@@ -26,26 +26,94 @@ module my_design_wrapper #(
     input  wire        clk,
     input  wire        rst_n,
 
-    input  wire        start,
-    input  wire [31:0] start_freq,
-    input  wire [31:0] stop_freq,
-    
+    input  wire        qtag_en_i,
+    input  wire [4:0]  qtag_op_i,
+    input  wire [31:0] qtag_dt1_i,
+    input  wire [31:0] qtag_dt2_i,
+    input  wire [31:0] qtag_dt3_i,
+    input  wire [31:0] qtag_dt4_i,
+    output reg         qtag_rdy_o,
+    output reg  [31:0] qtag_dt1_o,
+    output reg  [31:0] qtag_dt2_o,
+    output reg         qtag_vld_o,
+
     input  wire        trigger,
     input  wire [31:0] nsamp,
-    input  wire [$clog2(MAX_AVG)-1:0] averager_value,
-
     input  wire        s_axis_tvalid,
-    input  wire [31:0] s_axis_tdata,
+    input  wire [31:0] s_axis_tdata
 
-    output wire [31:0] freq_word,
-    output wire        freq_valid,
-    output wire        finish
+//    output wire [31:0] freq_word,
+//    output wire        freq_valid,
+//    output wire        finish
 );
+    //
+    wire [31:0] freq_word;
+    wire        freq_valid;
+    wire        finish;
+    
+    reg en_d;
+    wire en_rise;
+
+    reg [31:0] reg_start_freq;
+    reg [31:0] reg_stop_freq;
+    reg [$clog2(MAX_AVG)-1:0] reg_averager_value;
+    
+    wire w_start_pulse;
+
+    assign en_rise = qtag_en_i & ~en_d;
+    
+    assign w_start_pulse = en_rise & (qtag_op_i == 5'd1);
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            en_d <= 1'b0;
+        else
+            en_d <= qtag_en_i;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            qtag_rdy_o         <= 1'b1;
+            qtag_vld_o         <= 1'b0;
+            qtag_dt1_o         <= 32'd0;
+            qtag_dt2_o         <= 32'd0;
+            reg_start_freq     <= 32'd0;
+            reg_stop_freq      <= 32'd0;
+            reg_averager_value <= 0;
+        end else begin
+            qtag_vld_o <= 1'b0; // Default to 0 unless reading back data
+
+            if (en_rise) begin
+                case (qtag_op_i)
+                    5'd0: begin
+                        
+                        reg_start_freq     <= qtag_dt1_i;
+                        reg_stop_freq      <= qtag_dt2_i;
+                        reg_averager_value <= qtag_dt3_i[$clog2(MAX_AVG)-1:0];
+                    end
+                    5'd1: begin
+                        // OPCODE 1: Start Processing
+                        // Handled by the w_start_pulse wire above. 
+                        // No register updates needed here.
+                    end
+                    5'd2: begin
+                        // OPCODE 2: Read Results
+                        // Send the peak finder results back to the processor
+                        qtag_dt1_o <= freq_word;
+                        qtag_dt2_o <= {31'd0, finish}; // Pad 1-bit finish to 32 bits
+                        qtag_vld_o <= 1'b1;            // Tell processor data is valid
+                    end
+                    default: begin
+                    end
+                endcase
+            end
+        end
+    end
     
     wire [63:0] w_amplitude_data;  // Adjust width if you change ACCUM_WIDTH
     wire        w_amplitude_valid;
     wire        w_one_burst_done;
-    
+      
     peak_finder #(
         .first_sweep   (10000000),      // 10 MHz step
         .second_sweep  (1000000),       // 1 MHz step
