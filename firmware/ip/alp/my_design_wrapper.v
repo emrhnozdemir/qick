@@ -46,6 +46,8 @@ module my_design_wrapper #(
 //    output wire        freq_valid,
 //    output wire        finish
 );
+    reg sticky_finish;
+    reg sticky_freq_valid;
     //
     wire [31:0] freq_word;
     wire        freq_valid;
@@ -62,7 +64,32 @@ module my_design_wrapper #(
 
     assign en_rise = qtag_en_i & ~en_d;
     
+    wire w_read_pulse  = en_rise & (qtag_op_i == 5'd2);
+    
     assign w_start_pulse = en_rise & (qtag_op_i == 5'd1);
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sticky_finish     <= 1'b0;
+            sticky_freq_valid <= 1'b0;
+        end else begin
+            // Clear everything on a fresh start
+            if (w_start_pulse) begin
+                sticky_finish     <= 1'b0;
+                sticky_freq_valid <= 1'b0;
+            end else begin
+                // FINISH logic (only happens once at the very end, no need to clear)
+                if (finish) sticky_finish <= 1'b1;
+
+                // FREQ_VALID logic
+                if (freq_valid) begin
+                    sticky_freq_valid <= 1'b1; // Set to 1 when a new frequency is ready
+                end else if (w_read_pulse) begin
+                    sticky_freq_valid <= 1'b0; // CLEAR to 0 the moment the software reads it!
+                end
+            end
+        end
+    end
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
@@ -98,10 +125,12 @@ module my_design_wrapper #(
                     end
                     5'd2: begin
                         // OPCODE 2: Read Results
-                        // Send the peak finder results back to the processor
                         qtag_dt1_o <= freq_word;
-                        qtag_dt2_o <= {31'd0, finish}; // Pad 1-bit finish to 32 bits
-                        qtag_vld_o <= 1'b1;            // Tell processor data is valid
+            
+                        // Send the STICKY bits
+                        qtag_dt2_o <= {30'd0, sticky_freq_valid, sticky_finish}; 
+            
+                        qtag_vld_o <= 1'b1;             
                     end
                     default: begin
                     end
@@ -125,9 +154,9 @@ module my_design_wrapper #(
         .clk             (clk),               
         .rstn            (rst_n),             
 
-        .start           (start),             
-        .start_freq      (start_freq),        
-        .stop_freq       (stop_freq),         
+        .start           (w_start_pulse),             
+        .start_freq      (reg_start_freq),        
+        .stop_freq       (reg_stop_freq),         
 
         .amplitude_valid (w_amplitude_valid), 
         .amplitude_data  (w_amplitude_data),  
@@ -150,7 +179,7 @@ module my_design_wrapper #(
 
         .trigger        (trigger),            
         .nsamp          (nsamp),              
-        .averager_value (averager_value),     
+        .averager_value (reg_averager_value),     
 
         .m_axis_tdata   (w_amplitude_data),   
         .m_axis_tvalid  (w_amplitude_valid),  
