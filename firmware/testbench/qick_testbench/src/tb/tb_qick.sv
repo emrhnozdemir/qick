@@ -350,31 +350,99 @@ reg qcom_rdy_i, qp2_rdy_i;
    );
     
    // --- ADAPTIVE_SWEEP: QP2 wires ---
-   wire        qp2_en_o;
-   wire [4:0]  qp2_op_o;
-   wire [31:0] qp2_a_dt_o, qp2_b_dt_o, qp2_c_dt_o, qp2_d_dt_o;
-   wire        qp2_vld_i;
+//   wire        qp2_en_o;
+//   wire [4:0]  qp2_op_o;
+//   wire [31:0] qp2_a_dt_o, qp2_b_dt_o, qp2_c_dt_o, qp2_d_dt_o;
+//   wire        qp2_vld_i;
+parameter MAX_AVG = 64;
+//wire         qtag_en_i;
+//wire  [4:0]  qtag_op_i;
+//wire  [31:0] qtag_dt1_i;
+//wire  [31:0] qtag_dt2_i;
+//wire  [31:0] qtag_dt3_i;
+//wire  [31:0] qtag_dt4_i;
+//wire        qtag_rdy_o;
+//wire [31:0] qtag_dt1_o;
+//wire [31:0] qtag_dt2_o;
+//wire        qtag_vld_o;
+wire        qtag_en_w;
+    wire [4:0]  qtag_op_w;
+    wire [31:0] qtag_dt1_i_w;
+    wire [31:0] qtag_dt2_i_w;
+    wire [31:0] qtag_dt3_i_w;
+    wire [31:0] qtag_dt4_i_w;
     
+    wire        qtag_rdy_w;
+    wire [31:0] qtag_dt1_o_w;
+    wire [31:0] qtag_dt2_o_w;
+    wire        qtag_vld_w;
+//my_design_wrapper #(
+//        .MAX_AVG(MAX_AVG)
+//    ) dut (
+//        .clk           (ro_clk),
+//        .rst_n         (s_ps_dma_aresetn),
+        
+//        .qtag_en_i     (qtag_en_i),
+//        .qtag_op_i     (qtag_op_i),
+//        .qtag_dt1_i    (qtag_dt1_i),
+//        .qtag_dt2_i    (qtag_dt2_i),
+//        .qtag_dt3_i    (qtag_dt3_i),
+//        .qtag_dt4_i    (qtag_dt4_i),
+        
+//        .qtag_rdy_o    (qtag_rdy_o),
+//        .qtag_dt1_o    (qtag_dt1_o),
+//        .qtag_dt2_o    (qtag_dt2_o),
+//        .qtag_vld_o    (qtag_vld_o),
+        
+//        .trigger       (trigger_0),
+//        .nsamp         (u_axis_avg_buffer_0.AVG_LEN_REG),
+//        .s_axis_tvalid (axis_ro_avg_tvalid),
+//        .s_axis_tdata  (axis_ro_avg_tdata)
+//    );
+    my_design_wrapper #(
+        .MAX_AVG(MAX_AVG)
+    ) dut (
+        .clk           (ro_clk),
+        .rst_n         (s_ps_dma_aresetn),
+        
+        // Connected to the bridge wires
+        .qtag_en_i     (qtag_en_w),
+        .qtag_op_i     (qtag_op_w),
+        .qtag_dt1_i    (qtag_dt1_i_w),
+        .qtag_dt2_i    (qtag_dt2_i_w),
+        .qtag_dt3_i    (qtag_dt3_i_w),
+        .qtag_dt4_i    (qtag_dt4_i_w),
+        
+        .qtag_rdy_o    (qtag_rdy_w),
+        .qtag_dt1_o    (qtag_dt1_o_w),
+        .qtag_dt2_o    (qtag_dt2_o_w),
+        .qtag_vld_o    (qtag_vld_w),
+        
+        .trigger       (trigger_0),
+        .nsamp         (u_axis_avg_buffer_0.AVG_LEN_REG),
+        .s_axis_tvalid (axis_ro_avg_tvalid),
+        .s_axis_tdata  (axis_ro_avg_tdata)
+    );
    // --- ADAPTIVE_SWEEP: Instance on QP2 (Peripheral B) ---
-   adaptive_sweep #(
-      .INIT_START  (32'd100),
-      .INIT_END    (32'd200),
-      .INIT_STEP   (32'd1),
-      .SHRINK      (32'd10)
-   ) u_adaptive_sweep (
-      .clk         (c_clk),
-      .rst_n       (rst_ni),
-      .qtag_en_i   (qp2_en_o),
-      .qtag_op_i   (qp2_op_o),
-      .qtag_dt1_i  (qp2_a_dt_o),
-      .qtag_dt2_i  (qp2_b_dt_o),
-      .qtag_dt3_i  (qp2_c_dt_o),
-      .qtag_dt4_i  (qp2_d_dt_o),
-      .qtag_rdy_o  (qp2_rdy_i),
-      .qtag_dt1_o  (qp2_dt_i[0]),
-      .qtag_dt2_o  (qp2_dt_i[1]),
-      .qtag_vld_o  (qp2_vld_i)
-   );
+//   adaptive_sweep #(
+//      .INIT_START  (32'd100),
+//      .INIT_END    (32'd200),
+//      .INIT_STEP   (32'd1),
+//      .SHRINK      (32'd10)
+//   ) u_adaptive_sweep (
+//      .clk         (c_clk),
+//      .rst_n       (rst_ni),
+//      .qtag_en_i   (qp2_en_o),
+//      .qtag_op_i   (qp2_op_o),
+//      .qtag_dt1_i  (qp2_a_dt_o),
+//      .qtag_dt2_i  (qp2_b_dt_o),
+//      .qtag_dt3_i  (qp2_c_dt_o),
+//      .qtag_dt4_i  (qp2_d_dt_o),
+//      .qtag_rdy_o  (qp2_rdy_i),
+//      .qtag_dt1_o  (qp2_dt_i[0]),
+//      .qtag_dt2_o  (qp2_dt_i[1]),
+//      .qtag_vld_o  (qp2_vld_i)
+//   );
    
    axis_qick_processor # (
       .DUAL_CORE           (  `DUAL_CORE        ) ,
@@ -438,17 +506,30 @@ reg qcom_rdy_i, qp2_rdy_i;
       .qcom_vld_i          ( qcom_vld_i         ) ,
       .qcom_flag_i         ( qcom_flag_i        ) ,
       // QP1
-      .qp1_en_o           ( qp1_en_o          ) ,
-      .qp1_op_o           ( qp1_op_o          ) ,
-      .qp1_a_dt_o         ( qp1_a_dt_o        ) ,
-      .qp1_b_dt_o         ( qp1_b_dt_o        ) ,
-      .qp1_c_dt_o         ( qp1_c_dt_o        ) ,
-      .qp1_d_dt_o         ( qp1_d_dt_o        ) ,
-      .qp1_rdy_i          ( qp1_rdy_i         ) ,
-      .qp1_dt1_i          ( qp1_dt_i[0]       ) ,
-      .qp1_dt2_i          ( qp1_dt_i[1]       ) ,
-      .qp1_vld_i          ( qp1_vld_i         ) ,
-      .qp1_flag_i         ( qp1_flag_i        ) ,
+//      .qp1_en_o           ( qp1_en_o          ) ,
+//      .qp1_op_o           ( qp1_op_o          ) ,
+//      .qp1_a_dt_o         ( qp1_a_dt_o        ) ,
+//      .qp1_b_dt_o         ( qp1_b_dt_o        ) ,
+//      .qp1_c_dt_o         ( qp1_c_dt_o        ) ,
+//      .qp1_d_dt_o         ( qp1_d_dt_o        ) ,
+//      .qp1_rdy_i          ( qp1_rdy_i         ) ,
+//      .qp1_dt1_i          ( qp1_dt_i[0]       ) ,
+//      .qp1_dt2_i          ( qp1_dt_i[1]       ) ,
+//      .qp1_vld_i          ( qp1_vld_i         ) ,
+//      .qp1_flag_i         ( qp1_flag_i        ) ,
+    // QP1 (Wired directly to my_design_wrapper)
+      .qp1_en_o           ( qtag_en_w       ) , // Drives DUT qtag_en_i
+      .qp1_op_o           ( qtag_op_w       ) , // Drives DUT qtag_op_i
+      .qp1_a_dt_o         ( qtag_dt1_i_w    ) , // Drives DUT qtag_dt1_i
+      .qp1_b_dt_o         ( qtag_dt2_i_w    ) , // Drives DUT qtag_dt2_i
+      .qp1_c_dt_o         ( qtag_dt3_i_w    ) , // Drives DUT qtag_dt3_i
+      .qp1_d_dt_o         ( qtag_dt4_i_w    ) , // Drives DUT qtag_dt4_i
+      
+      .qp1_rdy_i          ( qtag_rdy_w      ) , // Read from DUT qtag_rdy_o
+      .qp1_dt1_i          ( qtag_dt1_o_w    ) , // Read from DUT qtag_dt1_o
+      .qp1_dt2_i          ( qtag_dt2_o_w    ) , // Read from DUT qtag_dt2_o
+      .qp1_vld_i          ( qtag_vld_w      ) , // Read from DUT qtag_vld_o
+      .qp1_flag_i         ( 1'b0            ) , // Tie to 0 if your DUT doesn't use a flag
       // QP2
       .qp2_en_o           ( qp2_en_o      ) ,
       .qp2_op_o           ( qp2_op_o      ) ,
