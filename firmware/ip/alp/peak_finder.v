@@ -1,9 +1,9 @@
 module peak_finder#(                
     parameter first_sweep  = 10000000,  // 10 MHz step
     parameter second_sweep = 1000000,    // 1 MHz step
-    parameter second_window = 5000000,   //+-5MHz fine tuning aralýðý
+    parameter second_window = 5000000,   //+-5MHz fine tuning aralï¿½ï¿½ï¿½
     parameter ADC_DAC_freq = 64'd491520000, //491.52 MHz
-    //parameter N_SAMP = 256, // averaging yapmak için gerekli, sample sayýsý kadar olmalý
+    //parameter N_SAMP = 256, // averaging yapmak iï¿½in gerekli, sample sayï¿½sï¿½ kadar olmalï¿½
     //parameter ACCUM_WIDTH = 32 + $clog2(N_SAMP)
     //parameter averager_value = 3,
     //parameter ACCUM_WIDTH = (((32 + $clog2(N_SAMP) + $clog2(averager_value))+7)/8)*8
@@ -16,7 +16,7 @@ module peak_finder#(
     input [31:0] stop_freq,    // CW format
     
     //input [$clog2(MAX_AVG)-1:0] averager_value,
-    //input [31:0] N_SAMP, //$clog2(MAX_NSAMP)-1:0] 32 bit yaptým çünkü QICK sisteminde 32 bit.
+    //input [31:0] N_SAMP, //$clog2(MAX_NSAMP)-1:0] 32 bit yaptï¿½m ï¿½ï¿½nkï¿½ QICK sisteminde 32 bit.
     
     input amplitude_valid,
     input [ACCUM_WIDTH-1:0] amplitude_data,
@@ -58,7 +58,7 @@ reg [31:0] freq_at_max;
 
 reg [63:0] temp;
 reg freq_valid_d;
-always @(posedge clk or negedge rstn) begin
+always @(posedge clk) begin
     if(!rstn) begin
         state <= IDLE;
         freq_valid <= 0;
@@ -149,7 +149,7 @@ always @(posedge clk or negedge rstn) begin
 
             cw_current <= freq_at_max - temp;
             fine_tune<=1;
-            max_amplitude <= 0; // burasý sýfýrlamasa da olabilir. Daha çok design choice gibi
+            max_amplitude <= 0; // burasï¿½ sï¿½fï¿½rlamasa da olabilir. Daha ï¿½ok design choice gibi
             
             state <= SEND_FREQ;
         end

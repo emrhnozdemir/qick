@@ -68,7 +68,7 @@ module my_design_wrapper #(
     
     assign w_start_pulse = en_rise & (qtag_op_i == 5'd1);
     
-    always @(posedge clk or negedge rst_n) begin
+    always @(posedge clk) begin
         if (!rst_n) begin
             sticky_finish     <= 1'b0;
             sticky_freq_valid <= 1'b0;
