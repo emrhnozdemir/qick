@@ -20,14 +20,14 @@
    </db_ref_list>
    <zoom_setting>
       <ZoomStartTime time="0.000000 us"></ZoomStartTime>
-      <ZoomEndTime time="49.072423 us"></ZoomEndTime>
-      <Cursor1Time time="26.995752 us"></Cursor1Time>
+      <ZoomEndTime time="54.909068 us"></ZoomEndTime>
+      <Cursor1Time time="1.000000 us"></Cursor1Time>
    </zoom_setting>
    <column_width_setting>
-      <NameColumnWidth column_width="286"></NameColumnWidth>
-      <ValueColumnWidth column_width="106"></ValueColumnWidth>
+      <NameColumnWidth column_width="283"></NameColumnWidth>
+      <ValueColumnWidth column_width="102"></ValueColumnWidth>
    </column_width_setting>
-   <WVObjectSize size="22" />
+   <WVObjectSize size="10" />
    <wvobject fp_name="group490" type="group">
       <obj_property name="label">RST_CLK</obj_property>
       <obj_property name="DisplayName">label</obj_property>
@@ -1205,7 +1205,6 @@
    <wvobject fp_name="group2522" type="group">
       <obj_property name="label">model_DAC_ADC</obj_property>
       <obj_property name="DisplayName">label</obj_property>
-      <obj_property name="isExpanded"></obj_property>
       <wvobject fp_name="/tb_qick/u_model_DAC_ADC/mode" type="array">
          <obj_property name="ElementShortName">mode[31:0]</obj_property>
          <obj_property name="ObjectShortName">mode[31:0]</obj_property>
@@ -2447,56 +2446,136 @@
          <obj_property name="ObjectShortName">m_axis_tlast</obj_property>
       </wvobject>
    </wvobject>
-   <wvobject fp_name="group572" type="group">
-      <obj_property name="label">ADAPTIVE_SWEEP</obj_property>
+   <wvobject fp_name="group586" type="group">
+      <obj_property name="label">ALP</obj_property>
       <obj_property name="DisplayName">label</obj_property>
-   </wvobject>
-   <wvobject fp_name="/tb_qick/dut/s_axis_tvalid" type="logic">
-      <obj_property name="ElementShortName">s_axis_tvalid</obj_property>
-      <obj_property name="ObjectShortName">s_axis_tvalid</obj_property>
-   </wvobject>
-   <wvobject fp_name="/tb_qick/dut/trigger" type="logic">
-      <obj_property name="ElementShortName">trigger</obj_property>
-      <obj_property name="ObjectShortName">trigger</obj_property>
-   </wvobject>
-   <wvobject fp_name="/tb_qick/dut/nsamp" type="array">
-      <obj_property name="ElementShortName">nsamp[31:0]</obj_property>
-      <obj_property name="ObjectShortName">nsamp[31:0]</obj_property>
-   </wvobject>
-   <wvobject fp_name="/tb_qick/dut/s_axis_tdata" type="array">
-      <obj_property name="ElementShortName">s_axis_tdata[31:0]</obj_property>
-      <obj_property name="ObjectShortName">s_axis_tdata[31:0]</obj_property>
-   </wvobject>
-   <wvobject fp_name="/tb_qick/dut/u_peak_finder/one_sample_done" type="logic">
-      <obj_property name="ElementShortName">one_sample_done</obj_property>
-      <obj_property name="ObjectShortName">one_sample_done</obj_property>
-   </wvobject>
-   <wvobject fp_name="/tb_qick/dut/u_amplitude_calculator/m_axis_tvalid" type="logic">
-      <obj_property name="ElementShortName">m_axis_tvalid</obj_property>
-      <obj_property name="ObjectShortName">m_axis_tvalid</obj_property>
-   </wvobject>
-   <wvobject fp_name="/tb_qick/dut/u_amplitude_calculator/m_axis_tdata" type="array">
-      <obj_property name="ElementShortName">m_axis_tdata[63:0]</obj_property>
-      <obj_property name="ObjectShortName">m_axis_tdata[63:0]</obj_property>
-   </wvobject>
-   <wvobject fp_name="/tb_qick/dut/freq_word" type="array">
-      <obj_property name="ElementShortName">freq_word[31:0]</obj_property>
-      <obj_property name="ObjectShortName">freq_word[31:0]</obj_property>
-   </wvobject>
-   <wvobject fp_name="/tb_qick/dut/freq_valid" type="logic">
-      <obj_property name="ElementShortName">freq_valid</obj_property>
-      <obj_property name="ObjectShortName">freq_valid</obj_property>
-   </wvobject>
-   <wvobject fp_name="/tb_qick/dut/finish" type="logic">
-      <obj_property name="ElementShortName">finish</obj_property>
-      <obj_property name="ObjectShortName">finish</obj_property>
-   </wvobject>
-   <wvobject fp_name="/tb_qick/dut/u_peak_finder/max_amplitude" type="array">
-      <obj_property name="ElementShortName">max_amplitude[63:0]</obj_property>
-      <obj_property name="ObjectShortName">max_amplitude[63:0]</obj_property>
-   </wvobject>
-   <wvobject fp_name="/tb_qick/dut/u_peak_finder/freq_at_max" type="array">
-      <obj_property name="ElementShortName">freq_at_max[31:0]</obj_property>
-      <obj_property name="ObjectShortName">freq_at_max[31:0]</obj_property>
+      <wvobject fp_name="/tb_qick/dut/clk" type="logic">
+         <obj_property name="ElementShortName">clk</obj_property>
+         <obj_property name="ObjectShortName">clk</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/rst_n" type="logic">
+         <obj_property name="ElementShortName">rst_n</obj_property>
+         <obj_property name="ObjectShortName">rst_n</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/qtag_en_i" type="logic">
+         <obj_property name="ElementShortName">qtag_en_i</obj_property>
+         <obj_property name="ObjectShortName">qtag_en_i</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/qtag_op_i" type="array">
+         <obj_property name="ElementShortName">qtag_op_i[4:0]</obj_property>
+         <obj_property name="ObjectShortName">qtag_op_i[4:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/qtag_dt1_i" type="array">
+         <obj_property name="ElementShortName">qtag_dt1_i[31:0]</obj_property>
+         <obj_property name="ObjectShortName">qtag_dt1_i[31:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/qtag_dt2_i" type="array">
+         <obj_property name="ElementShortName">qtag_dt2_i[31:0]</obj_property>
+         <obj_property name="ObjectShortName">qtag_dt2_i[31:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/qtag_dt3_i" type="array">
+         <obj_property name="ElementShortName">qtag_dt3_i[31:0]</obj_property>
+         <obj_property name="ObjectShortName">qtag_dt3_i[31:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/qtag_dt4_i" type="array">
+         <obj_property name="ElementShortName">qtag_dt4_i[31:0]</obj_property>
+         <obj_property name="ObjectShortName">qtag_dt4_i[31:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/qtag_rdy_o" type="logic">
+         <obj_property name="ElementShortName">qtag_rdy_o</obj_property>
+         <obj_property name="ObjectShortName">qtag_rdy_o</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/qtag_dt1_o" type="array">
+         <obj_property name="ElementShortName">qtag_dt1_o[31:0]</obj_property>
+         <obj_property name="ObjectShortName">qtag_dt1_o[31:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/qtag_dt2_o" type="array">
+         <obj_property name="ElementShortName">qtag_dt2_o[31:0]</obj_property>
+         <obj_property name="ObjectShortName">qtag_dt2_o[31:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/qtag_vld_o" type="logic">
+         <obj_property name="ElementShortName">qtag_vld_o</obj_property>
+         <obj_property name="ObjectShortName">qtag_vld_o</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/trigger" type="logic">
+         <obj_property name="ElementShortName">trigger</obj_property>
+         <obj_property name="ObjectShortName">trigger</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/nsamp" type="array">
+         <obj_property name="ElementShortName">nsamp[31:0]</obj_property>
+         <obj_property name="ObjectShortName">nsamp[31:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/s_axis_tvalid" type="logic">
+         <obj_property name="ElementShortName">s_axis_tvalid</obj_property>
+         <obj_property name="ObjectShortName">s_axis_tvalid</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/s_axis_tdata" type="array">
+         <obj_property name="ElementShortName">s_axis_tdata[31:0]</obj_property>
+         <obj_property name="ObjectShortName">s_axis_tdata[31:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/sticky_finish" type="logic">
+         <obj_property name="ElementShortName">sticky_finish</obj_property>
+         <obj_property name="ObjectShortName">sticky_finish</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/sticky_freq_valid" type="logic">
+         <obj_property name="ElementShortName">sticky_freq_valid</obj_property>
+         <obj_property name="ObjectShortName">sticky_freq_valid</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/freq_word" type="array">
+         <obj_property name="ElementShortName">freq_word[31:0]</obj_property>
+         <obj_property name="ObjectShortName">freq_word[31:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/freq_valid" type="logic">
+         <obj_property name="ElementShortName">freq_valid</obj_property>
+         <obj_property name="ObjectShortName">freq_valid</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/finish" type="logic">
+         <obj_property name="ElementShortName">finish</obj_property>
+         <obj_property name="ObjectShortName">finish</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/en_d" type="logic">
+         <obj_property name="ElementShortName">en_d</obj_property>
+         <obj_property name="ObjectShortName">en_d</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/en_rise" type="logic">
+         <obj_property name="ElementShortName">en_rise</obj_property>
+         <obj_property name="ObjectShortName">en_rise</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/reg_start_freq" type="array">
+         <obj_property name="ElementShortName">reg_start_freq[31:0]</obj_property>
+         <obj_property name="ObjectShortName">reg_start_freq[31:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/reg_stop_freq" type="array">
+         <obj_property name="ElementShortName">reg_stop_freq[31:0]</obj_property>
+         <obj_property name="ObjectShortName">reg_stop_freq[31:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/reg_averager_value" type="array">
+         <obj_property name="ElementShortName">reg_averager_value[5:0]</obj_property>
+         <obj_property name="ObjectShortName">reg_averager_value[5:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/w_start_pulse" type="logic">
+         <obj_property name="ElementShortName">w_start_pulse</obj_property>
+         <obj_property name="ObjectShortName">w_start_pulse</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/w_read_pulse" type="logic">
+         <obj_property name="ElementShortName">w_read_pulse</obj_property>
+         <obj_property name="ObjectShortName">w_read_pulse</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/w_amplitude_data" type="array">
+         <obj_property name="ElementShortName">w_amplitude_data[63:0]</obj_property>
+         <obj_property name="ObjectShortName">w_amplitude_data[63:0]</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/w_amplitude_valid" type="logic">
+         <obj_property name="ElementShortName">w_amplitude_valid</obj_property>
+         <obj_property name="ObjectShortName">w_amplitude_valid</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/w_one_burst_done" type="logic">
+         <obj_property name="ElementShortName">w_one_burst_done</obj_property>
+         <obj_property name="ObjectShortName">w_one_burst_done</obj_property>
+      </wvobject>
+      <wvobject fp_name="/tb_qick/dut/MAX_AVG" type="array">
+         <obj_property name="ElementShortName">MAX_AVG[31:0]</obj_property>
+         <obj_property name="ObjectShortName">MAX_AVG[31:0]</obj_property>
+      </wvobject>
    </wvobject>
 </wave_config>
