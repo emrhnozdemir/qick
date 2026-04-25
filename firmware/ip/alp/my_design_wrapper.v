@@ -91,14 +91,14 @@ module my_design_wrapper #(
         end
     end
 
-    always @(posedge clk or negedge rst_n) begin
+    always @(posedge clk ) begin
         if (!rst_n)
             en_d <= 1'b0;
         else
             en_d <= qtag_en_i;
     end
 
-    always @(posedge clk or negedge rst_n) begin
+    always @(posedge clk ) begin
         if (!rst_n) begin
             qtag_rdy_o         <= 1'b1;
             qtag_vld_o         <= 1'b0;
