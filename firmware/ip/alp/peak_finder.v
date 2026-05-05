@@ -85,7 +85,7 @@ always @(posedge clk) begin
             if(start) begin
                 cw_current <= start_freq;
                 cw_stop    <= stop_freq;
-                cw_step    <= (first_sweep * TWO32) / (DDS_MULT * DDS_CLK);
+                cw_step    <= cw_word; //(first_sweep * TWO32) / (DDS_MULT * DDS_CLK);
 
                 max_amplitude <= 0;
                 freq_at_max   <= 0;
