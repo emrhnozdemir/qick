@@ -1,5 +1,5 @@
 module peak_finder#(                
-    parameter first_sweep  = 10000000,  // 10 MHz step
+    parameter first_sweep  = 5000000,  // 10 MHz step
     parameter second_sweep = 1000000,    // 1 MHz step
     parameter second_window = 5000000,   //+-5MHz fine tuning aralığı
     parameter ADC_DAC_freq = 64'd614400000, //491.52 MHz
@@ -85,7 +85,7 @@ always @(posedge clk or negedge rstn) begin
             if(start) begin
                 cw_current <= start_freq;
                 cw_stop    <= stop_freq;
-                cw_step    <= 32'd5461333;//(first_sweep * TWO32) / (DDS_MULT * DDS_CLK);
+                cw_step    <= 32'd2184533; //32'd5461333;//(first_sweep * TWO32) / (DDS_MULT * DDS_CLK);
 
                 max_amplitude <= 0;
                 freq_at_max   <= 0;
@@ -143,11 +143,11 @@ always @(posedge clk or negedge rstn) begin
         
         FINE_INIT: begin
             //temp = (second_window * TWO32) / (DDS_MULT * DDS_CLK);
-            cw_step <= 32'd546133;//(second_sweep * TWO32) / (DDS_MULT * DDS_CLK);
+            cw_step <= 32'd436906;//32'd546133;//(second_sweep * TWO32) / (DDS_MULT * DDS_CLK);
             
-            cw_stop  <= 32'd19653332; //freq_at_max + temp;
+            cw_stop  <=32'd19107198; //32'd19653332; //freq_at_max + temp;
 
-            cw_current <= 32'd14192000; //freq_at_max - temp;
+            cw_current <= 32'd14738132;//32'd14192000; //freq_at_max - temp;
             fine_tune<=1;
             max_amplitude <= 0; // burası sıfırlamasa da olabilir. Daha çok design choice gibi
             
@@ -158,4 +158,4 @@ always @(posedge clk or negedge rstn) begin
     end
 end
 
-endmodule
+endmodule //
