@@ -1,9 +1,9 @@
 module peak_finder#(                
     parameter first_sweep  = 10000000,  // 10 MHz step
     parameter second_sweep = 1000000,    // 1 MHz step
-    parameter second_window = 5000000,   //+-5MHz fine tuning aral���
-    parameter ADC_DAC_freq = 64'd491520000, //491.52 MHz
-    //parameter N_SAMP = 256, // averaging yapmak i�in gerekli, sample say�s� kadar olmal�
+    parameter second_window = 5000000,   //+-5MHz fine tuning aralığı
+    parameter ADC_DAC_freq = 64'd614400000, //491.52 MHz
+    //parameter N_SAMP = 256, // averaging yapmak için gerekli, sample sayısı kadar olmalı
     //parameter ACCUM_WIDTH = 32 + $clog2(N_SAMP)
     //parameter averager_value = 3,
     //parameter ACCUM_WIDTH = (((32 + $clog2(N_SAMP) + $clog2(averager_value))+7)/8)*8
@@ -16,7 +16,7 @@ module peak_finder#(
     input [31:0] stop_freq,    // CW format
     
     //input [$clog2(MAX_AVG)-1:0] averager_value,
-    //input [31:0] N_SAMP, //$clog2(MAX_NSAMP)-1:0] 32 bit yapt�m ��nk� QICK sisteminde 32 bit.
+    //input [31:0] N_SAMP, //$clog2(MAX_NSAMP)-1:0] 32 bit yaptım çünkü QICK sisteminde 32 bit.
     
     input amplitude_valid,
     input [ACCUM_WIDTH-1:0] amplitude_data,
@@ -58,7 +58,7 @@ reg [31:0] freq_at_max;
 
 reg [63:0] temp;
 reg freq_valid_d;
-always @(posedge clk) begin
+always @(posedge clk or negedge rstn) begin
     if(!rstn) begin
         state <= IDLE;
         freq_valid <= 0;
@@ -85,7 +85,7 @@ always @(posedge clk) begin
             if(start) begin
                 cw_current <= start_freq;
                 cw_stop    <= stop_freq;
-                cw_step    <= cw_word; //(first_sweep * TWO32) / (DDS_MULT * DDS_CLK);
+                cw_step    <= 32'd5461333;//(first_sweep * TWO32) / (DDS_MULT * DDS_CLK);
 
                 max_amplitude <= 0;
                 freq_at_max   <= 0;
@@ -142,14 +142,14 @@ always @(posedge clk) begin
         end
         
         FINE_INIT: begin
-            temp = (second_window * TWO32) / (DDS_MULT * DDS_CLK);
-            cw_step <= (second_sweep * TWO32) / (DDS_MULT * DDS_CLK);
+            //temp = (second_window * TWO32) / (DDS_MULT * DDS_CLK);
+            cw_step <= 32'd546133;//(second_sweep * TWO32) / (DDS_MULT * DDS_CLK);
             
-            cw_stop  <= freq_at_max + temp;
+            cw_stop  <= 32'd19653332; //freq_at_max + temp;
 
-            cw_current <= freq_at_max - temp;
+            cw_current <= 32'd14192000; //freq_at_max - temp;
             fine_tune<=1;
-            max_amplitude <= 0; // buras� s�f�rlamasa da olabilir. Daha �ok design choice gibi
+            max_amplitude <= 0; // burası sıfırlamasa da olabilir. Daha çok design choice gibi
             
             state <= SEND_FREQ;
         end
