@@ -1,4 +1,4 @@
-module peak_finder#(                
+module peak_finder_v2#(                
     parameter first_sweep  = 5000000,  // 10 MHz step
     parameter second_sweep = 1000000,    // 1 MHz step
     parameter second_window = 5000000,   //+-5MHz fine tuning aralığı
