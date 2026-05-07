@@ -14,7 +14,10 @@ module peak_finder#(
     input start,
     input [31:0] start_freq,   // CW format
     input [31:0] stop_freq,    // CW format
-    
+    input [31:0] first_sweep_step,
+
+    input [31:0] second_sweep_step,
+    input [31:0] second_sweep_window,
     //input [$clog2(MAX_AVG)-1:0] averager_value,
     //input [31:0] N_SAMP, //$clog2(MAX_NSAMP)-1:0] 32 bit yaptım çünkü QICK sisteminde 32 bit.
     
@@ -85,7 +88,7 @@ always @(posedge clk or negedge rstn) begin
             if(start) begin
                 cw_current <= start_freq;
                 cw_stop    <= stop_freq;
-                cw_step    <= 32'd2184533; //32'd5461333;//(first_sweep * TWO32) / (DDS_MULT * DDS_CLK);
+                cw_step    <= first_sweep_step //32'd2184533; //32'd5461333;//(first_sweep * TWO32) / (DDS_MULT * DDS_CLK);
 
                 max_amplitude <= 0;
                 freq_at_max   <= 0;
@@ -143,11 +146,11 @@ always @(posedge clk or negedge rstn) begin
         
         FINE_INIT: begin
             //temp = (second_window * TWO32) / (DDS_MULT * DDS_CLK);
-            cw_step <= 32'd436906;//32'd546133;//(second_sweep * TWO32) / (DDS_MULT * DDS_CLK);
+            cw_step <= second_sweep_step; //32'd436906;//32'd546133;//(second_sweep * TWO32) / (DDS_MULT * DDS_CLK);
             
-            cw_stop  <=32'd19107198; //32'd19653332; //freq_at_max + temp;
+            cw_stop  <= (freq_at_max + second_window > stop_freq) ? stop_freq : freq_at_max + second_window; //32'd19107198; //32'd19653332; //freq_at_max + temp;
 
-            cw_current <= 32'd14738132;//32'd14192000; //freq_at_max - temp;
+            cw_current <= (freq_at_max - second_window < start_freq) ? start_freq : freq_at_max - second_window; //32'd14738132;//32'd14192000; //freq_at_max - temp;
             fine_tune<=1;
             max_amplitude <= 0; // burası sıfırlamasa da olabilir. Daha çok design choice gibi
             
