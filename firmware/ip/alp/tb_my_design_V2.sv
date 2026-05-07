@@ -1,185 +1,226 @@
 `timescale 1ns / 1ps
 
-module my_design_wrapper_v2 #(
-    parameter MAX_AVG = 64
-)(
-    input  wire        clk,
-    input  wire        rst_n,
+module tb_my_design_wrapper_v2();
 
-    input  wire        qtag_en_i,
-    input  wire [4:0]  qtag_op_i,
-    input  wire [31:0] qtag_dt1_i,
-    input  wire [31:0] qtag_dt2_i,
-    input  wire [31:0] qtag_dt3_i,
-    input  wire [31:0] qtag_dt4_i,
-    output reg         qtag_rdy_o,
-    output reg  [31:0] qtag_dt1_o,
-    output reg  [31:0] qtag_dt2_o,
-    output reg         qtag_vld_o,
+    // ==========================================
+    // Clock and Reset Generation
+    // ==========================================
+    reg clk;
+    reg rst_n;
 
-    input  wire        trigger,
-    input  wire [31:0] nsamp,
-    input  wire        s_axis_tvalid,
-    input  wire [31:0] s_axis_tdata
-);
+    always #5 clk = ~clk; // 100 MHz clock (10ns period)
 
-    reg sticky_finish;
-    reg sticky_freq_valid;
+    // ==========================================
+    // Wrapper Interface Signals
+    // ==========================================
+    reg        qtag_en_i;
+    reg  [4:0] qtag_op_i;
+    reg  [31:0] qtag_dt1_i;
+    reg  [31:0] qtag_dt2_i;
+    reg  [31:0] qtag_dt3_i;
+    reg  [31:0] qtag_dt4_i;
+    wire       qtag_rdy_o;
+    wire [31:0] qtag_dt1_o;
+    wire [31:0] qtag_dt2_o;
+    wire       qtag_vld_o;
+
+    reg        trigger;
+    wire [31:0] nsamp;
+    wire       s_axis_tvalid;
+    wire [31:0] s_axis_tdata;
+
+    // Fixed ADC stream control
+    assign nsamp         = 32'd256; // 256 samples per trigger
+    assign s_axis_tvalid = 1'b1;    // Always valid
+
+    // ==========================================
+    // Module Instantiation
+    // ==========================================
+    my_design_wrapper_v2 #(
+        .MAX_AVG(64)
+    ) uut (
+        .clk(clk),
+        .rst_n(rst_n),
+        .qtag_en_i(qtag_en_i),
+        .qtag_op_i(qtag_op_i),
+        .qtag_dt1_i(qtag_dt1_i),
+        .qtag_dt2_i(qtag_dt2_i),
+        .qtag_dt3_i(qtag_dt3_i),
+        .qtag_dt4_i(qtag_dt4_i),
+        .qtag_rdy_o(qtag_rdy_o),
+        .qtag_dt1_o(qtag_dt1_o),
+        .qtag_dt2_o(qtag_dt2_o),
+        .qtag_vld_o(qtag_vld_o),
+        .trigger(trigger),
+        .nsamp(nsamp),
+        .s_axis_tvalid(s_axis_tvalid),
+        .s_axis_tdata(s_axis_tdata)
+    );
+
+    // ==========================================
+    // Simulated ADC Peak Generation Environment
+    // ==========================================
+    parameter PEAK_FREQ  = 32'd18000000; // Fake resonant peak at 18 MHz
+    parameter PEAK_WIDTH = 32'd2000000;  // +/- 2MHz width for the peak slope
     
-    wire [31:0] freq_word;
-    wire        freq_valid;
-    wire        finish;
-    
-    reg en_d;
-    wire en_rise;
+    reg [31:0] read_freq_word;
+    reg [15:0] current_adc_amp;
+    reg        toggle_sign;
 
-    // --- Configuration Registers ---
-    reg [31:0] reg_start_freq;
-    reg [31:0] reg_stop_freq;
-    reg [$clog2(MAX_AVG)-1:0] reg_averager_value;
-    
-    // NEW: Fine tune and sweep registers
-    reg [31:0] reg_first_sweep_step;
-    reg [31:0] reg_second_sweep_step;
-    reg [31:0] reg_second_sweep_window;
-    // -------------------------------
+    // Calculate synthetic ADC amplitude based on proximity to PEAK_FREQ
+    always @(*) begin
+        integer diff;
+        diff = read_freq_word - PEAK_FREQ;
+        if (diff < 0) diff = -diff; // Absolute difference
 
-    wire w_start_pulse;
+        if (diff < PEAK_WIDTH) begin
+            // Linear slope up to max amplitude of ~30000
+            current_adc_amp = 16'd30000 - ((diff * 16'd29000) / PEAK_WIDTH); 
+        end else begin
+            // Noise floor
+            current_adc_amp = 16'd1000; 
+        end
+    end
 
-    assign en_rise = qtag_en_i & ~en_d;
-    
-    wire w_read_pulse  = en_rise & (qtag_op_i == 5'd2);
-    assign w_start_pulse = en_rise & (qtag_op_i == 5'd1);
-    
+    // Generate oscillating ADC data (simulating a complex AC waveform to the calculator)
     always @(posedge clk) begin
         if (!rst_n) begin
-            sticky_finish     <= 1'b0;
-            sticky_freq_valid <= 1'b0;
+            toggle_sign <= 1'b0;
         end else begin
-            // Clear everything on a fresh start
-            if (w_start_pulse) begin
-                sticky_finish     <= 1'b0;
-                sticky_freq_valid <= 1'b0;
-            end else begin
-                // FINISH logic 
-                if (finish) sticky_finish <= 1'b1;
-
-                // FREQ_VALID logic
-                if (freq_valid) begin
-                    sticky_freq_valid <= 1'b1; 
-                end else if (w_read_pulse) begin
-                    sticky_freq_valid <= 1'b0; // CLEAR to 0 when software reads
-                end
-            end
+            toggle_sign <= ~toggle_sign; // Create a simple square wave toggle
         end
     end
 
-    always @(posedge clk ) begin
-        if (!rst_n)
-            en_d <= 1'b0;
-        else
-            en_d <= qtag_en_i;
-    end
-
-    always @(posedge clk ) begin
-        if (!rst_n) begin
-            qtag_rdy_o              <= 1'b1;
-            qtag_vld_o              <= 1'b0;
-            qtag_dt1_o              <= 32'd0;
-            qtag_dt2_o              <= 32'd0;
-            
-            // Reset configurations
-            reg_start_freq          <= 32'd0;
-            reg_stop_freq           <= 32'd0;
-            reg_averager_value      <= 0;
-            reg_first_sweep_step    <= 32'd0;
-            reg_second_sweep_step   <= 32'd0;
-            reg_second_sweep_window <= 32'd0;
-        end else begin
-            qtag_vld_o <= 1'b0; // Default to 0 unless reading back data
-
-            if (en_rise) begin
-                case (qtag_op_i)
-                    5'd0: begin
-                        // OPCODE 0: Set basic sweep bounds and averaging
-                        reg_start_freq     <= qtag_dt1_i;
-                        reg_stop_freq      <= qtag_dt2_i;
-                        reg_averager_value <= qtag_dt3_i[$clog2(MAX_AVG)-1:0];
-                        reg_first_sweep_step    <= qtag_dt4_i;
-                    end
-                    5'd1: begin
-                        // OPCODE 1: Start Processing
-                        // Handled by w_start_pulse. No register updates needed.
-                    end
-                    5'd2: begin
-                        // OPCODE 2: Read Results
-                        qtag_dt1_o <= freq_word;
-                        // Send the STICKY bits
-                        qtag_dt2_o <= {30'd0, sticky_freq_valid, sticky_finish}; 
-                        qtag_vld_o <= 1'b1;             
-                    end
-                    5'd3: begin
-                        // NEW OPCODE 3: Set sweep step sizes and window
-                        //reg_first_sweep_step    <= qtag_dt1_i;
-                        reg_second_sweep_step   <= qtag_dt2_i;
-                        reg_second_sweep_window <= qtag_dt3_i;
-                    end
-                    default: begin
-                    end
-                endcase
-            end
-        end
-    end
+    // Create 16-bit I and Q pairs. 
+    // They are packed into the 32-bit s_axis_tdata port.
+    wire signed [15:0] i_samp = toggle_sign ? current_adc_amp : -current_adc_amp;
+    wire signed [15:0] q_samp = toggle_sign ? -current_adc_amp : current_adc_amp;
     
-    wire [63:0] w_amplitude_data;  
-    wire        w_amplitude_valid;
-    wire        w_one_burst_done;
-      
-    peak_finder_v2 #(
-        // You can leave parameters here if needed for defaults, 
-        // but the module now relies on the dynamic inputs
-        .ADC_DAC_freq  (64'd491520000), 
-        .MAX_AVG       (64),
-        .ACCUM_WIDTH   (64)
-    ) u_peak_finder_v2 (
-        .clk                 (clk),               
-        .rstn                (rst_n),             
+    assign s_axis_tdata = {i_samp, q_samp}; 
 
-        .start               (w_start_pulse),             
-        .start_freq          (reg_start_freq),        
-        .stop_freq           (reg_stop_freq),         
+    // ==========================================
+    // Main Test Sequence (Software Simulator)
+    // ==========================================
+    reg [31:0] read_flags;
+    reg        sw_freq_valid;
+    reg        sw_finish;
+    integer    sweep_step_counter;
+    
+    initial begin
+        // 1. Initialize Default Values
+        clk = 0;
+        rst_n = 0;
+        qtag_en_i = 0;
+        qtag_op_i = 0;
+        qtag_dt1_i = 0;
+        qtag_dt2_i = 0;
+        qtag_dt3_i = 0;
+        qtag_dt4_i = 0;
+        trigger = 0;
+        read_freq_word = 0;
+        sweep_step_counter = 0;
+
+        // Release Reset
+        #100;
+        rst_n = 1;
+        #100;
+        $display("-------------------------------------------------");
+        $display("[%0t] SYSTEM RESET COMPLETE", $time);
+
+        // 2. Opcode 0: Base Configuration (INCLUDING FIRST SWEEP STEP ON QTAG 4)
+        @(posedge clk); #1; 
+        qtag_en_i  = 1'b1;
+        qtag_op_i  = 5'd0;
+        qtag_dt1_i = 32'd6000000;   // Start Freq: 6 MHz
+        qtag_dt2_i = 32'd30000000;  // Stop Freq: 30 MHz
+        qtag_dt3_i = 32'd3;         // Averager Value: 3
+        qtag_dt4_i = 32'd1000000;   // First Sweep Step: 1 MHz (Coarse Search)
         
-        // NEW CONNECTIONS
-        .first_sweep_step    (reg_first_sweep_step),
-        .second_sweep_step   (reg_second_sweep_step),
-        .second_sweep_window (reg_second_sweep_window),
+        @(posedge clk); #1;
+        qtag_en_i  = 1'b0;
+        $display("[%0t] CONFIG 0 SENT: Start=6MHz, Stop=30MHz, Avg=3, CoarseStep=1MHz", $time);
+        #50;
 
-        .amplitude_valid     (w_amplitude_valid), 
-        .amplitude_data      (w_amplitude_data),  
-        .one_sample_done     (w_one_burst_done),  
+        // 3. Opcode 3: Fine Tuning Configuration
+        @(posedge clk); #1; 
+        qtag_en_i  = 1'b1;
+        qtag_op_i  = 5'd3;
+        qtag_dt1_i = 32'd0;         // Unused
+        qtag_dt2_i = 32'd100000;    // Second Sweep Step: 100 kHz (Fine Search)
+        qtag_dt3_i = 32'd5000000;   // Second Sweep Window: +/- 5 MHz
+        qtag_dt4_i = 32'd0;         // Unused
+        
+        @(posedge clk); #1;
+        qtag_en_i  = 1'b0;
+        $display("[%0t] CONFIG 3 SENT: FineStep=100kHz, Window=5MHz", $time);
+        #50;
 
-        .freq_word           (freq_word),         
-        .freq_valid          (freq_valid),        
-        .finish              (finish)             
-    );
+        // 4. Opcode 1: Start Sweeping
+        @(posedge clk); #1;
+        qtag_en_i = 1'b1;
+        qtag_op_i = 5'd1;
+        
+        @(posedge clk); #1;
+        qtag_en_i = 1'b0;
+        $display("[%0t] SWEEP STARTED! Target Resonant Peak is at %0d", $time, PEAK_FREQ);
+        $display("-------------------------------------------------");
 
-    amplitude_calculator_v3 #(
-        .MAX_AVG       (64),
-        .ACCUM_WIDTH   (64)
-    ) u_amplitude_calculator (
-        .clk            (clk),                
-        .rst_n          (rst_n),              
+        // 5. Polling Loop (Software checking for new frequencies)
+        sw_finish = 1'b0;
+        
+        while (!sw_finish) begin
+            // Wait simulated software polling delay
+            repeat(15) @(posedge clk);
 
-        .s_axis_tvalid  (s_axis_tvalid),      
-        .s_axis_tdata   (s_axis_tdata),       
+            // Read Opcode 2
+            @(posedge clk); #1;
+            qtag_en_i = 1'b1;
+            qtag_op_i = 5'd2;
+            
+            @(posedge clk); #1;
+            qtag_en_i = 1'b0;
 
-        .trigger        (trigger),            
-        .nsamp          (nsamp),              
-        .averager_value (reg_averager_value),     
+            // Wait for Wrapper Acknowledge
+            while (!qtag_vld_o) @(posedge clk);
 
-        .m_axis_tdata   (w_amplitude_data),   
-        .m_axis_tvalid  (w_amplitude_valid),  
-        .one_burst_done (w_one_burst_done)    
-    );
+            // Capture results slightly after the clock edge
+            #1;
+            read_freq_word = qtag_dt1_o;
+            read_flags     = qtag_dt2_o;
+
+            sw_freq_valid = read_flags[1];
+            sw_finish     = read_flags[0];
+
+            if (sw_finish) begin
+                $display("-------------------------------------------------");
+                $display("[%0t] SWEEP FINISHED DETECTED BY SOFTWARE!", $time);
+                $display("[%0t] Final optimized Peak Frequency: %0d Hz", $time, read_freq_word);
+                $display("-------------------------------------------------");
+            end 
+            else if (sw_freq_valid) begin
+                sweep_step_counter = sweep_step_counter + 1;
+                $display("[%0t] Step %0d | SW Read Freq: %0d Hz | Synthesizing Peak Amp: %0d", 
+                          $time, sweep_step_counter, read_freq_word, current_adc_amp);
+                
+                // Simulate DAC Write Delay (Software writing to DAC over SPI/I2C)
+                repeat(40) @(posedge clk); 
+                
+                // Loopback: Processor sees valid frequency, now tells ADC/Calculator to Trigger
+                @(posedge clk); #1;
+                trigger = 1'b1;
+                
+                @(posedge clk); #1;
+                trigger = 1'b0;
+
+                // Wait enough time for the amplitude_calculator burst and averager to finish
+                repeat(300) @(posedge clk);
+            end
+        end
+
+        // End Simulation
+        #500;
+        $display("[%0t] SIMULATION COMPLETE.", $time);
+        $finish;
+    end
 
 endmodule
