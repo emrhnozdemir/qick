@@ -33,16 +33,13 @@ module my_design_wrapper_v2 #(
     reg en_d;
     wire en_rise;
 
-    // --- Configuration Registers ---
     reg [31:0] reg_start_freq;
     reg [31:0] reg_stop_freq;
     reg [$clog2(MAX_AVG)-1:0] reg_averager_value;
     
-    // NEW: Fine tune and sweep registers
     reg [31:0] reg_first_sweep_step;
     reg [31:0] reg_second_sweep_step;
     reg [31:0] reg_second_sweep_window;
-    // -------------------------------
 
     wire w_start_pulse;
 
@@ -56,7 +53,6 @@ module my_design_wrapper_v2 #(
             sticky_finish     <= 1'b0;
             sticky_freq_valid <= 1'b0;
         end else begin
-            // Clear everything on a fresh start
             if (w_start_pulse) begin
                 sticky_finish     <= 1'b0;
                 sticky_freq_valid <= 1'b0;
@@ -86,9 +82,7 @@ module my_design_wrapper_v2 #(
             qtag_rdy_o              <= 1'b1;
             qtag_vld_o              <= 1'b0;
             qtag_dt1_o              <= 32'd0;
-            qtag_dt2_o              <= 32'd0;
-            
-            // Reset configurations
+            qtag_dt2_o              <= 32'd0;            
             reg_start_freq          <= 32'd0;
             reg_stop_freq           <= 32'd0;
             reg_averager_value      <= 0;
@@ -114,7 +108,6 @@ module my_design_wrapper_v2 #(
                     5'd2: begin
                         // OPCODE 2: Read Results
                         qtag_dt1_o <= freq_word;
-                        // Send the STICKY bits
                         qtag_dt2_o <= {30'd0, sticky_freq_valid, sticky_finish}; 
                         qtag_vld_o <= 1'b1;             
                     end
@@ -135,9 +128,7 @@ module my_design_wrapper_v2 #(
     wire        w_amplitude_valid;
     wire        w_one_burst_done;
       
-    peak_finder_v2 #(
-        // You can leave parameters here if needed for defaults, 
-        // but the module now relies on the dynamic inputs
+    peak_finder_v2 #(        
         .ADC_DAC_freq  (64'd491520000), 
         .MAX_AVG       (64),
         .ACCUM_WIDTH   (64)
