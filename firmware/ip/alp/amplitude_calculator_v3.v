@@ -37,7 +37,9 @@ module amplitude_calculator_v3 #(
     reg [ACCUM_WIDTH-1:0] sum_reg;     
 
     reg finish_delay;
-
+    
+    reg [31:0] nsamp_latched;
+    
     always @(posedge clk ) begin
         if (!rst_n) begin
             state <= IDLE;
@@ -59,6 +61,8 @@ module amplitude_calculator_v3 #(
                         state <= RUN;
                         sample_cnt <= 0;
                         accumulator <= 0;
+                        
+                        nsamp_latched<=nsamp;
                     end
                 end
 
@@ -67,7 +71,7 @@ module amplitude_calculator_v3 #(
                         accumulator <= accumulator + power;
                         sample_cnt <= sample_cnt + 1;
 
-                        if (sample_cnt == nsamp - 1) begin
+                        if (sample_cnt == nsamp_latched - 1) begin
                             finish_delay <= 1;
                         end
                     end

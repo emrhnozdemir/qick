@@ -65,7 +65,9 @@ module axis_avg_buffer
 		// AXIS Master for register output.
 		m2_axis_tvalid		,
 		m2_axis_tready		,
-		m2_axis_tdata        
+		m2_axis_tdata       ,
+		
+		avg_len_out //////////////////////////////////////////////////////////////////////////////
 	);
 
 /**************/
@@ -133,7 +135,7 @@ output				m2_axis_tvalid;
 input				m2_axis_tready;
 output	[4*B-1:0]	m2_axis_tdata;
 
-
+output  [31:0]      avg_len_out; ////////////////////////////////////////////////////////
 /********************/
 /* Internal signals */
 /********************/
@@ -154,7 +156,7 @@ wire				BUF_DR_START_REG;
 wire	[N_BUF-1:0]	BUF_DR_ADDR_REG;
 wire	[N_BUF-1:0]	BUF_DR_LEN_REG;
 
-
+assign avg_len_out = AVG_LEN_REG; /////////////////////////////////////////////////////////////
 /**********************/
 /* Begin Architecture */
 /**********************/
