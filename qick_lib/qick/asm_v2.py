@@ -2848,3 +2848,26 @@ class AveragerProgramV2(AcquireProgramV2):
             self.label(name)
             self.extend_macros(asm)
             self.ret()
+
+class QTagSweepProgram(AveragerProgramV2):
+    """
+    Custom QTAG Frequency Sweep Program interacting with Verilog module.
+    """
+    def _initialize(self, cfg):
+        f_start = cfg["start_freq"]
+        f_stop  = cfg["stop_freq"]
+        avg_val = cfg["averager_value"]
+        step_1  = cfg["first_sweep_step"]
+        step_2  = cfg["second_sweep_step"]
+        win_2   = cfg["second_sweep_window"]
+
+        self.asm_inst({'CMD': 'QTAG', 'OP': '0', 'DT1': str(f_start), 'DT2': str(f_stop), 'DT3': str(avg_val), 'DT4': str(step_1)})
+        self.asm_inst({'CMD': 'QTAG', 'OP': '3', 'DT1': '0', 'DT2': str(step_2), 'DT3': str(win_2), 'DT4': '0'})
+
+    def _body(self, cfg):
+        self.asm_inst({'CMD': 'QTAG', 'OP': '1'})
+        self.wait(1.0) 
+        self.asm_inst({'CMD': 'QTAG', 'OP': '2'})
+        
+        self.write_dmem(addr=0, src='s_core_r1') 
+        self.write_dmem(addr=1, src='s_core_r2')
