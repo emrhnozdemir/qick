@@ -2848,11 +2848,17 @@ class AveragerProgramV2(AcquireProgramV2):
             self.label(name)
             self.extend_macros(asm)
             self.ret()
-
+#####################################################################################################################################
 class QTagSweepProgram(AveragerProgramV2):
-    """
-    Custom QTAG Frequency Sweep Program interacting with Verilog module.
-    """
+    
+    def _make_binprog(self):
+        """
+        OVERRIDE: This allows compile() and make_program() to run normally, 
+        but skips the final binary generation step so the desktop 
+        compiler doesn't crash on the custom 'QTAG' command.
+        """
+        self.binprog = {'pmem': None, 'wmem': None, 'dmem': None}
+
     def _initialize(self, cfg):
         f_start = cfg["start_freq"]
         f_stop  = cfg["stop_freq"]
@@ -2861,13 +2867,20 @@ class QTagSweepProgram(AveragerProgramV2):
         step_2  = cfg["second_sweep_step"]
         win_2   = cfg["second_sweep_window"]
 
+        # Sending setup parameters
         self.asm_inst({'CMD': 'QTAG', 'OP': '0', 'DT1': str(f_start), 'DT2': str(f_stop), 'DT3': str(avg_val), 'DT4': str(step_1)})
         self.asm_inst({'CMD': 'QTAG', 'OP': '3', 'DT1': '0', 'DT2': str(step_2), 'DT3': str(win_2), 'DT4': '0'})
 
     def _body(self, cfg):
+        # Trigger the hardware
         self.asm_inst({'CMD': 'QTAG', 'OP': '1'})
+        
+        # Wait for 1.0 us
         self.wait(1.0) 
+        
+        # Read the outputs
         self.asm_inst({'CMD': 'QTAG', 'OP': '2'})
         
+        # Write outputs from the tProc core registers to Data Memory (DMEM)
         self.write_dmem(addr=0, src='s_core_r1') 
         self.write_dmem(addr=1, src='s_core_r2')
