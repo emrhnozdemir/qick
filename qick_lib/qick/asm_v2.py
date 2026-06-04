@@ -2849,14 +2849,15 @@ class AveragerProgramV2(AcquireProgramV2):
             self.extend_macros(asm)
             self.ret()
 #####################################################################################################################################
+"""
 class QTagSweepProgram(AveragerProgramV2):
     
     def _make_binprog(self):
-        """
+        """ """
         OVERRIDE: This allows compile() and make_program() to run normally, 
         but skips the final binary generation step so the desktop 
         compiler doesn't crash on the custom 'QTAG' command.
-        """
+        """ """
         self.binprog = {'pmem': None, 'wmem': None, 'dmem': None}
 
     def _initialize(self, cfg):
@@ -2884,3 +2885,31 @@ class QTagSweepProgram(AveragerProgramV2):
         # Write outputs from the tProc core registers to Data Memory (DMEM)
         self.write_dmem(addr=0, src='s_core_r1') 
         self.write_dmem(addr=1, src='s_core_r2')
+"""
+class QTagSweepProgram(AveragerProgramV2):
+    
+    # Notice: _make_binprog is GONE!
+
+    def _initialize(self, cfg):
+        # 1. Load registers
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 's1', 'SRC': 'imm', 'LIT': str(cfg["start_freq"])})
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 's2', 'SRC': 'imm', 'LIT': str(cfg["stop_freq"])})
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 's3', 'SRC': 'imm', 'LIT': str(cfg["averager_value"])})
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 's4', 'SRC': 'imm', 'LIT': str(cfg["first_sweep_step"])})
+
+        # 2. Fire peripheral 2 (qp2)
+        self.asm_inst({'CMD': 'CUSTOM', 'OP': '0', 'PORT': '2', 'A': 's1', 'B': 's2', 'C': 's3', 'D': 's4'})
+        
+        # ... (do the same for OP=3) ...
+
+    def _body(self, cfg):
+        # Trigger the hardware (OP=1)
+        self.asm_inst({'CMD': 'CUSTOM', 'OP': '1', 'PORT': '2', 'A': 's0', 'B': 's0', 'C': 's0', 'D': 's0'})
+        
+        self.wait(1.0) 
+        
+        # Read the outputs (OP=2)
+        self.asm_inst({'CMD': 'CUSTOM', 'OP': '2', 'PORT': '2', 'A': 's0', 'B': 's0', 'C': 's0', 'D': 's0'})
+        
+        self.write_dmem(addr=0, src='s_core_r1') 
+        self.write_dmem(addr=1, src='s_core_r2')   

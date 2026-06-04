@@ -2351,4 +2351,99 @@ class AcquireMixin:
             print("Dumped SG envelope table memory to file sg_%0d.mem"%(sg_idx))
         else:
             print(s)
+###########################################################################################################################
+    def print_qtag_protocol(self, gen_file=False):
+        """
+        Simulates and prints the hardware communication protocol 
+        sent to the custom Verilog module for RTL simulation.
+        """
+        s = "--- Simulated tProc -> Custom Module Bus Transactions ---\n"
+        
+        # In a real compilation, we would read self.binprog. 
+        # Here we read the expanded text macros.
+        for idx, inst in enumerate(self.prog_list):
+            if inst.get('CMD') == 'QTAG':
+                # Extract the raw strings
+                op = inst.get('OP', '0')
+                dt1 = inst.get('DT1', '0')
+                dt2 = inst.get('DT2', '0')
+                dt3 = inst.get('DT3', '0')
+                dt4 = inst.get('DT4', '0')
+                
+                # Format exactly how the digital bus sends it (e.g., as hex or packed 32-bit words)
+                # This formatting should perfectly match your Verilog module's expected inputs
+                s += f"Cycle [{idx:02d}]: VALID=1 | OP={op} | DT1={dt1} | DT2={dt2} | DT3={dt3} | DT4={dt4}\n"
+            
+            elif inst.get('CMD') == 'WAIT':
+                time_val = inst.get('TIME', '@0').replace('@', '')
+                s += f"Cycle [{idx:02d}]: VALID=0 | Holding bus for {time_val} clock cycles...\n"
 
+        if gen_file:
+            with open("qtag_protocol.txt", "w") as file:
+                print(s, file=file)
+            print("Dumped communication protocol to qtag_protocol.txt")
+        else:
+            print(s)
+
+
+    def finetune(self, start_freq, stop_freq, averager_value, first_sweep_step, 
+                 second_sweep_step, second_sweep_window, pulse_gain, pulse_len, trig_time):
+        """
+        Low-level assembly generator for the closed-loop frequency sweep.
+        Takes explicit sweep and RF parameters as inputs.
+        """
+        # ---------------------------------------------------------
+        # 1. SETUP & START (Using explicit inputs)
+        # ---------------------------------------------------------
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 's1', 'SRC': 'imm', 'LIT': f'#{start_freq}'})
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 's2', 'SRC': 'imm', 'LIT': f'#{stop_freq}'})
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 's3', 'SRC': 'imm', 'LIT': f'#{averager_value}'})
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 's4', 'SRC': 'imm', 'LIT': f'#{first_sweep_step}'})
+        
+        self.asm_inst({'CMD': 'PB', 'C_OP': '0', 'R1': 's1', 'R2': 's2', 'R3': 's3', 'R4': 's4'})
+        
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 's1', 'SRC': 'imm', 'LIT': '#0'})
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 's2', 'SRC': 'imm', 'LIT': f'#{second_sweep_step}'})
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 's3', 'SRC': 'imm', 'LIT': f'#{second_sweep_window}'})
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 's4', 'SRC': 'imm', 'LIT': '#0'})
+        
+        self.asm_inst({'CMD': 'PB', 'C_OP': '3', 'R1': 's1', 'R2': 's2', 'R3': 's3', 'R4': 's4'})
+
+        # Start the module
+        self.asm_inst({'CMD': 'PB', 'C_OP': '1', 'R1': 's0', 'R2': 's0', 'R3': 's0', 'R4': 's0'})
+
+        # ---------------------------------------------------------
+        # 2. POLLING LOOP
+        # ---------------------------------------------------------
+        self.add_label("POLL_MODULE")
+        self.asm_inst({'CMD': 'PB', 'C_OP': '2', 'R1': 's0', 'R2': 's0', 'R3': 's0', 'R4': 's0'})
+        
+        # Check sticky_finish (Bit 0)
+        self.asm_inst({'CMD': 'TEST', 'OP': 's_core_r2 AND #1'})
+        self.asm_inst({'CMD': 'JUMP', 'IF': 'NZ', 'LABEL': 'END_SWEEP'})
+        
+        # Check sticky_freq_valid (Bit 1)
+        self.asm_inst({'CMD': 'TEST', 'OP': 's_core_r2 AND #2'})
+        self.asm_inst({'CMD': 'JUMP', 'IF': 'Z', 'LABEL': 'POLL_MODULE'})
+
+        # ---------------------------------------------------------
+        # 3. APPLY FREQUENCY & FIRE (Using explicit inputs)
+        # ---------------------------------------------------------
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 'gen_freq_reg', 'SRC': 'op', 'OP': 's_core_r1'})
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 'ro_freq_reg',  'SRC': 'op', 'OP': 's_core_r1'})
+        
+        # Use the explicit pulse_gain input
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 'gen_gain_reg',  'SRC': 'imm', 'LIT': f'#{pulse_gain}'})
+        self.asm_inst({'CMD': 'REG_WR', 'DST': 'gen_phase_reg', 'SRC': 'imm', 'LIT': '#0'})
+        
+        self.asm_inst({'CMD': 'TRIG', 'PINS': '#1'}) 
+        
+        # Use the explicit timing inputs to calculate the wait
+        self.wait(pulse_len + trig_time)
+        
+        self.asm_inst({'CMD': 'JUMP', 'LABEL': 'POLL_MODULE'})
+
+        # ---------------------------------------------------------
+        # 4. END OF SWEEP
+        # ---------------------------------------------------------
+        self.add_label("END_SWEEP")
