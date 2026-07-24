@@ -71,3 +71,13 @@ Temporary Items
 
 !/.gitignore
 !/README.md
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Graphify output
+graphify-out/
+
+# Personal Files
+personal_files/
