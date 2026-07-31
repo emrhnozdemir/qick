@@ -1,4 +1,4 @@
-module axi_slv
+module axi_slv_adaptive_sweep
    (
       input    wire              s_axi_aclk     ,
       input    wire              s_axi_aresetn  ,
@@ -68,9 +68,7 @@ reg   axi_rvalid;
 // ADDR_LSB = 3 for 64 bits (n downto 3)
 localparam integer ADDR_LSB = (C_S_AXI_DATA_WIDTH/32) + 1;
 localparam integer OPT_MEM_ADDR_BITS = 5;
-//----------------------------------------------
-//-- Signals for user logic register space example
-//------------------------------------------------
+
 //-- Number of Slave Registers 64
 reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg0;
 reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg1;

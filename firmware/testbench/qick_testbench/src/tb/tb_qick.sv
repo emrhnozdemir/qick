@@ -50,9 +50,6 @@ module tb_qick ();
 //----------------------------------------------------
 // Define Test to run
 //----------------------------------------------------
-// string TEST_NAME = "test_adaptive_sweep";
-// string TEST_NAME = "test_fine_tuning_sweep";
-string TEST_NAME = "test_dual_channel";
 // string TEST_NAME = "test_basic_pulses";
 // string TEST_NAME = "test_fast_short_pulses";
 // string TEST_NAME = "test_many_envelopes";
@@ -62,6 +59,7 @@ string TEST_NAME = "test_dual_channel";
 // string TEST_NAME = "test_issue53";
 // string TEST_NAME = "test_randomized_benchmarking";
 // string TEST_NAME = "test_qubit_emulator";
+string TEST_NAME = "test_adaptive_sweep";
 //----------------------------------------------------
 
 // Default Simulation Settings
@@ -70,14 +68,16 @@ time TEST_READ_TIME        = 1us;   // Time to read data from buffers
 time REPEAT_EXEC           = 2;     // Number of Times to Repeat tProc Program Execution
 string TEST_OUT_CONNECTION = "TEST_OUT_LOOPBACK";     // Connect DAC/ADC in Loopback
 // string TEST_OUT_CONNECTION = "TEST_OUT_QEMU";         // Qubit Emulator
-// string TEST_OUT_CONNECTION = "TEST_OUT_RESONATOR";       // Resonator emulator (DAC->emu->ADC->readout)
-// string TEST_OUT_CONNECTION = "TEST_OUT_RESONATOR_BYPASS"; // Bypass readout DSP -- see block below axis_dyn_readout_v1_0 instance
+//----------------------------------------------------
+
+// What feeds adaptive_sweep's s_axis (see the ADAPTIVE SWEEP section below)
+// string AS_STREAM_SRC       = "AS_SRC_AVGBUF";  // live readout -> avg_buffer m2
+string AS_STREAM_SRC       = "AS_SRC_IQFILE";  // replay <test>/iq_shots.mem
 //----------------------------------------------------
 
 // VIP Agents
 axi_mst_0_mst_t     axi_mst_tproc_agent;
 axi_mst_0_mst_t     axi_mst_sg_agent;
-axi_mst_0_mst_t     axi_mst_sg_1_agent;
 axi_mst_0_mst_t     axi_mst_avg_agent;
 axi_mst_0_mst_t     axi_mst_qemu_agent;
 
@@ -149,6 +149,7 @@ reg [63 :0]        port_1_dt_i          ;
 
 
 logic              m0_axis_tready;
+reg                m1_axis_tready   =0    ;
 reg                m2_axis_tready   =0    ;
 reg                m3_axis_tready   =0    ;
 
@@ -162,6 +163,8 @@ wire               m_dma_axis_tlast_o   ;
 wire               m_dma_axis_tvalid_o  ;
 
 // tProc Interface
+wire [167:0]       m1_axis_tdata        ;
+wire               m1_axis_tvalid       ;
 wire [167:0]       m2_axis_tdata        ;
 wire               m2_axis_tvalid       ;
 wire [167:0]       m3_axis_tdata        ;
@@ -191,19 +194,6 @@ wire [159:0]       sgt_sg_0_axis_tdata ;
 wire               sgt_sg_0_axis_tvalid;
 logic              sgt_sg_0_axis_tready;
 
-// Signal Generator Path signals - CH1
-wire [167:0]       tproc_sgcdc_1_axis_tdata ;
-wire               tproc_sgcdc_1_axis_tvalid;
-logic              tproc_sgcdc_1_axis_tready;
-
-wire [167:0]       sgcdc_sgt_1_axis_tdata ;
-wire               sgcdc_sgt_1_axis_tvalid;
-logic              sgcdc_sgt_1_axis_tready;
-
-wire [159:0]       sgt_sg_1_axis_tdata ;
-wire               sgt_sg_1_axis_tvalid;
-logic              sgt_sg_1_axis_tready;
-
 // Readout Path signals
 wire [167:0]       tproc_rocdc_0_axis_tdata ;
 wire               tproc_rocdc_0_axis_tvalid;
@@ -229,7 +219,7 @@ reg  [31 :0]        qnet_dt_i [2]   ;
 reg  [31 :0]        qcom_dt_i [2]   ;
 
 reg  [31 :0]        qp1_dt_i [2]   ;
-reg  [31 :0]        qp2_dt_i [2]   ;
+wire [31 :0]        qp2_dt_i [2]   ;   // driven by adaptive_sweep
 
 wire                periph_en_o   ;
 wire  [4 :0]        periph_op_o   ;
@@ -282,18 +272,20 @@ assign periph_flag_i     = ~t_time_abs_o[5] &  t_time_abs_o[4] & t_time_abs_o[3]
 assign ext_flag_i        =  t_time_abs_o[5] &  t_time_abs_o[4] & t_time_abs_o[3] ;
 
 // reg  periph_vld_i  ;
-reg qcom_rdy_i, qp2_rdy_i;
+reg qcom_rdy_i;
+
+// Q Peripheral B -> adaptive_sweep (driven by the IP, see ADAPTIVE SWEEP below)
+wire        qp2_en_o;
+wire [4:0]  qp2_op_o;
+wire [31:0] qp2_a_dt_o, qp2_b_dt_o, qp2_c_dt_o, qp2_d_dt_o;
+wire        qp2_rdy_i;
+wire        qp2_vld_i;
 
 
    // DAC-ADC connections
    logic                   axis_sg_dac_tready;
    logic                   axis_sg_dac_tvalid;
    logic [N_DDS*16-1:0]    axis_sg_dac_tdata;
-
-   // CH1 DAC connection
-   logic                   axis_sg_dac_tready_1;
-   logic                   axis_sg_dac_tvalid_1;
-   logic [N_DDS*16-1:0]    axis_sg_dac_tdata_1;
 
    logic                   rf_signal_valid;
    logic [8*16-1:0]        rf_signal_data;
@@ -367,95 +359,6 @@ reg qcom_rdy_i, qp2_rdy_i;
       .m_axi_wready  (s_axi_tproc_wready  ),
       .m_axi_wstrb   (s_axi_tproc_wstrb   ),
       .m_axi_wvalid  (s_axi_tproc_wvalid  )
-   );
-    
-   // --- QP2 wires (shared by adaptive_sweep and fine_tuning_sweep) ---
-   wire        qp2_en_o;
-   wire [4:0]  qp2_op_o;
-   wire [31:0] qp2_a_dt_o, qp2_b_dt_o, qp2_c_dt_o, qp2_d_dt_o;
-   wire        qp2_vld_i;
-
-   // === Only ONE of u_adaptive_sweep / u_fine_tuning_sweep may be live at a
-   // === time -- both drive qp2_rdy_i / qp2_dt_i / qp2_vld_i.
-
-   // --- ADAPTIVE_SWEEP: Instance on QP2 (Peripheral B) ---
-   // Section 9 KW + Polyak + bisection algorithm.  Snoops the decimated
-   // I/Q output of u_axis_dyn_readout_v1_0 (axis_ro_avg_*) on ro_clk and
-   // is armed by trigger_0 from the tProc.
-   //
-   // ** DISABLED while running test_fine_tuning_sweep. **
-   /*
-   adaptive_sweep #(
-      .LUT_DEPTH          (256),
-      .LUT_AW             (8),
-      .X_WIDTH            (32),
-      .IQ_WIDTH           (16),
-      .SUM_WIDTH          (48),
-      .POW_WIDTH          (32),
-      .COUNT_WIDTH        (16),
-      .RO_FIFO_DEPTH_LOG2 (6),
-      .KW_TOL             (32'h0000_07D0)
-   ) u_adaptive_sweep (
-      .clk               (c_clk),
-      .rst_n             (rst_ni),
-      // QP2 (unchanged)
-      .qtag_en_i         (qp2_en_o),
-      .qtag_op_i         (qp2_op_o),
-      .qtag_dt1_i        (qp2_a_dt_o),
-      .qtag_dt2_i        (qp2_b_dt_o),
-      .qtag_dt3_i        (qp2_c_dt_o),
-      .qtag_dt4_i        (qp2_d_dt_o),
-      .qtag_rdy_o        (qp2_rdy_i),
-      .qtag_dt1_o        (qp2_dt_i[0]),
-      .qtag_dt2_o        (qp2_dt_i[1]),
-      .qtag_vld_o        (qp2_vld_i),
-      // Readout snoop (m1_axis of u_axis_dyn_readout_v1_0 -> avg_buffer).
-      // We do NOT drive axis_ro_avg_tready; the avg_buffer keeps that role.
-      // Our internal tready output is left unconnected (hardwired to 1 inside).
-      .s_ro_axis_aclk    (ro_clk),
-      .s_ro_axis_aresetn (rst_ni),
-      .s_ro_axis_tdata   (axis_ro_avg_tdata),
-      .s_ro_axis_tvalid  (axis_ro_avg_tvalid),
-      .s_ro_axis_tready  (),
-      // Trigger from tProc (already declared at line ~175 as wire trigger_0)
-      .trigger_i         (trigger_0)
-   );
-   */
-
-   // --- FINE_TUNING_SWEEP: Two-pass peak finder on QP2 ---
-   // Coarse sweep -> argmax -> fine sweep in [argmax-window, argmax+window].
-   //
-   // Dual-clock IP: peak_finder + QP2 FSM on clk (c_clk); amplitude_calculator
-   // on s_axis_aclk (= ro_clk in the real BD).  Here in the TB we tie
-   // s_axis_aclk = c_clk so the BYPASS streamer (which drives axis_ro_avg_*
-   // from c_clk regs) keeps working without an extra CDC.
-   //
-   // nsamp is now a software-programmable register inside the IP (QP2 OP 4).
-   // Default after reset is 256; the tProc program can override before OP 1.
-   fine_tuning_sweep #(
-      .MAX_AVG (64)
-   ) u_fine_tuning_sweep (
-      // c_clk domain
-      .clk            (c_clk),
-      .rst_n          (rst_ni),
-      // QP2 (c_clk)
-      .qtag_en_i      (qp2_en_o),
-      .qtag_op_i      (qp2_op_o),
-      .qtag_dt1_i     (qp2_a_dt_o),
-      .qtag_dt2_i     (qp2_b_dt_o),
-      .qtag_dt3_i     (qp2_c_dt_o),
-      .qtag_dt4_i     (qp2_d_dt_o),
-      .qtag_rdy_o     (qp2_rdy_i),
-      .qtag_dt1_o     (qp2_dt_i[0]),
-      .qtag_dt2_o     (qp2_dt_i[1]),
-      .qtag_vld_o     (qp2_vld_i),
-      // Trigger pulse from tProc (c_clk)
-      .trigger        (trigger_0),
-      // s_axis_aclk domain (tied to c_clk in TB; ro_clk in BD)
-      .s_axis_aclk    (c_clk),
-      .s_axis_aresetn (rst_ni),
-      .s_axis_tvalid  (axis_ro_avg_tvalid),
-      .s_axis_tdata   (axis_ro_avg_tdata)   // [31:16]=I  [15:0]=Q
    );
 
    axis_qick_processor # (
@@ -531,17 +434,17 @@ reg qcom_rdy_i, qp2_rdy_i;
       .qp1_dt2_i          ( qp1_dt_i[1]       ) ,
       .qp1_vld_i          ( qp1_vld_i         ) ,
       .qp1_flag_i         ( qp1_flag_i        ) ,
-      // QP2
-      .qp2_en_o           ( qp2_en_o      ) ,
-      .qp2_op_o           ( qp2_op_o      ) ,
-      .qp2_a_dt_o         ( qp2_a_dt_o    ) ,
-      .qp2_b_dt_o         ( qp2_b_dt_o    ) ,
-      .qp2_c_dt_o         ( qp2_c_dt_o    ) ,
-      .qp2_d_dt_o         ( qp2_d_dt_o    ) ,
-      .qp2_rdy_i          ( qp2_rdy_i     ) ,
-      .qp2_dt1_i          ( qp2_dt_i[0]   ) ,
-      .qp2_dt2_i          ( qp2_dt_i[1]   ) ,
-      .qp2_vld_i          ( qp2_vld_i     ) ,
+      // QP2 -- QPeriphB, wired to adaptive_sweep as in the d_1 block design
+      .qp2_en_o           ( qp2_en_o          ) ,
+      .qp2_op_o           ( qp2_op_o          ) ,
+      .qp2_a_dt_o         ( qp2_a_dt_o        ) ,
+      .qp2_b_dt_o         ( qp2_b_dt_o        ) ,
+      .qp2_c_dt_o         ( qp2_c_dt_o        ) ,
+      .qp2_d_dt_o         ( qp2_d_dt_o        ) ,
+      .qp2_rdy_i          ( qp2_rdy_i         ) ,
+      .qp2_dt1_i          ( qp2_dt_i[0]       ) ,
+      .qp2_dt2_i          ( qp2_dt_i[1]       ) ,
+      .qp2_vld_i          ( qp2_vld_i         ) ,
       // DMA AXIS FOR READ AND WRITE MEMORY
       .s_dma_axis_tdata_i   ( s_dma_axis_tdata_i  ) ,
       .s_dma_axis_tlast_i   ( s_dma_axis_tlast_i  ) ,
@@ -592,9 +495,9 @@ reg qcom_rdy_i, qp2_rdy_i;
       .m0_axis_tdata        ( tproc_sgcdc_0_axis_tdata  ) ,
       .m0_axis_tvalid       ( tproc_sgcdc_0_axis_tvalid ) ,
       .m0_axis_tready       ( tproc_sgcdc_0_axis_tready ) ,
-      .m1_axis_tdata        ( tproc_sgcdc_1_axis_tdata  ) ,
-      .m1_axis_tvalid       ( tproc_sgcdc_1_axis_tvalid ) ,
-      .m1_axis_tready       ( tproc_sgcdc_1_axis_tready ) ,
+      .m1_axis_tdata        ( /*m1_axis_tdata*/       ) ,
+      .m1_axis_tvalid       ( /*m1_axis_tvalid*/      ) ,
+      .m1_axis_tready       ( m1_axis_tready          ) ,
       .m2_axis_tdata        ( /*m2_axis_tdata*/       ) ,
       .m2_axis_tvalid       ( /*m2_axis_tvalid*/      ) ,
       .m2_axis_tready       ( m2_axis_tready          ) ,
@@ -699,7 +602,7 @@ reg qcom_rdy_i, qp2_rdy_i;
 
 
    axis_cdcsync_v1 #(
-      .N                         (2),     // Number of inputs/outputs.
+      .N                         (1),     // Number of inputs/outputs.
       .B                         (168)    // Number of data bits.
    )
    u_axis_sgcdcsync_v1 (
@@ -709,9 +612,9 @@ reg qcom_rdy_i, qp2_rdy_i;
       .s0_axis_tready            (tproc_sgcdc_0_axis_tready),
       .s0_axis_tvalid            (tproc_sgcdc_0_axis_tvalid),
       .s0_axis_tdata             (tproc_sgcdc_0_axis_tdata),
-      .s1_axis_tready            (tproc_sgcdc_1_axis_tready),
-      .s1_axis_tvalid            (tproc_sgcdc_1_axis_tvalid),
-      .s1_axis_tdata             (tproc_sgcdc_1_axis_tdata),
+      .s1_axis_tready            (/*s1_axis_tready*/),
+      .s1_axis_tvalid            (/*s1_axis_tvalid*/),
+      .s1_axis_tdata             (/*s1_axis_tdata*/),
       .s2_axis_tready            (/*s2_axis_tready*/),
       .s2_axis_tvalid            (/*s2_axis_tvalid*/),
       .s2_axis_tdata             (/*s2_axis_tdata*/),
@@ -760,9 +663,9 @@ reg qcom_rdy_i, qp2_rdy_i;
       .m0_axis_tready            (sgcdc_sgt_0_axis_tready),
       .m0_axis_tvalid            (sgcdc_sgt_0_axis_tvalid),
       .m0_axis_tdata             (sgcdc_sgt_0_axis_tdata),
-      .m1_axis_tready            (sgcdc_sgt_1_axis_tready),
-      .m1_axis_tvalid            (sgcdc_sgt_1_axis_tvalid),
-      .m1_axis_tdata             (sgcdc_sgt_1_axis_tdata),
+      .m1_axis_tready            (/*m1_axis_tready*/),
+      .m1_axis_tvalid            (/*m1_axis_tvalid*/),
+      .m1_axis_tdata             (/*m1_axis_tdata*/),
       .m2_axis_tready            (/*m2_axis_tready*/),
       .m2_axis_tvalid            (/*m2_axis_tvalid*/),
       .m2_axis_tdata             (/*m2_axis_tdata*/),
@@ -905,161 +808,13 @@ reg qcom_rdy_i, qp2_rdy_i;
 
 
    //--------------------------------------
-   // SIGNAL GENERATOR - CH1
-   //--------------------------------------
-
-   wire  [5:0]       s_axi_sg1_araddr;
-   wire  [2:0]       s_axi_sg1_arprot;
-   wire              s_axi_sg1_arready;
-   wire              s_axi_sg1_arvalid;
-   wire  [5:0]       s_axi_sg1_awaddr;
-   wire  [2:0]       s_axi_sg1_awprot;
-   wire              s_axi_sg1_awready;
-   wire              s_axi_sg1_awvalid;
-   wire              s_axi_sg1_bready;
-   wire  [1:0]       s_axi_sg1_bresp;
-   wire              s_axi_sg1_bvalid;
-   wire  [31:0]      s_axi_sg1_rdata;
-   wire              s_axi_sg1_rready;
-   wire  [1:0]       s_axi_sg1_rresp;
-   wire              s_axi_sg1_rvalid;
-   wire  [31:0]      s_axi_sg1_wdata;
-   wire              s_axi_sg1_wready;
-   wire  [3:0]       s_axi_sg1_wstrb;
-   wire              s_axi_sg1_wvalid;
-
-   axi_mst_0 u_axi_mst_sg_1 (
-      .aclk          (s_ps_dma_aclk    ),
-      .aresetn       (s_ps_dma_aresetn ),
-      .m_axi_araddr  (s_axi_sg1_araddr ),
-      .m_axi_arprot  (s_axi_sg1_arprot ),
-      .m_axi_arready (s_axi_sg1_arready),
-      .m_axi_arvalid (s_axi_sg1_arvalid),
-      .m_axi_awaddr  (s_axi_sg1_awaddr ),
-      .m_axi_awprot  (s_axi_sg1_awprot ),
-      .m_axi_awready (s_axi_sg1_awready),
-      .m_axi_awvalid (s_axi_sg1_awvalid),
-      .m_axi_bready  (s_axi_sg1_bready ),
-      .m_axi_bresp   (s_axi_sg1_bresp  ),
-      .m_axi_bvalid  (s_axi_sg1_bvalid ),
-      .m_axi_rdata   (s_axi_sg1_rdata  ),
-      .m_axi_rready  (s_axi_sg1_rready ),
-      .m_axi_rresp   (s_axi_sg1_rresp  ),
-      .m_axi_rvalid  (s_axi_sg1_rvalid ),
-      .m_axi_wdata   (s_axi_sg1_wdata  ),
-      .m_axi_wready  (s_axi_sg1_wready ),
-      .m_axi_wstrb   (s_axi_sg1_wstrb  ),
-      .m_axi_wvalid  (s_axi_sg1_wvalid )
-   );
-
-   wire sg_s1_axis_aclk = s_ps_dma_aclk;
-   logic   [31:0]       sg_s1_axis_tdata;
-   logic                sg_s1_axis_tready;
-   logic                sg_s1_axis_tvalid;
-
-   logic tb_load_mem_1, tb_load_mem_done_1;
-
-   sg_translator # (
-      .OUT_TYPE               (0) // (0:gen_v6, 1:int4_v1, 2:mux4_v1, 3:readout)
-   )
-   u_sg_translator_1 (
-      // Reset and clock.
-      .aresetn                (1'bx),  // not used
-      .aclk                   (1'bx),  // not used
-      // IN WAVE PORT
-      .s_axis_tdata           (sgcdc_sgt_1_axis_tdata),
-      .s_axis_tvalid          (sgcdc_sgt_1_axis_tvalid),
-      .s_axis_tready          (sgcdc_sgt_1_axis_tready),
-      // OUT DATA gen_v6 (SEL:0)
-      .m_gen_v6_axis_tdata    (sgt_sg_1_axis_tdata),
-      .m_gen_v6_axis_tvalid   (sgt_sg_1_axis_tvalid),
-      .m_gen_v6_axis_tready   (sgt_sg_1_axis_tready),
-      // OUT DATA int4_v1 (SEL:1)
-      .m_int4_axis_tdata      (),
-      .m_int4_axis_tvalid     (),
-      .m_int4_axis_tready     (),
-      // OUT DATA mux4_v1 (SEL:2)
-      .m_mux4_axis_tdata      (),
-      .m_mux4_axis_tvalid     (),
-      .m_mux4_axis_tready     (),
-      // OUT DATA readout_v3 (SEL:3)
-      .m_readout_axis_tdata   (),
-      .m_readout_axis_tvalid  (),
-      .m_readout_axis_tready  ()
-   );
-
-   axis_signal_gen_v6 #(
-      .N                   (N                ),
-      .N_DDS               (N_DDS            ),
-      .GEN_DDS             ("TRUE"           ),
-      .ENVELOPE_TYPE       ("COMPLEX"        )
-   )
-   u_axis_signal_gen_v6_1 (
-      // AXI Slave I/F for configuration.
-      .s_axi_aclk          (s_ps_dma_aclk    ),
-      .s_axi_aresetn       (s_ps_dma_aresetn ),
-      .s_axi_araddr        (s_axi_sg1_araddr ),
-      .s_axi_arprot        (s_axi_sg1_arprot ),
-      .s_axi_arready       (s_axi_sg1_arready),
-      .s_axi_arvalid       (s_axi_sg1_arvalid),
-      .s_axi_awaddr        (s_axi_sg1_awaddr ),
-      .s_axi_awprot        (s_axi_sg1_awprot ),
-      .s_axi_awready       (s_axi_sg1_awready),
-      .s_axi_awvalid       (s_axi_sg1_awvalid),
-      .s_axi_bready        (s_axi_sg1_bready ),
-      .s_axi_bresp         (s_axi_sg1_bresp  ),
-      .s_axi_bvalid        (s_axi_sg1_bvalid ),
-      .s_axi_rdata         (s_axi_sg1_rdata  ),
-      .s_axi_rready        (s_axi_sg1_rready ),
-      .s_axi_rresp         (s_axi_sg1_rresp  ),
-      .s_axi_rvalid        (s_axi_sg1_rvalid ),
-      .s_axi_wdata         (s_axi_sg1_wdata  ),
-      .s_axi_wready        (s_axi_sg1_wready ),
-      .s_axi_wstrb         (s_axi_sg1_wstrb  ),
-      .s_axi_wvalid        (s_axi_sg1_wvalid ),
-
-      // AXIS Slave to load data into memory.
-      .s0_axis_aclk        (s_ps_dma_aclk      ),
-      .s0_axis_aresetn     (s_ps_dma_aresetn   ),
-      .s0_axis_tdata       (sg_s1_axis_tdata   ),
-      .s0_axis_tvalid      (sg_s1_axis_tvalid  ),
-      .s0_axis_tready      (sg_s1_axis_tready  ),
-
-      // s1_* and m_* reset/clock.
-      .aresetn             (rst_ni           ),
-      .aclk                (sg_clk           ),
-
-      // AXIS Slave to queue waveforms - From TPROC
-      .s1_axis_tdata       (sgt_sg_1_axis_tdata    ),
-      .s1_axis_tvalid      (sgt_sg_1_axis_tvalid   ),
-      .s1_axis_tready      (sgt_sg_1_axis_tready   ),
-
-      // AXIS Master for output data.
-      .m_axis_tready       (axis_sg_dac_tready_1   ),
-      .m_axis_tvalid       (axis_sg_dac_tvalid_1   ),
-      .m_axis_tdata        (axis_sg_dac_tdata_1    )
-   );
-
-
-   // For Waveform Debug - CH1
-   logic signed [15:0] axis_sg_dac_tdata_1_dbg [0:N_DDS-1];
-   always @* begin
-      for (int i=0; i<N_DDS; i=i+1) begin
-         axis_sg_dac_tdata_1_dbg[i] = axis_sg_dac_tdata_1[16*i +: 16];
-      end
-   end
-
-
-   //--------------------------------------
    // TODO: RF DATA CONVERTER IP
    //--------------------------------------
 
    localparam DAC_W = 16;
    logic signed [DAC_W-1:0] dac_data;
-   logic signed [DAC_W-1:0] dac_data_1;
    localparam ADC_W = 14;
    logic signed [ADC_W-1:0] adc_sample;
-   logic signed [ADC_W-1:0] adc_sample_1;
    logic signed [15:0] adc_data;
 
    model_DAC_ADC #(
@@ -1072,20 +827,6 @@ reg qcom_rdy_i, qp2_rdy_i;
 
       .clk_ADC             (adc_fs),
       .adc_sample          (adc_sample),
-
-      .mode                (1)   // 0 = ZOH, 1 = linear
-   );
-
-   model_DAC_ADC #(
-      .DAC_W               (DAC_W),
-      .ADC_W               (ADC_W),
-      .BUFFER_SIZE         (16)
-   ) u_model_DAC_ADC_1 (
-      .clk_DAC             (dac_fs),
-      .dac_sample          (dac_data_1),
-
-      .clk_ADC             (adc_fs),
-      .adc_sample          (adc_sample_1),
 
       .mode                (1)   // 0 = ZOH, 1 = linear
    );
@@ -1108,21 +849,6 @@ reg qcom_rdy_i, qp2_rdy_i;
    // ADC RF to RO processes 8 samples per clock
 
    assign axis_sg_dac_tready        = 1'b1;  // DAC always ready to receive samples
-
-   // CH1 DAC demux
-   logic [$clog2(N_DDS)-1:0] dac_samp_cnt_1;
-   always @(posedge dac_fs) begin
-      if (axis_sg_dac_tvalid_1) begin
-         dac_data_1       <= axis_sg_dac_tdata_1[ 16*dac_samp_cnt_1 +: 16];
-         dac_samp_cnt_1   <= dac_samp_cnt_1 + 'd1;
-      end
-      else begin
-         dac_data_1       <= 'd0;
-         dac_samp_cnt_1   <= 'd0;
-      end
-   end
-
-   assign axis_sg_dac_tready_1      = 1'b1;  // CH1 DAC always ready to receive samples
 
    logic [$clog2(N_DDS)-1:0] adc_samp_cnt;
    always @(posedge adc_fs) begin
@@ -1276,40 +1002,6 @@ reg qcom_rdy_i, qp2_rdy_i;
    //    end
    // end
 
-   //--------------------------------------
-   // Resonator Emulator (test_adaptive_sweep)
-   //--------------------------------------
-   // Stands in for a superconducting resonator/qubit.  Plays back a
-   // Python-generated I/Q dataset (iq_shots.mem) indexed by drive
-   // frequency, modulated onto the carrier so axis_dyn_readout_v1's
-   // demodulation recovers the intended (I, Q) at m1_axis.
-   wire [8*16-1:0]  emu_adc_tdata;
-   wire             emu_adc_tvalid;
-   wire             emu_enable = (TEST_OUT_CONNECTION == "TEST_OUT_RESONATOR");
-
-   resonator_emulator #(
-      .N_SWEEP    (1000),
-      .N_SHOTS    (1000),
-      .F_START_HZ (3.0e9),
-      .F_STEP_HZ  (1.001001e6),
-      .IQ_SCALE   (16384),
-      .F_DAC_HZ   (6.144e9),
-      .MEM_FILE   ("../../../../src/tb/test_adaptive_sweep/iq_shots.mem")
-   ) u_resonator_emulator (
-      .clk_sg            (sg_clk),
-      .clk_adc           (adc_fs),
-      .clk_ro            (ro_clk),
-      .rst_n             (rst_ni),
-      .enable            (emu_enable),
-      // Snoop drive pinc from the SG waveform queue (sgt_sg_0_axis_*)
-      .sg_queue_tdata    (sgt_sg_0_axis_tdata),
-      .sg_queue_tvalid   (sgt_sg_0_axis_tvalid),
-      .sg_queue_tready   (sgt_sg_0_axis_tready),
-      // Modulated ADC samples
-      .m_adc_axis_tdata  (emu_adc_tdata),
-      .m_adc_axis_tvalid (emu_adc_tvalid)
-   );
-
    logic [2:0] rf_signal_cnt;
    always_ff @(posedge adc_fs) begin
       if (TEST_OUT_CONNECTION == "TEST_OUT_LOOPBACK") begin
@@ -1325,17 +1017,6 @@ reg qcom_rdy_i, qp2_rdy_i;
          else begin
             rf_signal_cnt  <= 0;
          end
-      end
-      else if (TEST_OUT_CONNECTION == "TEST_OUT_RESONATOR") begin
-         // REALISTIC: emulator's modulated 8 ADC samples drive the readout.
-         axis_adc_ro_tvalid                  <= emu_adc_tvalid;
-         axis_adc_ro_tdata[N_DDS_RO*16-1:0]  <= emu_adc_tdata;
-      end
-      else if (TEST_OUT_CONNECTION == "TEST_OUT_RESONATOR_BYPASS") begin
-         // Bypass: keep the readout's input quiet (its output m1_axis is
-         // force-overridden below; we just don't want X on its input).
-         axis_adc_ro_tvalid                  <= 1'b0;
-         axis_adc_ro_tdata[N_DDS_RO*16-1:0]  <= '0;
       end
    end
 
@@ -1526,81 +1207,6 @@ reg qcom_rdy_i, qp2_rdy_i;
       .m1_axis_tdata    (axis_ro_avg_tdata)
    );
 
-   //--------------------------------------------------------------------
-   // BYPASS streamer for test_fine_tuning_sweep
-   //
-   // Streams iq_shots.mem directly into axis_ro_avg_*, skipping
-   // axis_dyn_readout_v1 entirely.  Row index advances on each rising edge
-   // of u_fine_tuning_sweep.u_peak_finder_v2.freq_valid so each measurement
-   // step sees a fresh (I, Q) held constant for the whole nsamp*avg burst.
-   //
-   // Active only when TEST_OUT_CONNECTION == "TEST_OUT_RESONATOR_BYPASS".
-   // iq_shots.mem is generated by
-   //   personal_files/fine_tuning_sweep_simulation/gen_iq_lorentzian.py
-   // and read directly from that location (the Python reference simulator
-   // sim_fine_tuning_sweep.py reads the same file, so the two stay coherent).
-   //
-   // --- BEGIN BYPASS ---
-   localparam integer BYPASS_DEPTH = 128;
-   logic [31:0] bypass_iq_mem [0:BYPASS_DEPTH-1];
-   initial begin
-      $readmemh("../../../../../../../personal_files/fine_tuning_sweep_simulation/data/iq_shots.mem",
-                bypass_iq_mem);
-   end
-
-   logic [$clog2(BYPASS_DEPTH)-1:0] bypass_addr_r;
-   logic                            bypass_first_rise_done;
-
-   logic [31:0] bypass_tdata_r;
-   logic        bypass_tvalid_r;
-
-   // set_current_freq_now is already a one-cycle pulse (en_rise & op==1 in
-   // fine_tuning_sweep.v); one pulse per ASM step, before each TRIG.
-   wire bypass_step_pulse = u_fine_tuning_sweep.set_current_freq_now;
-
-   // --- BYPASS streamer behavior ---
-   //
-   // (1) bypass_tvalid_r toggles every c_clk.  The amplitude_calculator's
-   //     completion check `if (finish_delay && !acc_en)` requires acc_en to
-   //     drop after the last sample.  acc_en = run_d2 & v_s2 where v_s2 is
-   //     the 3-stage pipelined version of s_axis_tvalid.  If we drive tvalid
-   //     constantly high, v_s2 stays high, acc_en stays high, and the burst
-   //     never finishes.  Toggling gives v_s2 a low cycle so the completion
-   //     drain logic can fire.  Sample count is still nsamp because acc_en
-   //     only counts on the high cycles -- so a burst takes ~2*nsamp c_clks.
-   //
-   // (2) The FIRST set_current_freq_now pulse (OP 1 for step 0) does NOT
-   //     advance bypass_addr_r.  Skipping it keeps addr=0 when the first
-   //     TRIG fires so measurement 0 reads mem[0], measurement 1 reads
-   //     mem[1], ..., matching gen_iq_lorentzian.py's row order.
-   always_ff @(posedge c_clk) begin
-      if (!rst_ni) begin
-         bypass_addr_r          <= 0;
-         bypass_first_rise_done <= 1'b0;
-         bypass_tdata_r         <= 32'h0;
-         bypass_tvalid_r        <= 1'b0;
-      end else if (TEST_OUT_CONNECTION == "TEST_OUT_RESONATOR_BYPASS") begin
-         if (bypass_step_pulse) begin
-            if (bypass_first_rise_done && bypass_addr_r < BYPASS_DEPTH-1) begin
-               bypass_addr_r <= bypass_addr_r + 1;
-            end
-            bypass_first_rise_done <= 1'b1;
-         end
-         bypass_tdata_r  <= bypass_iq_mem[bypass_addr_r];
-         bypass_tvalid_r <= ~bypass_tvalid_r;
-      end
-   end
-
-   initial begin : bypass_force
-      wait (rst_ni == 1'b1);
-      if (TEST_OUT_CONNECTION == "TEST_OUT_RESONATOR_BYPASS") begin
-         force tb_qick.axis_ro_avg_tdata  = bypass_tdata_r;
-         force tb_qick.axis_ro_avg_tvalid = bypass_tvalid_r;
-      end
-   end
-   // --- END BYPASS ---
-   //--------------------------------------------------------------------
-
    // For Waveform Debug
    logic signed [15:0] axis_ro_avg_tdata_dbg [0:1];
    logic signed [15:0] axis_ro_mrbuf_tdata_dbg [0:7][0:1];
@@ -1687,6 +1293,10 @@ reg qcom_rdy_i, qp2_rdy_i;
    wire        m1_axis_buf_dec_tvalid;
    wire [31:0] m1_axis_buf_dec_tdata;
 
+   // m2 = per-shot accumulated {Q,I} sent to the tProc register / adaptive_sweep
+   wire        m2_axis_buf_acc_tvalid;
+   wire [63:0] m2_axis_buf_acc_tdata;
+
    axis_avg_buffer #(
       .N_AVG                  (13               ),
       .N_BUF                  (12               ),
@@ -1744,8 +1354,8 @@ reg qcom_rdy_i, qp2_rdy_i;
 
       // AXIS Master for register output.
       .m2_axis_tready         (1'b1/*m2_axis_tready*/),
-      .m2_axis_tvalid         (/*m2_axis_tvalid*/    ),
-      .m2_axis_tdata          (/*m2_axis_tdata*/     )
+      .m2_axis_tvalid         (m2_axis_buf_acc_tvalid),
+      .m2_axis_tdata          (m2_axis_buf_acc_tdata )
    );
 
    logic [64:0] buf_avg_abs_dbg;
@@ -1759,8 +1369,137 @@ reg qcom_rdy_i, qp2_rdy_i;
    logic [32:0] buf_dec_abs_dbg;
    always @(posedge s_ps_dma_aclk) begin
       if (m1_axis_buf_dec_tvalid) begin
-         buf_dec_abs_dbg = $signed(m1_axis_buf_dec_tdata[15:0]) * $signed(m1_axis_buf_dec_tdata[15:0]) + 
+         buf_dec_abs_dbg = $signed(m1_axis_buf_dec_tdata[15:0]) * $signed(m1_axis_buf_dec_tdata[15:0]) +
                               $signed(m1_axis_buf_dec_tdata[31:16]) * $signed(m1_axis_buf_dec_tdata[31:16]);
+      end
+   end
+
+//--------------------------------------
+// ADAPTIVE SWEEP
+//--------------------------------------
+// Mirrors the d_1 block design of qick_tprocv2_4x2_standard:
+//
+//   qick_processor_0/QPeriphB  ---------------------> adaptive_sweep_0/qick_peripheral
+//   axis_avg_buffer_0/m2_axis -> broadcaster_avg0/M01 -> axis_cc_ft -> s_axis
+//   ps8_0_axi_periph/M22_AXI   ---------------------> adaptive_sweep_0/s_axi
+//   clk_core/clk_out1 -> clk and s_axi_aclk;  rst_core -> rst_n and s_axi_aresetn
+//
+// The BD's axis_cc_ft is an axis_clock_converter taking m2 from the avg_buffer
+// m_axis domain (s_ps_dma_aclk here) into c_clk. m2 carries one beat per
+// trigger, so the toggle handshake below reproduces it without a full async
+// FIFO. s_axi is left idle: the AXI-Lite side only loads the GD/KW and MAD
+// tables, which this test does not use.
+
+   // --- axis_cc_ft model: s_ps_dma_aclk -> c_clk ---
+   reg  [63:0] m2_cdc_data  = 64'd0;
+   reg         m2_cdc_tgl   = 1'b0;
+
+   always_ff @(posedge s_ps_dma_aclk) begin
+      if (m2_axis_buf_acc_tvalid) begin
+         m2_cdc_data <= m2_axis_buf_acc_tdata;
+         m2_cdc_tgl  <= ~m2_cdc_tgl;
+      end
+   end
+
+   reg m2_tgl_s0 = 1'b0, m2_tgl_s1 = 1'b0, m2_tgl_s2 = 1'b0;
+
+   always_ff @(posedge c_clk) begin
+      m2_tgl_s0 <= m2_cdc_tgl;
+      m2_tgl_s1 <= m2_tgl_s0;
+      m2_tgl_s2 <= m2_tgl_s1;
+   end
+
+   wire        m2_c_tvalid = m2_tgl_s1 ^ m2_tgl_s2;
+   wire [63:0] m2_c_tdata  = m2_cdc_data;
+
+   // --- recorded-I/Q replay source (AS_SRC_IQFILE) ---
+   // Paced by the IP's own point arming, so one armed point consumes exactly
+   // averager_value recorded shots and the file stays aligned with the sweep.
+   wire        as_point_arm = u_adaptive_sweep.point_arm;
+   wire [31:0] as_avg_value = u_adaptive_sweep.cfg_avg;
+
+   wire        iqf_tvalid;
+   wire [63:0] iqf_tdata;
+   wire [31:0] iqf_cursor;
+
+   iq_feeder u_iq_feeder (
+      .clk           (c_clk        ),
+      .rst_n         (rst_ni       ),
+      .arm_i         (as_point_arm ),
+      .shots_i       (as_avg_value ),
+      .gap_i         (16'd8        ),
+      .m_axis_tvalid (iqf_tvalid   ),
+      .m_axis_tdata  (iqf_tdata    ),
+      .cursor_o      (iqf_cursor   )
+   );
+
+   // --- source select ---
+   logic        as_s_axis_tvalid;
+   logic [63:0] as_s_axis_tdata;
+
+   always_comb begin
+      if (AS_STREAM_SRC == "AS_SRC_IQFILE") begin
+         as_s_axis_tvalid = iqf_tvalid;
+         as_s_axis_tdata  = iqf_tdata;
+      end else begin
+         as_s_axis_tvalid = m2_c_tvalid;
+         as_s_axis_tdata  = m2_c_tdata;
+      end
+   end
+
+   adaptive_sweep u_adaptive_sweep (
+      .clk           (c_clk            ),
+      .rst_n         (rst_ni           ),
+
+      .qtag_en_i     (qp2_en_o         ),
+      .qtag_op_i     (qp2_op_o         ),
+      .qtag_dt1_i    (qp2_a_dt_o       ),
+      .qtag_dt2_i    (qp2_b_dt_o       ),
+      .qtag_dt3_i    (qp2_c_dt_o       ),
+      .qtag_dt4_i    (qp2_d_dt_o       ),
+      .qtag_rdy_o    (qp2_rdy_i        ),
+      .qtag_dt1_o    (qp2_dt_i[0]      ),
+      .qtag_dt2_o    (qp2_dt_i[1]      ),
+      .qtag_vld_o    (qp2_vld_i        ),
+
+      .s_axis_tvalid (as_s_axis_tvalid ),
+      .s_axis_tready (/*unused*/       ),
+      .s_axis_tdata  (as_s_axis_tdata  ),
+
+      .s_axi_aclk    (c_clk            ),
+      .s_axi_aresetn (rst_ni           ),
+      .s_axi_awaddr  (8'd0             ),
+      .s_axi_awprot  (3'd0             ),
+      .s_axi_awvalid (1'b0             ),
+      .s_axi_awready (/*unused*/       ),
+      .s_axi_wdata   (32'd0            ),
+      .s_axi_wstrb   (4'd0             ),
+      .s_axi_wvalid  (1'b0             ),
+      .s_axi_wready  (/*unused*/       ),
+      .s_axi_bresp   (/*unused*/       ),
+      .s_axi_bvalid  (/*unused*/       ),
+      .s_axi_bready  (1'b1             ),
+      .s_axi_araddr  (8'd0             ),
+      .s_axi_arprot  (3'd0             ),
+      .s_axi_arvalid (1'b0             ),
+      .s_axi_arready (/*unused*/       ),
+      .s_axi_rdata   (/*unused*/       ),
+      .s_axi_rresp   (/*unused*/       ),
+      .s_axi_rvalid  (/*unused*/       ),
+      .s_axi_rready  (1'b1             )
+   );
+
+   // Sweep progress log: one line per emitted point, plus the final result.
+   always_ff @(posedge c_clk) begin
+      if (u_adaptive_sweep.grid_valid) begin
+         $display("*** %t - adaptive_sweep point %0d: freq_word=0x%08x power=%0d (iq cursor %0d)",
+                  $realtime(), u_adaptive_sweep.pf_point_idx,
+                  u_adaptive_sweep.pf_freq_word, u_adaptive_sweep.grid_data[35:0],
+                  iqf_cursor);
+      end
+      if (u_adaptive_sweep.pf_finish) begin
+         $display("*** %t - adaptive_sweep FINISH: best freq_word=0x%08x at point %0d",
+                  $realtime(), u_adaptive_sweep.pf_freq_word, u_adaptive_sweep.pf_point_idx);
       end
    end
 
@@ -1792,13 +1531,6 @@ initial begin
    axi_mst_sg_agent.set_agent_tag("axi_mst_sg_0 VIP");
    // Start agents.
    axi_mst_sg_agent.start_master();
-
-   // Create agents.
-   axi_mst_sg_1_agent   = new("axi_mst_sg_1 VIP Agent",tb_qick.u_axi_mst_sg_1.inst.IF);
-   // Set tag for agents.
-   axi_mst_sg_1_agent.set_agent_tag("axi_mst_sg_1 VIP");
-   // Start agents.
-   axi_mst_sg_1_agent.start_master();
 
    // Create agents.
    axi_mst_avg_agent   = new("axi_mst_avg_0 VIP Agent",tb_qick.u_axi_mst_avg_0.inst.IF);
@@ -1834,6 +1566,10 @@ initial begin
    // Load tProc Memories with Program
    tproc_load_mem(TEST_NAME);
 
+   // Load recorded resonator I/Q for the adaptive_sweep replay source
+   if (AS_STREAM_SRC == "AS_SRC_IQFILE")
+      iq_load_mem(TEST_NAME);
+
 
    // INITIAL VALUES
 
@@ -1844,7 +1580,6 @@ initial begin
    s1_axis_tvalid          = 1'b0 ;
    port_1_dt_i             = 0;
    qcom_rdy_i              = 0 ;
-   qp2_rdy_i               = 0 ;
    periph_dt_i             = {0,0} ;
    qnet_rdy_i              = 0 ;
    qnet_dt_i [2]           = {0,0} ;
@@ -1860,8 +1595,6 @@ initial begin
 
    tb_load_mem             = 1'b0;
    tb_load_mem_done        = 1'b0;
-   tb_load_mem_1           = 1'b0;
-   tb_load_mem_done_1      = 1'b0;
 
    tb_test_run_start       = 1'b1;
    tb_test_run_done        = 1'b0;
@@ -1874,9 +1607,6 @@ initial begin
 
    sg_s0_axis_tvalid       = 0;
    sg_s0_axis_tdata        = 0;
-
-   sg_s1_axis_tvalid       = 0;
-   sg_s1_axis_tdata        = 0;
 
    m1_axis_buf_dec_tready      = 1'b1;
 
@@ -1917,24 +1647,9 @@ initial begin
 
       WRITE_AXI( REG_TPROC_CTRL , 4); //PROC_START
 
-      // Wait for either TEST_RUN_TIME to elapse OR (for fine_tuning_sweep)
-      // the ASM's done flag (dmem[2] != 0) to assert -- whichever happens first.
-      // This lets the algorithm-done test finish as soon as it's actually
-      // done, instead of waiting out the full TEST_RUN_TIME window.
-      if (TEST_NAME == "test_fine_tuning_sweep") begin
-         fork : ft_timeout_or_finish
-            #(TEST_RUN_TIME);
-            begin
-               wait (AXIS_QPROC.QPROC.CORE_0.CORE_MEM.D_MEM.RAM[2] != 32'h0);
-               #500ns;   // brief grace so the last dmem write retires
-            end
-         join_any
-         disable ft_timeout_or_finish;
-      end else begin
-         #(TEST_RUN_TIME);
-      end
+      #(TEST_RUN_TIME);
 
-
+      
       WRITE_AXI( REG_TPROC_CTRL , 8); //PROC_STOP
       
       tb_test_run_done = 1'b1;
@@ -1961,58 +1676,8 @@ initial begin
    #1us;
 
    $display("*** End Test ***");
-
-   // test_fine_tuning_sweep summary.
-   //   dmem[0] = final freq_word
-   //   dmem[2] = step count (written last; host polls dmem[2] != 0 to know done)
-   if (TEST_NAME == "test_fine_tuning_sweep") begin : ft_dump
-      logic [31:0] dmem_final;
-      logic [31:0] dmem_nsteps;
-      dmem_final  = AXIS_QPROC.QPROC.CORE_0.CORE_MEM.D_MEM.RAM[0];
-      dmem_nsteps = AXIS_QPROC.QPROC.CORE_0.CORE_MEM.D_MEM.RAM[2];
-      $display("====================== FT_SWEEP RESULT =======================");
-      $display("  final freq_word  : %0d  (0x%08h)", dmem_final, dmem_final);
-      $display("  step count       : %0d", dmem_nsteps);
-      $display("  trig_cnt         : %0d", ft_event_counters.trig_cnt);
-      $display("  amp_valid_cnt    : %0d", ft_event_counters.amp_valid_cnt);
-      $display("  current_freq_set_cnt: %0d", ft_event_counters.current_freq_set_cnt);
-      $display("==============================================================");
-   end
-
    $finish();
 end
-
-// test_fine_tuning_sweep per-stage event counters (rising-edge detect).
-generate
-if (1) begin : ft_event_counters
-   integer trig_cnt;
-   integer amp_valid_cnt;
-   integer current_freq_set_cnt;
-
-   reg trig0_d;
-   reg amp_valid_d;
-
-   always @(posedge c_clk) begin
-      if (!rst_ni) begin
-         trig_cnt             <= 0;
-         amp_valid_cnt        <= 0;
-         current_freq_set_cnt <= 0;
-         trig0_d              <= 1'b0;
-         amp_valid_d          <= 1'b0;
-      end else if (TEST_NAME == "test_fine_tuning_sweep") begin
-         trig0_d     <= trigger_0;
-         amp_valid_d <= u_fine_tuning_sweep.amp_valid_c;
-
-         if (trigger_0 & ~trig0_d)
-            trig_cnt <= trig_cnt + 1;
-         if (u_fine_tuning_sweep.amp_valid_c & ~amp_valid_d)
-            amp_valid_cnt <= amp_valid_cnt + 1;
-         if (u_fine_tuning_sweep.set_current_freq_now)
-            current_freq_set_cnt <= current_freq_set_cnt + 1;
-      end
-   end
-end
-endgenerate
 
 initial begin
    integer N;
@@ -2041,6 +1706,30 @@ initial begin
       #100ns;
 
       $display("*** %t - End of test_basic_pulses Test ***", $realtime());
+   end
+
+
+   if (TEST_NAME == "test_adaptive_sweep") begin
+      $display("*** %t - Start test_adaptive_sweep Test ***", $realtime());
+      $display("*** adaptive_sweep stream source: %s ***", AS_STREAM_SRC);
+
+      // One readout window per shot; the adaptive_sweep IP derives its own
+      // stage-1 shift from the NSAMP the tProc sends it over QP2 (OP2), so
+      // ro_average_length here must match that value.
+      ro_length            = 2000.0 / (2.0*T_RO_CLK);
+      ro_decimated_length  = 2000.0 / (2.0*T_RO_CLK);
+      ro_average_length    = 190;
+
+      // The tProc paces n_points*averager_value shots at shot_period, so the run
+      // has to outlast that: 61 points x 16 shots x 1us = 976us for the window
+      // in iq_shots.mem. The full 4001-point grid needs ~64ms instead.
+      TEST_RUN_TIME        = 2ms;
+      TEST_READ_TIME       = 10us;
+
+      wait (tb_qick.AXIS_QPROC.t_resetn == 1'b1);
+      #100ns;
+
+      $display("*** %t - End of test_adaptive_sweep Test ***", $realtime());
    end
 
 
@@ -2104,50 +1793,6 @@ initial begin
          $display("*** %t - End of test_tproc_basic Test ***", $realtime());
          wait (tb_qick.AXIS_QPROC.QPROC.QPROC_CTRL.core_en_o == 1'b0);
       end
-   end
-
-
-   if (TEST_NAME == "test_adaptive_sweep") begin
-      $display("*** %t - Start test_adaptive_sweep Test ***", $realtime());
-      // The adaptive_sweep IP runs phases 1..3 of the resonator-sweep
-      // algorithm.  This case just configures readout/run/read timing
-      // and lets the tProc program (loaded from
-      // src/tb/test_adaptive_sweep/{pmem,wmem,dmem}.mem) drive QP2.
-      // The resonator_emulator on axis_adc_ro_* supplies the I/Q samples
-      // that adaptive_sweep snoops via axis_dyn_readout_v1.m1_axis.
-      TEST_RUN_TIME        = 200us;
-      TEST_READ_TIME       = 10us;
-      REPEAT_EXEC          = 1;
-
-      ro_length            = 1000.0 / (2.0*T_RO_CLK);
-      ro_decimated_length  = 1000.0 / (2.0*T_RO_CLK);
-      ro_average_length    = 1;
-
-      wait (tb_qick.AXIS_QPROC.t_resetn == 1'b1);
-      #100ns;
-      $display("*** %t - End of test_adaptive_sweep Test ***", $realtime());
-   end
-
-
-   // --- TEST_FINE_TUNING_SWEEP ---
-   // The tProc program (pmem/wmem/dmem under src/tb/test_fine_tuning_sweep/)
-   // drives QP2: OP 0 -> OP 3 -> OP 1 -> poll OP 2 -> trigger -> log -> exit.
-   // The bypass streamer above feeds iq_shots.mem into axis_ro_avg_* so the
-   // IP sees a Lorentzian amplitude landscape without going through the SG
-   // or readout DSP.  Expected final freq_word is F0 from gen_iq_lorentzian.py.
-   if (TEST_NAME == "test_fine_tuning_sweep") begin
-      $display("*** %t - Start test_fine_tuning_sweep Test ***", $realtime());
-      TEST_RUN_TIME        = 500us;
-      TEST_READ_TIME       = 10us;
-      REPEAT_EXEC          = 1;
-
-      ro_length            = 1000.0 / (2.0*T_RO_CLK);
-      ro_decimated_length  = 1000.0 / (2.0*T_RO_CLK);
-      ro_average_length    = 1;
-
-      wait (tb_qick.AXIS_QPROC.t_resetn == 1'b1);
-      #100ns;
-      $display("*** %t - End of test_fine_tuning_sweep Test ***", $realtime());
    end
 
 
@@ -2246,6 +1891,20 @@ task READ_AXI(integer ADDR_AXI);
 endtask
 
 
+task iq_load_mem(string test_name);
+   string iq_file;
+
+   $display("### Task iq_load_mem() start ###");
+
+   iq_file = {"../../../../src/tb/",test_name,"/iq_shots.mem"};
+
+   $readmemh(iq_file, u_iq_feeder.mem);
+
+   $display("Loaded recorded resonator I/Q from %s", iq_file);
+   $display("### Task iq_load_mem() end ###");
+endtask
+
+
 task tproc_load_mem(string test_name);
    string pmem_file, wmem_file, dmem_file;
 
@@ -2267,47 +1926,32 @@ endtask
 
 // Load pulse data into memory.
 task sg_load_mem(string test_name) /*, input logic tb_load_mem, output logic tb_load_mem_done)*/;
-   string sg_file, sg_file_1;
-   int fd, fd_1, vali, valq;
+   string sg_file;
+   int fd,vali,valq;
    bit signed [15:0] ii,qq;
-
+   
    $display("### %t - Task sg_load_mem() start ###", $realtime());
 
    sg_s0_axis_tvalid = 0;
    sg_s0_axis_tdata  = 0;
-   sg_s1_axis_tvalid = 0;
-   sg_s1_axis_tdata  = 0;
 
-
+   
    $display("################################");
    $display("### Load envelope into Table ###");
    $display("################################");
    $display("t = %0t", $time);
 
-   // Configure both SG0 and SG1 AXI-Lite (start_addr + WE) before either envelope load,
-   // so neither $fopen-then-wait pair hangs.
-
-   // SG0 start_addr.
+   // start_addr.
    data_wr = 0;
    axi_mst_sg_agent.AXI4LITE_WRITE_BURST(SG_ADDR_START_ADDR, prot, data_wr, resp);
    #100ns;
-
-   // SG0 we.
+   
+   // we.
    data_wr = 1;
    axi_mst_sg_agent.AXI4LITE_WRITE_BURST(SG_ADDR_WE, prot, data_wr, resp);
    #100ns;
-
-   // SG1 start_addr.
-   data_wr = 0;
-   axi_mst_sg_1_agent.AXI4LITE_WRITE_BURST(SG_ADDR_START_ADDR, prot, data_wr, resp);
-   #100ns;
-
-   // SG1 we.
-   data_wr = 1;
-   axi_mst_sg_1_agent.AXI4LITE_WRITE_BURST(SG_ADDR_WE, prot, data_wr, resp);
-   #100ns;
-
-   // Load Envelope Table Memory - SG0.
+   
+   // Load Envelope Table Memory.
    tb_load_mem    = 1;
 
    // File must be relative to where the simulation is run from (i.e.: xxx.sim/sim_x/behav/xsim)
@@ -2330,31 +1974,6 @@ task sg_load_mem(string test_name) /*, input logic tb_load_mem, output logic tb_
    sg_s0_axis_tvalid    = 0;
 
    tb_load_mem_done = 1;
-
-   // Load Envelope Table Memory - SG1.
-   tb_load_mem_1  = 1;
-   sg_file_1 = {"../../../../src/tb/",test_name,"/sg_1.mem"};
-   fd_1 = $fopen(sg_file_1,"r");
-
-   if (fd_1 == 0) begin
-      $display("### %t - sg_1.mem not found for test '%s', skipping SG1 envelope load ###", $realtime(), test_name);
-   end else begin
-      wait (sg_s1_axis_tready);
-
-      while($fscanf(fd_1,"%d,%d", vali,valq) == 2) begin
-         ii = vali;
-         qq = valq;
-         @(posedge sg_s1_axis_aclk);
-         sg_s1_axis_tvalid    = 1;
-         sg_s1_axis_tdata     = {qq,ii};
-      end
-      $fclose(fd_1);
-
-      @(posedge sg_s1_axis_aclk);
-      sg_s1_axis_tvalid    = 0;
-   end
-
-   tb_load_mem_done_1 = 1;
 
    $display("### %t - Task sg_load_mem() end ###", $realtime());
 endtask

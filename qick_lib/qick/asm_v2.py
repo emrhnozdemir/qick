@@ -5,8 +5,9 @@ import textwrap
 from collections import OrderedDict, defaultdict
 from collections.abc import Mapping
 from types import SimpleNamespace
-from typing import Callable, NamedTuple, Union, Dict
+from typing import Callable, NamedTuple, Union, Dict, List, Optional, Tuple
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from fractions import Fraction
 import copy
 from numbers import Number, Integral
@@ -16,6 +17,1280 @@ from .qick_asm import AbsQickProgram, AcquireMixin
 from .helpers import to_int, check_bytes, check_keys
 
 logger = logging.getLogger(__name__)
+
+# =========================================================================
+# QP2 accelerator registry
+# =========================================================================
+# The tProc-v2 talks to a custom peripheral on the "QPeriphB" bus with a single
+# instruction:  PB <op> <r1> <r2> <r3> <r4>.  There are no immediates, so every
+# value has to be staged into a data register first.
+#
+# Each accelerator therefore has an *opcode map*: for every operation, which
+# named fields live in which dt word and at which bit offset.  That map is pure
+# data, so it is kept as data -- adding an accelerator, or an operation on an
+# existing one, means adding a table entry rather than writing code.
+#
+# The two entries below are transcribed from the RTL, not from documentation:
+#   fine_tuning_sweep  firmware/ip/fine_tuning_sweep/src/fine_tuning_sweep.v
+#   adaptive_sweep     firmware/ip/adaptive_sweep/src/adaptive_sweep.v
+
+MASK32 = 0xFFFFFFFF
+
+
+def to_u32(val):
+    """Wrap a Python int into an unsigned 32-bit word (two's complement)."""
+    return int(val) & MASK32
+
+
+def to_s32(val):
+    """Interpret the low 32 bits of ``val`` as a signed 32-bit int."""
+    val = int(val) & MASK32
+    return val - (1 << 32) if val & 0x80000000 else val
+
+
+@dataclass(frozen=True)
+class Field:
+    """One named bit field inside a 32-bit ``dt`` word.
+
+    Parameters
+    ----------
+    name : str
+        Field name, as used in the keyword arguments of :func:`pack_op`.
+    bits : int
+        Field width in bits.
+    lsb : int
+        Position of the field's least significant bit within the word.
+    signed : bool
+        If True, the value is allowed to be negative and is packed as two's
+        complement.  Frequency words and steps are signed; counts are not.
+    """
+
+    name: str
+    bits: int
+    lsb: int
+    signed: bool = False
+
+    @property
+    def mask(self):
+        """The field's mask, positioned at bit 0."""
+        return (1 << self.bits) - 1
+
+    def check(self, value, where=""):
+        """Raise ValueError if ``value`` does not fit this field."""
+        value = int(value)
+        if self.signed:
+            lo, hi = -(1 << (self.bits - 1)), (1 << (self.bits - 1)) - 1
+            # a value already given as an unsigned 32-bit word is fine too
+            if self.bits == 32 and 0 <= value <= MASK32:
+                return
+        else:
+            lo, hi = 0, (1 << self.bits) - 1
+        if not lo <= value <= hi:
+            raise ValueError(
+                "%s: field '%s' is %d bits, so its value must be in [%d, %d], "
+                "but got %d" % (where or "pack_op", self.name, self.bits, lo, hi, value))
+
+    def pack(self, value):
+        """Return ``value`` masked and shifted into place."""
+        return (int(value) & self.mask) << self.lsb
+
+    def unpack(self, word):
+        """Extract this field from ``word``, sign-extending if signed."""
+        raw = (int(word) >> self.lsb) & self.mask
+        if self.signed and self.bits < 32 and raw & (1 << (self.bits - 1)):
+            raw -= (1 << self.bits)
+        elif self.signed and self.bits == 32:
+            raw = to_s32(raw)
+        return raw
+
+
+# a whole 32-bit word, one field
+def _word(name, signed=False):
+    return (Field(name, 32, 0, signed),)
+
+
+@dataclass(frozen=True)
+class QP2Op:
+    """One QP2 operation.
+
+    Parameters
+    ----------
+    number : int
+        The 5-bit opcode (the ``C_OP`` of the ``PB`` instruction).
+    mnemonic : str
+        Human-readable name, used as the key in the accelerator's op table.
+    args : dict
+        Maps ``"dt1"`` .. ``"dt4"`` to a tuple of :class:`Field`.  Words that
+        the RTL ignores are simply absent.
+    resp : dict
+        For operations that produce a response, maps ``"dt1"``/``"dt2"`` (the
+        peripheral's ``qtag_dt1_o``/``qtag_dt2_o``, readable from ``s_core_r1``
+        and ``s_core_r2``) to a tuple of :class:`Field`.
+    blocking : bool
+        True if issuing this op drops the peripheral's READY line (i.e. it
+        starts a job that completes asynchronously).
+    responds : bool
+        True if the op raises ``qtag_vld_o`` (``bit_qpb_new`` in ``s_status``),
+        which the program must acknowledge.
+    doc : str
+        One-line description.
+    """
+
+    number: int
+    mnemonic: str
+    args: Dict[str, Tuple[Field, ...]] = field(default_factory=dict)
+    resp: Dict[str, Tuple[Field, ...]] = field(default_factory=dict)
+    blocking: bool = False
+    responds: bool = False
+    doc: str = ""
+
+    def field_names(self):
+        """All argument field names accepted by this op."""
+        return [f.name for word in self.args.values() for f in word]
+
+
+@dataclass(frozen=True)
+class QP2Accel:
+    """One QP2 accelerator: its opcode map, status word, and capabilities.
+
+    Parameters
+    ----------
+    name : str
+        Registry key, as passed to ``adaptive_sweep(accel=...)``.
+    rtl_source : str
+        Repo-relative path of the RTL this table was transcribed from.
+    rtl_template : str
+        Repo-relative path of the authoring template, where one exists and
+        differs from what is synthesized.  May not be present in a checkout.
+    ops : dict
+        Mnemonic -> :class:`QP2Op`.
+    status_bits : tuple of Field
+        Layout of the status word, where the accelerator has one.
+    algorithms : tuple of str
+        Search algorithms this accelerator implements.
+    calcs : tuple of str
+        Names of the measurement schemes this accelerator can be configured
+        into.  These are presets over the CTRL word, not a hardware select:
+        one shared datapath implements all of them (see ``calc_ctrl``).
+    calc_ctrl : dict
+        Calc name -> the CTRL field values that select it.  ``adaptive_sweep``
+        has one accumulator and MUX-selected post-processing, so a calc name
+        is a combination of ``reduce_sel`` / ``prescale_en`` / ``estop_en``
+        rather than an index.
+    gdkw_calcs : tuple of str
+        Subset of ``calcs`` usable with the GD/KW engine.  The engine consumes
+        a 36-bit power, so a scheme whose point value is wider is truncated
+        (the router saturates it rather than wrapping, but it is still wrong).
+    lut_depth : int
+        Depth of the a/c schedule LUTs (0 if absent).
+    thr_depth : int
+        Depth of the madstop threshold table (0 if absent).
+    """
+
+    name: str
+    rtl_source: str
+    ops: Dict[str, QP2Op]
+    rtl_template: str = ""
+    status_bits: Tuple[Field, ...] = ()
+    algorithms: Tuple[str, ...] = ("grid",)
+    calcs: Tuple[str, ...] = ()
+    calc_ctrl: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    gdkw_calcs: Tuple[str, ...] = ()
+    lut_depth: int = 0
+    thr_depth: int = 0
+
+    def op(self, mnemonic):
+        """Look up an op by mnemonic, with a helpful error."""
+        try:
+            return self.ops[mnemonic]
+        except KeyError:
+            raise ValueError(
+                "accelerator '%s' has no operation '%s'; it supports %s"
+                % (self.name, mnemonic, sorted(self.ops))) from None
+
+    def has_op(self, mnemonic):
+        """True if this accelerator implements ``mnemonic``."""
+        return mnemonic in self.ops
+
+    def calc_fields(self, calc):
+        """Map a calc name to the CTRL field values that select it.
+
+        Returns a dict suitable for ``**`` into :func:`pack_op` for CFG_ACQ.
+        It is empty for an accelerator whose datapath is hardwired.
+        """
+        if calc not in self.calcs:
+            raise ValueError(
+                "accelerator '%s' does not support calc=%r; it supports %s"
+                % (self.name, calc, list(self.calcs)))
+        return dict(self.calc_ctrl.get(calc, {}))
+
+    def unpack_status(self, word):
+        """Decode a status word into a dict of named fields."""
+        return {f.name: f.unpack(word) for f in self.status_bits}
+
+
+def pack_op(accel, mnemonic, **values):
+    """Pack named field values into the four ``dt`` words of a QP2 operation.
+
+    Parameters
+    ----------
+    accel : QP2Accel
+        The accelerator whose opcode map to use.
+    mnemonic : str
+        Operation mnemonic (a key of ``accel.ops``).
+    **values
+        Field values, by name.  Every field named in the op's ``args`` may be
+        given; omitted fields pack as zero.  Passing an unknown name is an
+        error (it is almost always a typo or a wrong-accelerator mistake).
+
+    Returns
+    -------
+    int
+        The opcode number, for the ``PB`` instruction's ``C_OP``.
+    list of int
+        Four unsigned 32-bit words, ``[dt1, dt2, dt3, dt4]``.
+    """
+    op = accel.op(mnemonic)
+    known = set(op.field_names())
+    unknown = set(values) - known
+    if unknown:
+        raise ValueError(
+            "%s.%s: unknown field(s) %s; this op takes %s"
+            % (accel.name, mnemonic, sorted(unknown), sorted(known)))
+
+    words = [0, 0, 0, 0]
+    where = "%s.%s" % (accel.name, mnemonic)
+    for idx, key in enumerate(("dt1", "dt2", "dt3", "dt4")):
+        for f in op.args.get(key, ()):
+            if f.name not in values:
+                continue
+            val = values[f.name]
+            if val is None:
+                continue
+            f.check(val, where)
+            words[idx] |= f.pack(val)
+    return op.number, [w & MASK32 for w in words]
+
+
+def unpack_fields(fields, word):
+    """Decode a tuple of :class:`Field` out of one 32-bit word."""
+    return {f.name: f.unpack(word) for f in fields}
+
+
+# ---------------------------------------------------------------------------
+# fine_tuning_sweep
+# ---------------------------------------------------------------------------
+# Transcribed from firmware/ip/fine_tuning_sweep/src/fine_tuning_sweep.v.
+# The whole opcode surface is three ops: the RTL decodes only op 0, 1 and 2
+# (lines 35, 58, 65).  There is NO status-read op -- the only response the IP
+# ever produces is the end-of-sweep one (lines 91-94: on pf_finish, dt1_o gets
+# the peak/dip freq word, dt2_o is zero, vld_o rises).  A program therefore
+# learns the result by polling READY high, then bit_qpb_new, then reading
+# s_core_r1.
+_FTS_OPS = {
+    "CFG_WINDOW": QP2Op(
+        number=0, mnemonic="CFG_WINDOW",
+        args={
+            "dt1": _word("start_freq", signed=True),
+            "dt2": _word("step", signed=True),
+            "dt3": _word("n_points"),
+            "dt4": _word("averager_value"),
+        },
+        doc="latch the grid: start word, step word, point count, shots/point",
+    ),
+    "START": QP2Op(
+        number=1, mnemonic="START", blocking=True, responds=True,
+        resp={"dt1": _word("freq_at_best", signed=True), "dt2": _word("zero")},
+        doc="start the grid sweep; READY drops now and rises at finish, when "
+            "dt1_o carries the peak/dip frequency word",
+    ),
+    "CFG_ACQ": QP2Op(
+        number=2, mnemonic="CFG_ACQ",
+        args={
+            "dt1": _word("nsamp"),
+            "dt2": (Field("mode", 1, 0),),
+        },
+        doc="latch nsamp (raw samples folded per shot) and mode (0 peak/1 dip)",
+    ),
+}
+
+FINE_TUNING_SWEEP = QP2Accel(
+    name="fine_tuning_sweep",
+    rtl_source="firmware/ip/fine_tuning_sweep/src/fine_tuning_sweep.v",
+    ops=_FTS_OPS,
+    status_bits=(),
+    algorithms=("grid",),
+    # one hardwired amplitude_calculator (the two-stage round-shift scheme);
+    # this IP has no CTRL word, so only "shift" is selectable and it packs
+    # no extra CFG_ACQ fields.
+    calcs=("shift",),
+    calc_ctrl={"shift": {}},
+    gdkw_calcs=(),
+    lut_depth=0,
+    thr_depth=0,
+)
+
+
+# ---------------------------------------------------------------------------
+# adaptive_sweep
+# ---------------------------------------------------------------------------
+# Transcribed from firmware/ip/adaptive_sweep/src/adaptive_sweep.v (opcode
+# decode and field wiring) and src/ctrl_status_reg.v (the CTRL/STATUS word
+# layout).  The prose description of every module is in
+# personal_files/adaptive_sweep/MODULE_GUIDE.txt.
+_AS_OPS = {
+    "CFG_WINDOW": QP2Op(
+        number=0, mnemonic="CFG_WINDOW",
+        args={
+            "dt1": _word("start_freq", signed=True),
+            "dt2": _word("step", signed=True),
+            "dt3": _word("n_points"),
+            "dt4": _word("averager_value"),
+        },
+        doc="grid window; 'step' doubles as the GD forward-probe spacing and "
+            "the racing-mode fixed step (fstep_i), and 'averager_value' is the "
+            "shot count every amp_calc variant folds per armed point",
+    ),
+    "START": QP2Op(
+        number=1, mnemonic="START", blocking=True, responds=True,
+        resp={"dt1": _word("freq_at_best", signed=True), "dt2": _word("zero")},
+        doc="start the grid sweep (peak_finder_wide walks the grid)",
+    ),
+    "CFG_ACQ": QP2Op(
+        number=2, mnemonic="CFG_ACQ",
+        args={
+            "dt1": _word("nsamp"),
+            "dt2": (Field("mode", 1, 0),
+                    Field("reduce_sel", 3, 1),
+                    Field("estop_hold", 1, 4),
+                    Field("prescale_en", 1, 5),
+                    Field("estop_en", 1, 6)),
+            "dt3": _word("n0"),
+            "dt4": _word("n_min"),
+        },
+        doc="nsamp and the CTRL word: mode (0 peak/1 dip); reduce_sel "
+            "(0 raw 64-bit sum / 1 round-shift / 2 running mean); estop_hold "
+            "(0 immediate emit / 1 freeze-and-drain); prescale_en (stage-1 "
+            "round-shift by flog2(nsamp)); estop_en. dt3 = n0 (running-mean "
+            "warmup), dt4 = n_min (first tested epoch; 0 also disables the "
+            "early stop)",
+    ),
+    "GET_STATUS": QP2Op(
+        number=3, mnemonic="GET_STATUS", responds=True,
+        resp={"dt1": _word("status"), "dt2": _word("freq_at_max", signed=True)},
+        doc="status read -> dt1_o = status word, dt2_o = freq_at_max",
+    ),
+    "THR_WR": QP2Op(
+        number=4, mnemonic="THR_WR",
+        args={
+            "dt1": (Field("index", 5, 0),),
+            "dt2": _word("thr_lo"),
+            "dt3": (Field("thr_hi", 14, 0),),
+        },
+        doc="madstop threshold table write: thr[index] = {thr_hi, thr_lo}, "
+            "46 bits total, index = log2(n) of the epoch",
+    ),
+    "GET_DIAG": QP2Op(
+        number=5, mnemonic="GET_DIAG", responds=True,
+        resp={"dt1": _word("n_used"), "dt2": _word("dev_acc_hi")},
+        doc="diag read -> n_used (shots folded into the last emitted point), "
+            "dev_acc[45:14] (live MAD accumulator, top 32 bits)",
+    ),
+    "RUN_GD": QP2Op(
+        number=6, mnemonic="RUN_GD", blocking=True, responds=True,
+        args={
+            "dt1": _word("x0", signed=True),
+            "dt2": (Field("use_lut", 1, 0),
+                    Field("lambda", 5, 4),
+                    Field("patience", 8, 16)),
+            "dt3": _word("min_step"),
+            "dt4": (Field("max_iter", 16, 0),),
+        },
+        resp={"dt1": _word("x_final", signed=True),
+              "dt2": (Field("converged", 1, 0),
+                      Field("capped", 1, 1),
+                      Field("iter", 16, 16))},
+        doc="gradient-descent search, forward pair P(x+step) - P(x)",
+    ),
+    "RUN_KW": QP2Op(
+        number=7, mnemonic="RUN_KW", blocking=True, responds=True,
+        args={
+            "dt1": _word("x0", signed=True),
+            "dt2": (Field("use_lut", 1, 0),
+                    Field("lambda", 5, 4),
+                    Field("patience", 8, 16)),
+            "dt3": _word("min_step"),
+            "dt4": (Field("max_iter", 16, 0),),
+        },
+        resp={"dt1": _word("x_final", signed=True),
+              "dt2": (Field("converged", 1, 0),
+                      Field("capped", 1, 1),
+                      Field("iter", 16, 16))},
+        doc="Kiefer-Wolfowitz search, symmetric pair P(x+c) - P(x-c)",
+    ),
+    "ALUT_WR": QP2Op(
+        number=8, mnemonic="ALUT_WR",
+        args={
+            "dt1": (Field("index", 6, 0),),
+            "dt2": _word("value", signed=True),
+            "dt3": (Field("length", 7, 0),),
+        },
+        doc="a-LUT (step schedule) write; 'length' is latched when nonzero, "
+            "default 64",
+    ),
+    "CLUT_WR": QP2Op(
+        number=9, mnemonic="CLUT_WR",
+        args={
+            "dt1": (Field("index", 6, 0),),
+            "dt2": _word("value", signed=True),
+            "dt3": (Field("length", 7, 0),),
+        },
+        doc="c-LUT (probe-width schedule) write; same layout as ALUT_WR",
+    ),
+    "GET_FREQ": QP2Op(
+        number=10, mnemonic="GET_FREQ", responds=True,
+        resp={"dt1": _word("freq_word", signed=True),
+              "dt2": (Field("freq_pending", 1, 0),)},
+        doc="GD/KW probe handshake: returns the probe word; reading it while "
+            "pending acks the engine and arms the amp_calc for this probe's "
+            "averager_value shots",
+    ),
+    "GET_GDKW_DIAG": QP2Op(
+        number=11, mnemonic="GET_GDKW_DIAG", responds=True,
+        resp={"dt1": (Field("iter", 16, 0), Field("pairs", 16, 16)),
+              "dt2": _word("sd_hi")},
+        doc="GD/KW diag -> {pairs, iter} and the top 32 bits of S_d",
+    ),
+    "CLR_RESULT": QP2Op(
+        number=13, mnemonic="CLR_RESULT",
+        doc="release a finished job's answer and drop the response-valid bit. "
+            "Between a job finishing and this op, every read is held off so it "
+            "cannot overwrite the answer: READY reaches the tProc a couple of "
+            "cycles late, so a program that was still polling can get a read "
+            "in after completion",
+    ),
+    "CFG_GDKW": QP2Op(
+        number=12, mnemonic="CFG_GDKW",
+        args={
+            "dt1": _word("f_lo", signed=True),
+            "dt2": _word("f_hi", signed=True),
+            "dt3": (Field("m_min", 16, 0),),
+            "dt4": (Field("m_max", 16, 0),),
+        },
+        doc="GD/KW search window [f_lo, f_hi] and racing pair-count bounds",
+    ),
+}
+
+# status_word, built by src/ctrl_status_reg.v:
+#   {point_idx[15:0], eng_freq_valid, eng_busy, eng_converged, eng_capped,
+#    dest, estop_en, prescale_en, early_stop, warmup_done, reduce_sel, mode,
+#    busy, finish_seen, 1'b0}
+_AS_STATUS = (
+    Field("finish_seen", 1, 1),
+    Field("busy", 1, 2),
+    Field("mode", 1, 3),
+    Field("reduce_sel", 3, 4),
+    Field("warmup_done", 1, 7),
+    Field("early_stop", 1, 8),
+    Field("prescale_en", 1, 9),
+    Field("estop_en", 1, 10),
+    Field("dest", 1, 11),
+    Field("capped", 1, 12),
+    Field("converged", 1, 13),
+    Field("gdkw_busy", 1, 14),
+    Field("freq_pending", 1, 15),
+    Field("point_idx", 16, 16),
+)
+
+ADAPTIVE_SWEEP = QP2Accel(
+    name="adaptive_sweep",
+    # the shipped IP is the authority; rtl_templates/adaptive_sweep_top.v is a
+    # pre-unification snapshot and no longer matches this table
+    rtl_source="firmware/ip/adaptive_sweep/src/adaptive_sweep.v",
+    rtl_template="",
+    ops=_AS_OPS,
+    status_bits=_AS_STATUS,
+    algorithms=("grid", "gd", "kw"),
+    # One shared datapath (src/amp_calc.v): a single 64-bit accumulator whose
+    # post-processing is MUX-selected, with the early stop as an independent
+    # enable.  A calc name is therefore a CTRL preset, not a hardware index.
+    calcs=("acc64", "shift", "welford", "madstop"),
+    calc_ctrl={
+        "acc64":   dict(reduce_sel=0, prescale_en=0, estop_en=0),
+        "shift":   dict(reduce_sel=1, prescale_en=1, estop_en=0),
+        "welford": dict(reduce_sel=2, prescale_en=1, estop_en=0),
+        "madstop": dict(reduce_sel=1, prescale_en=1, estop_en=1),
+    },
+    # the engine consumes search_data[35:0]; acc64's point value is the raw
+    # 64-bit sum, so its power does not fit and result_router saturates it
+    gdkw_calcs=("shift", "welford", "madstop"),
+    lut_depth=64,
+    thr_depth=32,
+)
+
+
+ACCELS = {a.name: a for a in (FINE_TUNING_SWEEP, ADAPTIVE_SWEEP)}
+
+
+def get_accel(name):
+    """Look up an accelerator by name.
+
+    Parameters
+    ----------
+    name : str
+        Registry key, e.g. ``"adaptive_sweep"``.
+
+    Returns
+    -------
+    QP2Accel
+    """
+    if isinstance(name, QP2Accel):
+        return name
+    try:
+        return ACCELS[name]
+    except KeyError:
+        raise ValueError(
+            "unknown accelerator %r; known accelerators are %s"
+            % (name, sorted(ACCELS))) from None
+
+
+# status-word bit masks the tProc tests directly, from tprocv2_assembler.py's
+# alias table (bit_qpb_rdy / bit_qpb_new) and the CTRL word used to ack.
+BIT_QPB_RDY = 0x0400
+BIT_QPB_NEW = 0x0800
+CFG_SRC_QPB = 0x05
+CTRL_CLR_QPB = 0x20_0000
+#: The internal multiply unit, as a peripheral source select and status bits.
+CFG_SRC_ARITH = 0x01
+BIT_ARITH_RDY = 0x0001
+BIT_ARITH_NEW = 0x0002
+CTRL_CLR_ARITH = 0x1_0000
+#: The ack word.  s_cfg and s_ctrl are the SAME register (s2), so acking with a
+#: bare clr_qpb would also wipe the peripheral source select and the next
+#: s_core_r1 read would return nothing.  Always rewrite the full word.
+QPB_ACK = CTRL_CLR_QPB | CFG_SRC_QPB
+#: Clear the ARITH response *and* hand the source select back to the QP2
+#: peripheral, in one write -- for the same reason ``QPB_ACK`` keeps the select.
+ARITH_ACK_TO_QPB = CTRL_CLR_ARITH | CFG_SRC_QPB
+
+#: The nine forms of ``(D +/- A) * B +/- C`` the ARITH unit implements, mapped
+#: to the source registers each one needs, in ``R1..Rn`` order.
+ARITH_OPS = {
+    "T": ("A", "B"),
+    "TP": ("A", "B", "C"),
+    "TM": ("A", "B", "C"),
+    "PT": ("D", "A", "B"),
+    "MT": ("D", "A", "B"),
+    "PTP": ("D", "A", "B", "C"),
+    "PTM": ("D", "A", "B", "C"),
+    "MTP": ("D", "A", "B", "C"),
+    "MTM": ("D", "A", "B", "C"),
+}
+
+# =========================================================================
+# Accelerated-sweep planning: validation and unit conversion
+# =========================================================================
+# adaptive_sweep() is a declaration: it validates the user's physical-unit
+# parameters, converts them to the integer words the co-processor wants, and
+# records the result as a SweepPlan.  The AdaptiveSweep macro then reads the
+# plan and emits assembly.  Keeping the conversion separate from the macro
+# means the numbers a user sees in prog.get_sweep_plan(name) are exactly the
+# numbers the tProc and the IP get.
+#
+# Two frequency words per point, always.  The drive word and the readout DDC
+# word are produced by different clocks and do not scale alike, so a sweep has
+# to step both.  They are computed with the same cross-rounding idiom
+# add_pulse and add_readoutconfig use, so the words agree with the waveform
+# memory the program plays.
+
+#: Offsets inside the result block written to data memory.
+RESULT_FREQ = 0        #: best/final drive frequency word
+RESULT_DONE = 1        #: done sentinel, written last
+RESULT_STATUS = 2      #: accelerator status word (only if it has a status read)
+RESULT_DIAG = 3        #: n_used, when debug=True
+RESULT_BLOCK = 4       #: words reserved per sweep
+
+#: Value written to the done word once the sweep has finished.
+DONE_SENTINEL = 0x600D
+
+#: Largest data-memory address a *literal* ``DMEM_WR [&N]`` can reach.  The
+#: address field is 11 bits, encoded signed (tprocv2_assembler.py:1320 calls
+#: ``integer2bin(..., 11)`` with the default signed flag).  Register-addressed
+#: accesses -- which the staged table loop uses -- are not limited this way.
+LITERAL_DMEM_MAX = 1023
+
+
+def gen_freq_word(prog, freq, gen_ch, ro_ch):
+    """The drive register word for ``freq`` MHz, matched to a readout.
+
+    Mirrors ``StandardGenManager.make_pulse`` (asm_v2.py:1974-1981), including
+    the digital-mixer offset when the generator has one.
+    """
+    gencfg = prog.soccfg["gens"][gen_ch]
+    f_dds = freq
+    if prog.ABSOLUTE_FREQS and gencfg["has_mixer"]:
+        f_dds = freq - prog.gen_chs[gen_ch]["mixer_freq"]["rounded"]
+    return int(prog.freq2reg(gen_ch=gen_ch, f=f_dds, ro_ch=ro_ch))
+
+
+def ro_freq_word(prog, freq, ro_ch, gen_ch):
+    """The readout DDC register word for ``freq`` MHz, matched to a generator.
+
+    Mirrors ``ReadoutManager.make_pulse`` (asm_v2.py:2134-2147), including the
+    mixer split and the downconversion sign flip.
+    """
+    mixer_freq = 0
+    if gen_ch is not None and prog.gen_chs[gen_ch].get("mixer_freq") is not None:
+        mixer_freq = prog.gen_chs[gen_ch]["mixer_freq"]["rounded"]
+        mixer_freq = prog.roundfreq(mixer_freq, [prog.soccfg["readouts"][ro_ch]])
+    f_dds = freq - mixer_freq if prog.ABSOLUTE_FREQS else freq
+    word = int(prog.freq2reg_adc(ro_ch=ro_ch, f=f_dds, gen_ch=gen_ch))
+    if mixer_freq:
+        word += int(prog.freq2reg_adc(ro_ch=ro_ch, f=mixer_freq))
+    if prog.FLIP_DOWNCONVERSION:
+        word *= -1
+    return word
+
+
+@dataclass
+class SweepPlan:
+    """Everything the code generator needs, in machine units.
+
+    Attributes are grouped: what the user asked for (``*_mhz``, ``avg``, ...),
+    what that became in register words (``gen_start``, ``ro_step``, ...), and
+    the algorithm-specific tables.
+    """
+
+    name: str
+    accel: QP2Accel
+    algorithm: str
+    calc: str
+    calc_fields: Dict[str, int]
+
+    gen_ch: int
+    ro_ch: int
+    pulse: str
+    ro_cfg: str
+    gen_wave: str = ""
+    ro_wave: str = ""
+
+    # grid geometry, user units
+    start_mhz: float = 0.0
+    stop_mhz: float = 0.0
+    step_mhz: float = 0.0
+    n_points: int = 0
+
+    # grid geometry, machine words
+    gen_start: int = 0
+    gen_step: int = 0
+    ro_start: int = 0
+    ro_step: int = 0
+
+    avg: int = 1
+    nsamp: int = 1
+    mode: int = 0
+    trig_time: float = 0.0
+    shot_period: float = 0.0
+
+    # calc-specific
+    n0: int = 0
+    n_min: int = 0
+    emit_mode: int = 0
+    thr_table: List[int] = field(default_factory=list)
+
+    # gd/kw
+    x0_mhz: Optional[float] = None
+    x0: int = 0
+    ro_x0: int = 0
+    min_step_mhz: float = 0.0
+    min_step: int = 0
+    max_iter: int = 0
+    patience: int = 0
+    use_lut: int = 0
+    lam: int = 0
+    m_min: int = 1
+    m_max: int = 1
+    f_lo_mhz: float = 0.0
+    f_hi_mhz: float = 0.0
+    f_lo: int = 0
+    f_hi: int = 0
+    a_words: List[int] = field(default_factory=list)
+    c_words: List[int] = field(default_factory=list)
+
+    # readout-word tracking for the handshake path
+    ro_ratio: int = 0
+    ro_pre_shift: int = 0
+    ro_post_shift: int = 0
+    gen_base: int = 0
+    ro_base: int = 0
+
+    result_addr: int = 0
+    debug: bool = False
+    #: Set by the code generator: whether the program writes these result words
+    writes_status: bool = False
+    writes_diag: bool = False
+    count_shots: bool = False
+    table_via_dmem: bool = False
+    dmem_table_addr: int = 0
+
+    @property
+    def handshake(self):
+        """True if the tProc gets each frequency through the QP2 handshake."""
+        return self.algorithm in ("gd", "kw")
+
+    @property
+    def total_shots(self):
+        """Shots the tProc fires, for the fixed-schedule (grid) algorithms."""
+        if self.handshake:
+            return None
+        return self.n_points * self.avg
+
+    def freq_of_word(self, prog, word):
+        """Convert a drive register word back to MHz.
+
+        The word is reduced modulo the generator's DDS width first, because
+        that is what the generator itself does with it, and the generator's
+        digital-mixer offset is added back -- ``gen_freq_word`` subtracts it,
+        so leaving it out here would report a frequency low by the mixer
+        setting.
+
+        Note that the accelerator walks its grid as ``start + k*step`` in
+        register words, exactly as the tProcessor does, so the two never
+        disagree -- but the resulting grid is uniform in *words*, not exactly
+        uniform in MHz. Over a 2 GHz, 4000-point sweep the far end sits a few
+        tens of kHz off the nominal frequency. This conversion reports where
+        the tone actually was, so the answer itself carries no such error.
+        """
+        gencfg = prog.soccfg["gens"][self.gen_ch]
+        b_dds = gencfg["b_dds"]
+        freq = float(prog.soccfg.reg2freq(to_u32(word) % (1 << b_dds),
+                                          gen_ch=self.gen_ch))
+        if prog.ABSOLUTE_FREQS and gencfg["has_mixer"]:
+            freq += prog.gen_chs[self.gen_ch]["mixer_freq"]["rounded"]
+        return freq
+
+    def describe(self):
+        """A short human-readable summary, for logging and notebooks."""
+        lines = ["adaptive_sweep '%s' on %s (%s/%s)"
+                 % (self.name, self.accel.name, self.algorithm, self.calc)]
+        if self.handshake:
+            lines.append("  window %.4f-%.4f MHz, x0 %.4f MHz, max_iter %d"
+                         % (self.f_lo_mhz, self.f_hi_mhz, self.x0_mhz,
+                            self.max_iter))
+            lines.append("  probe step %.6f MHz (gen word %d)"
+                         % (self.step_mhz, self.gen_step))
+        else:
+            lines.append("  %.4f-%.4f MHz, %d points, step %.6f MHz"
+                         % (self.start_mhz, self.stop_mhz, self.n_points,
+                            self.step_mhz))
+            lines.append("  gen word %d step %d / ro word %d step %d"
+                         % (self.gen_start, self.gen_step,
+                            self.ro_start, self.ro_step))
+            lines.append("  %d shots/point -> %d shots total"
+                         % (self.avg, self.total_shots))
+        lines.append("  nsamp %d, mode %s, result at dmem[%d]"
+                     % (self.nsamp, "dip" if self.mode else "peak",
+                        self.result_addr))
+        return "\n".join(lines)
+
+
+def _require(cond, msg):
+    if not cond:
+        raise ValueError(msg)
+
+
+#: The ARITH unit is a 27x18 DSP macro: it truncates its A/D inputs to signed
+#: 27 bits and its B input to signed 18 bits, and produces a 46-bit product
+#: (firmware/ip/qick_processor/src/_qproc_ips.sv:905-908, 947-951).
+ARITH_A_BITS = 27
+ARITH_B_BITS = 18
+
+#: The ALU takes its shift amount from the low FOUR bits of the second operand
+#: (``wire [3:0] shift; assign shift = B_i[3:0];``,
+#: firmware/ip/qick_processor/src/_qproc_ips.sv:827-828).  That is a hardware
+#: truncation, so it applies to register operands too, not just to the
+#: assembler's literal check -- a shift of 19 silently becomes a shift of 3.
+ALU_MAX_SHIFT = 15
+
+
+def _ratio_scaling(ratio, max_delta):
+    """Size the readout-tracking multiply for the ARITH unit.
+
+    The tProc's ALU has no multiplier, so the readout word is tracked through
+    the DSP::
+
+        ro_delta = ((gen_delta >>> pre) * ratio_word) >>> post
+
+    ``pre`` shrinks the drive delta into the DSP's 27-bit A input, and
+    ``ratio_word = round(ratio * 2**(pre+post))`` has to fit its 18-bit B
+    input.  Both shifts are chosen as small as those widths allow, which is
+    what keeps the error down: the pre-shift costs at most ``2**pre * ratio``
+    readout LSBs and the ratio rounding at most ``max_delta * 2**-(pre+post+1)``.
+
+    ``post`` is additionally constrained to ``[2, 15]``.  The upper bound is
+    the ALU's 4-bit shift field.  The lower bound is because recombining the
+    64-bit product needs the high word shifted left by ``32 - post``, which is
+    done as two shifts of at most 15 each -- so ``32 - post`` must not exceed
+    30.
+
+    Returns
+    -------
+    tuple of int
+        ``(ratio_word, pre, post)``.
+    """
+    _require(ratio != 0,
+             "the readout word does not move with the drive word over this "
+             "window; check gen_ch/ro_ch")
+    pre = 0
+    while (int(max_delta) >> pre) >= (1 << (ARITH_A_BITS - 1)):
+        pre += 1
+    _require(pre <= ALU_MAX_SHIFT,
+             "the search window spans %d drive words, too wide to shrink into "
+             "the multiplier's 27-bit input with a single shift. Narrow "
+             "f_lo/f_hi, or use algorithm='grid', where both step words are "
+             "precomputed on the host." % (max_delta,))
+
+    # the ratio scale is capped so the post-shift stays inside the ALU's shift
+    # field; within that cap, take the largest scale the 18-bit B input allows
+    scale = min(ARITH_B_BITS - 1, pre + ALU_MAX_SHIFT)
+    while scale > 0 and abs(round(ratio * (1 << scale))) >= (1 << (ARITH_B_BITS - 1)):
+        scale -= 1
+    ratio_word = int(round(ratio * (1 << scale)))
+    _require(ratio_word != 0,
+             "the drive/readout word ratio %g is too small to represent in the "
+             "multiplier's 18-bit input; the readout would not track the drive"
+             % (ratio,))
+
+    post = scale - pre
+    _require(2 <= post <= ALU_MAX_SHIFT,
+             "the drive/readout word ratio %g cannot be tracked across this "
+             "search window: it needs a pre-shift of %d and leaves a "
+             "post-shift of %d, outside the ALU's usable range. Narrow "
+             "f_lo/f_hi, or use algorithm='grid', where both step words are "
+             "precomputed on the host." % (ratio, pre, post))
+    return ratio_word, pre, post
+
+
+def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
+               gen_ch=None, ro_ch=None, pulse=None, ro_cfg=None,
+               start=None, stop=None, step=None, n_points=None,
+               avg=1, nsamp=None, mode="peak",
+               trig_time=0.0, shot_period=None,
+               n0=None, n_min=None, thr_table=None, emit_mode=None,
+               x0=None, min_step=None, max_iter=None, patience=None,
+               a_table=None, c_table=None,
+               use_lut=None, lambda_=0, m_min=2, m_max=8,
+               f_lo=None, f_hi=None,
+               result_addr=0, debug=False, count_shots=False,
+               table_via_dmem=None, dmem_table_addr=None):
+    """Validate a sweep declaration and convert it to machine units.
+
+    See :meth:`qick.asm_v2.QickProgramV2.adaptive_sweep` for the parameter
+    documentation; this function does the work behind it.
+
+    Returns
+    -------
+    SweepPlan
+    """
+    accel = get_accel(accel)
+
+    # --- capability checks -------------------------------------------------
+    _require(algorithm in accel.algorithms,
+             "accelerator '%s' does not implement algorithm=%r; it implements "
+             "%s" % (accel.name, algorithm, list(accel.algorithms)))
+    if calc is None:
+        calc = accel.calcs[0] if len(accel.calcs) == 1 else "shift"
+    calc_fields = accel.calc_fields(calc)
+    if algorithm in ("gd", "kw"):
+        _require(calc in accel.gdkw_calcs,
+                 "calc=%r cannot drive the GD/KW engine: it consumes a 36-bit "
+                 "power and %r is wider, so the value would be truncated. Use "
+                 "one of %s." % (calc, calc, list(accel.gdkw_calcs)))
+
+    # --- channels and names ------------------------------------------------
+    _require(gen_ch is not None, "gen_ch is required")
+    _require(ro_ch is not None, "ro_ch is required")
+    _require(gen_ch in prog.gen_chs,
+             "gen_ch=%s is not declared; call declare_gen() first" % (gen_ch,))
+    _require(ro_ch in prog.ro_chs,
+             "ro_ch=%s is not declared; call declare_readout() first" % (ro_ch,))
+    _require(pulse is not None, "pulse is required: name the drive pulse "
+                                "declared with add_pulse()")
+    _require(ro_cfg is not None, "ro_cfg is required: name the readout config "
+                                 "declared with add_readoutconfig()")
+    _require(pulse in prog.pulses,
+             "pulse=%r has not been declared; add_pulse() must run before "
+             "adaptive_sweep(). Declared pulses: %s"
+             % (pulse, sorted(prog.pulses)))
+    _require(ro_cfg in prog.pulses,
+             "ro_cfg=%r has not been declared; add_readoutconfig() must run "
+             "before adaptive_sweep(). Declared: %s"
+             % (ro_cfg, sorted(prog.pulses)))
+
+    gen_waves = prog.pulses[pulse].get_wavenames()
+    ro_waves = prog.pulses[ro_cfg].get_wavenames()
+    _require(len(gen_waves) == 1,
+             "pulse=%r has %d waveforms; an accelerated sweep retunes exactly "
+             "one drive waveform, so use a single-waveform pulse style like "
+             "'const'" % (pulse, len(gen_waves)))
+    _require(len(ro_waves) == 1,
+             "ro_cfg=%r has %d waveforms, expected exactly 1" % (ro_cfg, len(ro_waves)))
+
+    gencfg = prog.soccfg["gens"][gen_ch]
+    _require("tproc_ch" in gencfg,
+             "gen_ch=%s has no tProc waveform port" % (gen_ch,))
+    _require("tproc_ctrl" in prog.soccfg["readouts"][ro_ch],
+             "ro_ch=%s is not a tProc-controlled readout, so its DDC cannot "
+             "track the drive" % (ro_ch,))
+
+    # --- shared acquisition parameters -------------------------------------
+    avg = int(avg)
+    _require(avg >= 1, "avg must be >= 1, got %d" % (avg,))
+    if nsamp is None:
+        nsamp = int(prog.ro_chs[ro_ch]["length"])
+    nsamp = int(nsamp)
+    _require(nsamp >= 1,
+             "nsamp must be >= 1; it is the number of raw ADC samples folded "
+             "per shot, and defaults to the declared readout window")
+    _require(mode in ("peak", "dip"),
+             "mode must be 'peak' or 'dip', got %r" % (mode,))
+    _require(not debug or accel.has_op("GET_DIAG"),
+             "debug=True asks for the diagnostic counters, but accelerator "
+             "'%s' has no diagnostic read" % (accel.name,))
+    mode_bit = 1 if mode == "dip" else 0
+
+    if shot_period is None:
+        ro_len_us = prog.ro_chs[ro_ch]["length"] / prog.soccfg["readouts"][ro_ch]["f_output"]
+        shot_period = trig_time + ro_len_us + 1.0
+    ro_len_us = prog.ro_chs[ro_ch]["length"] / prog.soccfg["readouts"][ro_ch]["f_output"]
+    _require(shot_period > trig_time + ro_len_us,
+             "shot_period (%g us) must exceed trig_time + readout length "
+             "(%g us), or shots would overlap"
+             % (shot_period, trig_time + ro_len_us))
+
+    plan = SweepPlan(
+        name=name, accel=accel, algorithm=algorithm, calc=calc,
+        calc_fields=calc_fields, gen_ch=gen_ch, ro_ch=ro_ch, pulse=pulse,
+        ro_cfg=ro_cfg, gen_wave=gen_waves[0], ro_wave=ro_waves[0],
+        avg=avg, nsamp=nsamp, mode=mode_bit,
+        trig_time=trig_time, shot_period=shot_period,
+        result_addr=int(result_addr), debug=bool(debug),
+        count_shots=bool(count_shots),
+    )
+
+    def gw(f):
+        return to_s32(gen_freq_word(prog, f, gen_ch, ro_ch))
+
+    def rw(f):
+        return to_s32(ro_freq_word(prog, f, ro_ch, gen_ch))
+
+    # --- grid geometry -----------------------------------------------------
+    _require(start is not None, "start (MHz) is required")
+    if algorithm == "grid":
+        _require(stop is not None or (step is not None and n_points is not None),
+                 "give stop=, or both step= and n_points=")
+        if n_points is None:
+            _require(step is not None and step != 0,
+                     "step must be nonzero when n_points is not given")
+            n_points = int(round((stop - start) / step)) + 1
+        elif step is None:
+            _require(stop is not None, "give stop= or step=")
+            _require(n_points > 1,
+                     "n_points must be > 1 when the step is derived from "
+                     "start/stop")
+            step = (stop - start) / (n_points - 1)
+        n_points = int(n_points)
+        _require(n_points >= 1, "n_points must be >= 1, got %d" % (n_points,))
+        if stop is None:
+            stop = start + step * (n_points - 1)
+    else:
+        _require(step is not None and step != 0,
+                 "gd/kw need step= (MHz): it is the probe spacing and the "
+                 "racing-mode move size")
+        n_points = 0
+        if stop is None:
+            stop = start
+
+    plan.start_mhz = float(start)
+    plan.stop_mhz = float(stop)
+    plan.step_mhz = float(step)
+    plan.n_points = n_points
+    plan.gen_start = gw(start)
+    plan.ro_start = rw(start)
+    # the step is a *delta* of words, and the two axes scale differently:
+    # computing each from its own converter is the whole point
+    plan.gen_step = to_s32(gw(start + step) - plan.gen_start)
+    plan.ro_step = to_s32(rw(start + step) - plan.ro_start)
+    _require(plan.gen_step != 0,
+             "step=%g MHz rounds to a zero drive-word step; the sweep would "
+             "never move" % (step,))
+
+    # The accelerator walks the grid in 32-bit arithmetic and the tProcessor
+    # steps the waveform register the same way, so a 32-bit wrap is harmless --
+    # both sides wrap identically and the generator plays the wrapped word.
+    # A generator narrower than 32 bits is different: there the generator wraps
+    # but the accelerator does not, so its reported word would decode to a
+    # frequency the tone never played.
+    b_dds = gencfg["b_dds"]
+    if b_dds < 32 and algorithm == "grid":
+        ends = (plan.gen_start, plan.gen_start + (n_points - 1) * plan.gen_step)
+        _require(0 <= min(ends) and max(ends) < (1 << b_dds),
+                 "the sweep runs from drive word %d to %d, outside this "
+                 "generator's %d-bit DDS range; the accelerator would report a "
+                 "frequency the tone never played. Narrow the band."
+                 % (min(ends), max(ends), b_dds))
+
+    # --- calc-specific -----------------------------------------------------
+    if calc == "welford":
+        _require(n0 is not None,
+                 "calc='welford' needs n0= (the warmup shot count)")
+        _require(1 <= int(n0) <= avg,
+                 "n0 must be in [1, avg]=[1, %d], got %s" % (avg, n0))
+        plan.n0 = int(n0)
+    elif n0 is not None:
+        raise ValueError("n0 only applies to calc='welford'")
+
+    if calc == "madstop":
+        _require(thr_table is not None,
+                 "calc='madstop' needs thr_table=: the per-epoch deviation "
+                 "thresholds, in LSB units, indexed by log2(shot count)")
+        thr = [int(t) for t in thr_table]
+        _require(len(thr) <= accel.thr_depth,
+                 "thr_table has %d entries but the threshold table is only %d "
+                 "deep" % (len(thr), accel.thr_depth))
+        for i, t in enumerate(thr):
+            _require(0 <= t < (1 << 46),
+                     "thr_table[%d]=%d does not fit in the 46-bit threshold "
+                     "register" % (i, t))
+        # the table is indexed by log2(shot count), and the last epoch tested
+        # is the one at or below avg, so it has to reach that far
+        need = int(avg).bit_length() - 1 if avg else 0
+        _require(len(thr) > need,
+                 "thr_table has %d entries but avg=%d reaches epoch %d, so it "
+                 "needs at least %d; an unwritten entry reads as 0 and would "
+                 "silently disable the early stop at that epoch"
+                 % (len(thr), avg, need, need + 1))
+        plan.thr_table = thr
+        plan.n_min = 0 if n_min is None else int(n_min)
+        _require(plan.n_min == 0 or (plan.n_min & (plan.n_min - 1)) == 0,
+                 "n_min must be a power of two (it is an epoch boundary) or 0 "
+                 "to disable early stopping, got %s" % (n_min,))
+        _require(plan.n_min <= avg,
+                 "n_min=%d exceeds avg=%d, so the early stop could never fire"
+                 % (plan.n_min, avg))
+        if emit_mode is None:
+            emit_mode = "drain" if algorithm == "grid" else "immediate"
+        _require(emit_mode in ("immediate", "drain"),
+                 "emit_mode must be 'immediate' or 'drain', got %r" % (emit_mode,))
+        if algorithm == "grid" and emit_mode == "immediate":
+            raise ValueError(
+                "emit_mode='immediate' breaks the grid lockstep: the IP would "
+                "advance to the next point as soon as a point converges, while "
+                "the tProc keeps firing its fixed avg shots per point, and the "
+                "two desynchronise. Use emit_mode='drain' under "
+                "algorithm='grid'; if you want the IP to advance early, drive "
+                "it from the OP3 status (point_idx / early_stop) with "
+                "algorithm='gd' or 'kw' instead.")
+        plan.emit_mode = 1 if emit_mode == "drain" else 0
+    else:
+        _require(thr_table is None, "thr_table only applies to calc='madstop'")
+        _require(n_min is None, "n_min only applies to calc='madstop'")
+        _require(emit_mode is None, "emit_mode only applies to calc='madstop'")
+
+    # --- gd/kw -------------------------------------------------------------
+    if plan.handshake:
+        _require(accel.has_op("GET_FREQ"),
+                 "accelerator '%s' has no GET_FREQ handshake" % (accel.name,))
+        use_lut = bool(a_table is not None or c_table is not None) \
+            if use_lut is None else bool(use_lut)
+        plan.use_lut = 1 if use_lut else 0
+
+        f_lo = start if f_lo is None else f_lo
+        f_hi = stop if f_hi is None else f_hi
+        _require(f_lo < f_hi,
+                 "f_lo (%g MHz) must be below f_hi (%g MHz)" % (f_lo, f_hi))
+        plan.f_lo_mhz, plan.f_hi_mhz = float(f_lo), float(f_hi)
+        plan.f_lo = gw(f_lo)
+        plan.f_hi = gw(f_hi)
+        _require(to_u32(plan.f_lo) < to_u32(plan.f_hi),
+                 "f_lo and f_hi map to drive words %d and %d, which are not in "
+                 "increasing order; the engine clips against unsigned words, so "
+                 "the window must not wrap" % (plan.f_lo, plan.f_hi))
+
+        x0 = start if x0 is None else x0
+        _require(f_lo <= x0 <= f_hi,
+                 "x0=%g MHz is outside the search window [%g, %g] MHz"
+                 % (x0, f_lo, f_hi))
+        plan.x0_mhz = float(x0)
+        plan.x0 = gw(x0)
+
+        _require(min_step is not None,
+                 "gd/kw need min_step= (MHz): the convergence threshold on the "
+                 "step size")
+        plan.min_step_mhz = float(min_step)
+        plan.min_step = abs(to_s32(gw(start + min_step) - gw(start)))
+        _require(plan.min_step > 0,
+                 "min_step=%g MHz rounds to a zero drive-word step" % (min_step,))
+
+        _require(max_iter is not None, "gd/kw need max_iter=")
+        _require(1 <= int(max_iter) < (1 << 16),
+                 "max_iter must be in [1, 65535], got %s" % (max_iter,))
+        plan.max_iter = int(max_iter)
+
+        patience = 0 if patience is None else int(patience)
+        _require(0 <= patience < (1 << 8),
+                 "patience must be in [0, 255], got %s" % (patience,))
+        plan.patience = patience
+
+        _require(0 <= int(lambda_) < (1 << 5),
+                 "lambda_ must be in [0, 31], got %s" % (lambda_,))
+        plan.lam = int(lambda_)
+
+        if plan.use_lut:
+            _require(a_table is not None and c_table is not None,
+                     "use_lut=True needs both a_table= and c_table= (step and "
+                     "probe-width schedules, in MHz)")
+            for label, table in (("a_table", a_table), ("c_table", c_table)):
+                _require(len(table) > 0, "%s is empty" % (label,))
+                _require(len(table) <= accel.lut_depth,
+                         "%s has %d entries but the schedule LUT is only %d "
+                         "deep" % (label, len(table), accel.lut_depth))
+            plan.a_words = [abs(to_s32(gw(start + v) - plan.gen_start))
+                            for v in a_table]
+            plan.c_words = [abs(to_s32(gw(start + v) - plan.gen_start))
+                            for v in c_table]
+            for label, words, table in (("a_table", plan.a_words, a_table),
+                                        ("c_table", plan.c_words, c_table)):
+                for i, (w, v) in enumerate(zip(words, table)):
+                    _require(w > 0,
+                             "%s[%d]=%g MHz rounds to a zero drive-word step"
+                             % (label, i, v))
+            plan.m_min = plan.m_max = 1
+        else:
+            _require(a_table is None and c_table is None,
+                     "a_table/c_table are only used with use_lut=True; racing "
+                     "mode repeats the fixed step= pair instead")
+            _require(1 <= int(m_min) <= int(m_max) < (1 << 16),
+                     "racing mode needs 1 <= m_min <= m_max < 65536, got "
+                     "m_min=%s m_max=%s" % (m_min, m_max))
+            plan.m_min, plan.m_max = int(m_min), int(m_max)
+
+        # Readout tracking: the engine reports only the drive word, so the
+        # tProc derives the readout word from it.  Anchor at the middle of the
+        # window, which halves the largest delta the multiplier has to take.
+        f_mid = 0.5 * (plan.f_lo_mhz + plan.f_hi_mhz)
+        plan.gen_base = gw(f_mid)
+        plan.ro_base = rw(f_mid)
+        plan.ro_x0 = rw(x0)
+        gen_span = to_s32(plan.f_hi) - to_s32(plan.f_lo)
+        ro_span = to_s32(rw(f_hi)) - to_s32(rw(f_lo))
+        _require(gen_span != 0,
+                 "f_lo and f_hi map to the same drive word; widen the search "
+                 "window")
+        max_delta = max(abs(to_s32(plan.f_hi) - plan.gen_base),
+                        abs(to_s32(plan.f_lo) - plan.gen_base))
+        plan.ro_ratio, plan.ro_pre_shift, plan.ro_post_shift = _ratio_scaling(
+            ro_span / gen_span, max_delta)
+    else:
+        for label, value in (("x0", x0), ("min_step", min_step),
+                             ("max_iter", max_iter), ("patience", patience),
+                             ("a_table", a_table), ("c_table", c_table),
+                             ("use_lut", use_lut), ("f_lo", f_lo),
+                             ("f_hi", f_hi)):
+            _require(value is None,
+                     "%s only applies to algorithm='gd' or 'kw'" % (label,))
+
+    # --- table transport ---------------------------------------------------
+    n_table = len(plan.thr_table) + len(plan.a_words) + len(plan.c_words)
+    if table_via_dmem is None:
+        # straight-line PBs cost ~4 instructions per entry; past this many it
+        # is cheaper to preload the values into data memory and loop
+        table_via_dmem = n_table > 16
+    plan.table_via_dmem = bool(table_via_dmem) and n_table > 0
+    if plan.table_via_dmem:
+        base = dmem_table_addr
+        if base is None:
+            base = plan.result_addr + RESULT_BLOCK
+        plan.dmem_table_addr = int(base)
+        _require(plan.dmem_table_addr >= 0, "dmem_table_addr must be >= 0")
+        _require(plan.dmem_table_addr >= plan.result_addr + RESULT_BLOCK
+                 or plan.dmem_table_addr + _table_words(plan) <= plan.result_addr,
+                 "the dmem table at %d would overlap the result block at %d"
+                 % (plan.dmem_table_addr, plan.result_addr))
+        limit = prog.tproccfg["dmem_size"]
+        _require(plan.dmem_table_addr + _table_words(plan) <= limit,
+                 "the dmem table needs %d words at address %d, past the end of "
+                 "data memory (%d)"
+                 % (_table_words(plan), plan.dmem_table_addr, limit))
+
+    _require(plan.result_addr >= 0, "result_addr must be >= 0")
+    # the result block is written with literal DMEM_WR addresses, and a literal
+    # data-memory address encodes in 11 signed bits
+    # (tprocv2_assembler.py:1320), so it is capped well below dmem_size
+    limit = min(LITERAL_DMEM_MAX + 1, prog.tproccfg["dmem_size"])
+    _require(plan.result_addr + RESULT_BLOCK <= limit,
+             "result_addr=%d leaves no room for the %d-word result block: a "
+             "literal data-memory address is 11-bit signed, so the block must "
+             "end by address %d (this tProc's data memory is %d words, but "
+             "only the first %d are reachable by literal address)"
+             % (plan.result_addr, RESULT_BLOCK, limit,
+                prog.tproccfg["dmem_size"], limit))
+
+    # --- collisions with sweeps already declared in this program -----------
+    _check_no_overlap(prog, plan)
+    return plan
+
+
+def _blocks(plan):
+    """The data-memory ranges a plan writes, as ``(start, stop, what)``."""
+    out = [(plan.result_addr, plan.result_addr + RESULT_BLOCK, "result block")]
+    if plan.table_via_dmem:
+        out.append((plan.dmem_table_addr,
+                    plan.dmem_table_addr + _table_words(plan), "staged table"))
+    return out
+
+
+def _check_no_overlap(prog, plan):
+    """Reject a sweep whose data memory collides with an earlier one.
+
+    ``result_addr`` defaults to 0, so two sweeps in one program silently
+    overwrite each other's answers unless the second one is given an address.
+    """
+    for other in getattr(prog, "_sweep_plans", {}).values():
+        if other.name == plan.name:
+            continue
+        for lo, hi, what in _blocks(plan):
+            for olo, ohi, owhat in _blocks(other):
+                _require(hi <= olo or ohi <= lo,
+                         "sweep %r puts its %s at data-memory [%d, %d) which "
+                         "overlaps sweep %r's %s at [%d, %d); give one of them "
+                         "a different result_addr (or dmem_table_addr)"
+                         % (plan.name, what, lo, hi, other.name, owhat,
+                            olo, ohi))
+
+
+def _table_words(plan):
+    """Words the dmem-staged table occupies (2 per thr entry, 1 per LUT entry)."""
+    return 2 * len(plan.thr_table) + len(plan.a_words) + len(plan.c_words)
+
+
+def table_image(plan):
+    """The data-memory image of a dmem-staged table.
+
+    Returns
+    -------
+    list of int
+        Words to place at ``plan.dmem_table_addr``.  Threshold entries occupy
+        two words each (low then high), LUT entries one each.
+    """
+    words = []
+    for t in plan.thr_table:
+        words.append(to_s32(t & 0xFFFFFFFF))
+        words.append((t >> 32) & 0x3FFF)
+    words.extend(to_s32(w) for w in plan.a_words)
+    words.extend(to_s32(w) for w in plan.c_words)
+    return words
+
 
 # user units, multi-dimension
 class QickParam:
@@ -610,6 +1885,80 @@ class IncReg(Macro):
         insts.append(AsmInst(inst={'CMD':"REG_WR", 'DST': dst, 'SRC':'op', 'OP': '%s + %s'%(dst, src)}, addr_inc=1))
         return insts
 
+class AluReg(Macro):
+    """Write the result of a general ALU operation into a register.
+
+    ``WriteReg`` copies and ``IncReg`` adds in place; this covers the rest of
+    the ALU, with an arbitrary destination.
+    """
+    # dst, arg1, op, arg2
+    def expand(self, prog):
+        insts = []
+        dst = prog._get_reg(self.dst)
+        arg1 = prog._get_reg(self.arg1)
+        if self.op is None:
+            return [AsmInst(inst={'CMD':"REG_WR", 'DST': dst, 'SRC':'op', 'OP': arg1}, addr_inc=1)]
+        if isinstance(self.arg2, Integral):
+            # operation immediates are 24-bit; anything wider goes via scratch
+            if check_bytes(self.arg2, 3):
+                arg2 = '#%d'%(self.arg2)
+            else:
+                trunc = int(np.int64(self.arg2).astype(np.int32))
+                prog.add_reg("scratch", allow_reuse=True)
+                insts.append(WriteReg(dst="scratch", src=trunc))
+                arg2 = prog._get_reg("scratch")
+        elif isinstance(self.arg2, str):
+            arg2 = prog._get_reg(self.arg2)
+        else:
+            raise RuntimeError(f"invalid arg2: {self.arg2}")
+        insts.append(AsmInst(inst={'CMD':"REG_WR", 'DST': dst, 'SRC':'op', 'OP':'%s %s %s'%(arg1, self.op, arg2)}, addr_inc=1))
+        return insts
+
+class Arith(Macro):
+    """One ``ARITH`` instruction: a DSP multiply-accumulate.
+
+    The unit computes ``(D +/- A) * B +/- C`` and parks a 64-bit result inside
+    the peripheral.  Reading it means pointing the peripheral source select at
+    ARITH and reading ``s_core_r1`` (low) and ``s_core_r2`` (high) -- the same
+    registers the custom peripheral uses, so the two cannot be in flight at
+    once.
+    """
+    # op, r1, r2, r3, r4
+    def expand(self, prog):
+        if self.op not in ARITH_OPS:
+            raise ValueError("unknown ARITH operation %r; the unit implements %s"
+                             % (self.op, sorted(ARITH_OPS)))
+        inst = {'CMD': 'ARITH', 'C_OP': self.op}
+        for key, reg in (('R1', self.r1), ('R2', self.r2),
+                         ('R3', self.r3), ('R4', self.r4)):
+            if reg is not None:
+                inst[key] = prog._get_reg(reg)
+        return [AsmInst(inst=inst, addr_inc=1)]
+
+class LoopBack(Macro):
+    """Test a counter and jump back to a label, incrementing on the way.
+
+    The tail of a counted loop, in two instructions -- the same form
+    ``CloseLoop`` uses, but for a loop this library builds internally rather
+    than one the user opened.
+    """
+    # label, reg, last
+    def expand(self, prog):
+        insts = []
+        reg = prog._get_reg(self.reg)
+        big_pmem = prog.tproccfg['pmem_size'] > 2**11
+        if big_pmem:
+            # NOTE: to jump to address > 11bits, use s_addr/s15 reg
+            insts.append(WriteLabel(label=self.label))
+        insts.append(AsmInst(inst={'CMD':'TEST', 'OP':'%s - #%d'%(reg, self.last)}, addr_inc=1))
+        jump = {'CMD':'JUMP', 'IF':'NZ', 'WR':'%s op'%(reg), 'OP':'%s + #1'%(reg)}
+        if big_pmem:
+            jump['ADDR'] = 's15'
+        else:
+            jump['LABEL'] = self.label
+        insts.append(AsmInst(inst=jump, addr_inc=1))
+        return insts
+
 class ReadWmem(Macro):
     # name
     def expand(self, prog):
@@ -716,6 +2065,417 @@ class CondJump(Macro):
         else:
             insts.append(AsmInst(inst={'CMD': 'JUMP', 'IF': self.test, 'LABEL': self.label}, addr_inc=1))
         return insts
+
+# QP2 custom peripheral (the "PB" bus)
+
+class PeriphB(Macro):
+    """One raw ``PB`` instruction, optionally followed by the mandatory NOP.
+
+    ``PB`` takes four register operands and no immediates.  R1/R2 are encoded
+    as "src_data" and R3/R4 as "src_addr" (tprocv2_assembler.py:154-172); all
+    four become ``qtag_dt1_i`` .. ``qtag_dt4_i`` at the peripheral.
+
+    The peripheral latches on the rising edge of its enable, so two ``PB``
+    instructions back to back would be seen as one; a NOP between them is
+    required.  Emitting it here (rather than leaving it to the caller) makes
+    that impossible to forget.
+    """
+    # op, r1, r2, r3, r4, nop
+    def expand(self, prog):
+        op = int(self.op)
+        if not 0 <= op <= 31:
+            raise ValueError("PB opcode must be in [0, 31], got %d" % (op))
+        # C_OP is parsed with int(s, 10), so it must be a decimal string
+        # (tprocv2_assembler.py:286)
+        inst = {'CMD': 'PB', 'C_OP': str(op)}
+        for key, reg in (('R1', self.r1), ('R2', self.r2),
+                         ('R3', self.r3), ('R4', self.r4)):
+            regname = prog._get_reg(reg)
+            if key in ('R3', 'R4') and regname.startswith('w'):
+                raise ValueError(
+                    "PB operand %s is an address-type operand and can't be a "
+                    "waveform register (got %s); use R1/R2 for w-registers"
+                    % (key, regname))
+            inst[key] = regname
+        insts = [AsmInst(inst=inst, addr_inc=1)]
+        if self.nop:
+            insts.append(AsmInst(inst={'CMD': 'NOP'}, addr_inc=1))
+        return insts
+
+class PeriphBOp(Macro):
+    """A named accelerator operation: stage the dt words, then issue the PB.
+
+    The four 32-bit ``dt`` words are packed from named fields by
+    :func:`pack_op`, written into scratch registers, and handed
+    to a :class:`PeriphB`.  Words that pack to zero use the hardwired ``s_zero``
+    register instead of burning an instruction.
+    """
+    # accel, mnemonic, values, nop
+    def expand(self, prog):
+        accel = get_accel(self.accel)
+        op, words = pack_op(accel, self.mnemonic, **self.values)
+        insts = []
+        operands = []
+        for i, word in enumerate(words):
+            if word == 0:
+                operands.append('s_zero')
+                continue
+            name = 'qp2_dt%d' % (i + 1)
+            prog.add_reg(name, allow_reuse=True)
+            # REG_WR immediates are encoded as signed 32-bit
+            # (tprocv2_assembler.py:280-292), so present the word that way
+            insts.append(WriteReg(dst=name, src=to_s32(word)))
+            operands.append(name)
+        insts.append(PeriphB(op=op, r1=operands[0], r2=operands[1],
+                             r3=operands[2], r4=operands[3], nop=self.nop))
+        return insts
+
+class QpbPoll(Macro):
+    """Spin on a bit of ``s_status`` until it reaches the wanted polarity.
+
+    Expands to a self-referencing label plus a masked ``TEST``/``JUMP`` pair.
+    The label is allocated from the program's counter at expansion time, so a
+    program containing several polls gets several distinct labels, and two
+    compiles of the same program produce the same names.
+    """
+    # mask, want, tag
+    def expand(self, prog):
+        label = prog._next_auto_label(self.tag)
+        # jump back while the tested bit is NOT yet at the wanted polarity:
+        # want=1 -> keep looping while (status & mask) == 0  -> test Z
+        # want=0 -> keep looping while (status & mask) != 0  -> test NZ
+        test = 'Z' if self.want else 'NZ'
+        return [Label(label=label),
+                CondJump(label=label, arg1='s_status', op='&',
+                         arg2=int(self.mask), test=test)]
+
+# accelerated sweeps
+
+class AdaptiveSweep(Macro):
+    """A whole co-processor-accelerated sweep, as one macro.
+
+    ``expand()`` produces the entire sequence: configuration ops, any table
+    loads, the waveform-memory seed, the RUN op, the service loop that fires
+    shots, and the result read-back into data memory.
+
+    The child macros are built during ``preprocess()`` rather than ``expand()``
+    because some of them are timed (``Pulse``, ``Trigger``, ``Delay``) and have
+    their own preprocessing to do -- they need to walk the timeline in the same
+    pass as every other macro in the program.
+    """
+    # name, kwargs
+
+    def preprocess(self, prog):
+        self.plan = plan_sweep(prog, name=self.name, **self.kwargs)
+        prog._sweep_plans[self.name] = self.plan
+        asm = AsmV2()
+        if self.plan.handshake:
+            self._emit_handshake(prog, asm, self.plan)
+        else:
+            self._emit_grid(prog, asm, self.plan)
+        self.children = asm.macro_list
+        for macro in self.children:
+            macro.preprocess(prog)
+
+    def expand(self, prog):
+        return self.children
+
+    # -- shared pieces -----------------------------------------------------
+
+    def _label(self, prog, what):
+        return prog._next_auto_label('%s_%s' % (self.name, what))
+
+    def _config(self, prog, asm, plan):
+        """Point the bus at the peripheral and latch the acquisition setup."""
+        accel = plan.accel
+        asm.qpb_select()
+        cfg = dict(nsamp=plan.nsamp, mode=plan.mode)
+        if 'reduce_sel' in accel.op('CFG_ACQ').field_names():
+            cfg.update(plan.calc_fields)
+            cfg.update(estop_hold=plan.emit_mode, n0=plan.n0, n_min=plan.n_min)
+        asm.qpb_send(accel, 'CFG_ACQ', **cfg)
+
+    def _seed_wave(self, asm, wave, word):
+        """Overwrite a waveform's frequency field with an absolute word."""
+        asm.read_wmem(wave)
+        asm.write_reg(dst='w_freq', src=to_s32(word))
+        asm.write_wmem(wave)
+
+    def _step_wave(self, asm, wave, delta):
+        """Advance a waveform's frequency field by a constant word delta."""
+        asm.read_wmem(wave)
+        asm.inc_reg(dst='w_freq', src=to_s32(delta))
+        asm.write_wmem(wave)
+
+    def _shot_loop(self, prog, asm, plan, reg_shot):
+        """Fire exactly ``avg`` shots at whatever the waveform memory holds."""
+        label = self._label(prog, 'shot')
+        asm.write_reg(dst=reg_shot, src=0)
+        asm.label(label)
+        asm.pulse(ch=plan.gen_ch, name=plan.pulse, t=0)
+        asm.send_readoutconfig(ch=plan.ro_ch, name=plan.ro_cfg, t=0)
+        asm.trigger(ros=[plan.ro_ch], t=plan.trig_time)
+        asm.wait_auto(0, gens=False, ros=True, no_warn=True)
+        asm.delay(plan.shot_period)
+        if plan.count_shots:
+            asm.inc_ext_counter(addr=1)
+        asm.append_macro(LoopBack(label=label, reg=reg_shot, last=plan.avg - 1))
+
+    def _load_tables(self, prog, asm, plan):
+        """Emit the threshold and schedule table writes.
+
+        Short tables become straight-line ``PB``s.  Long ones are staged
+        through data memory and written by a loop, which keeps program memory
+        flat as the table grows.
+        """
+        accel = plan.accel
+        entries = []
+        if plan.thr_table:
+            entries.append(('THR_WR', plan.thr_table, 'thr'))
+        if plan.a_words:
+            entries.append(('ALUT_WR', plan.a_words, 'a'))
+        if plan.c_words:
+            entries.append(('CLUT_WR', plan.c_words, 'c'))
+        if not entries:
+            return
+
+        if not plan.table_via_dmem:
+            for mnemonic, values, _ in entries:
+                for i, value in enumerate(values):
+                    if mnemonic == 'THR_WR':
+                        asm.qpb_send(accel, mnemonic, index=i,
+                                     thr_lo=value & 0xFFFFFFFF,
+                                     thr_hi=(value >> 32) & 0x3FFF)
+                    else:
+                        asm.qpb_send(accel, mnemonic, index=i, value=value,
+                                     length=len(values))
+            return
+
+        # dmem-staged: walk an index register over the preloaded words
+        reg_i = prog.add_reg('%s_tbl_i' % (plan.name))
+        reg_a = prog.add_reg('%s_tbl_a' % (plan.name))
+        prog.add_reg('qp2_dt1', allow_reuse=True)
+        prog.add_reg('qp2_dt2', allow_reuse=True)
+        prog.add_reg('qp2_dt3', allow_reuse=True)
+        base = plan.dmem_table_addr
+        for mnemonic, values, tag in entries:
+            label = self._label(prog, 'tbl_%s' % (tag))
+            # a threshold occupies two data-memory words, a LUT entry one, so
+            # the index register counts words and the entry index is derived
+            width = 2 if mnemonic == 'THR_WR' else 1
+            asm.write_reg(dst=reg_i, src=0)
+            asm.label(label)
+            asm.append_macro(AluReg(dst=reg_a, arg1=reg_i, op='+', arg2=base))
+            asm.read_dmem(dst='qp2_dt2', addr=reg_a)
+            if width == 2:
+                asm.append_macro(AluReg(dst=reg_a, arg1=reg_a, op='+', arg2=1))
+                asm.read_dmem(dst='qp2_dt3', addr=reg_a)
+                asm.append_macro(AluReg(dst='qp2_dt1', arg1=reg_i, op='ASR',
+                                        arg2=1))
+                asm.pb(accel.op(mnemonic).number, r1='qp2_dt1', r2='qp2_dt2',
+                       r3='qp2_dt3')
+                # step over this entry's second word before the loop test,
+                # which contributes the other +1
+                asm.append_macro(AluReg(dst=reg_i, arg1=reg_i, op='+', arg2=1))
+            else:
+                asm.write_reg(dst='qp2_dt3', src=len(values))
+                asm.pb(accel.op(mnemonic).number, r1=reg_i, r2='qp2_dt2',
+                       r3='qp2_dt3')
+            asm.append_macro(LoopBack(label=label, reg=reg_i,
+                                      last=len(values) * width - 1))
+            base += len(values) * width
+
+    def _store_result(self, prog, asm, plan, status_src):
+        """Copy the response words into the result block and raise the flag.
+
+        The frequency word goes to data memory *before* any further peripheral
+        read, because a status read overwrites the response registers.
+        """
+        asm.write_dmem(addr=plan.result_addr + RESULT_FREQ, src='s_core_r1')
+        if status_src is not None:
+            asm.write_dmem(addr=plan.result_addr + RESULT_STATUS,
+                           src=status_src)
+            plan.writes_status = True
+        asm.qpb_ack()
+        accel = plan.accel
+        # the answer is now safely in data memory, so release the peripheral's
+        # hold on it -- until this, every read is refused so that a poll the
+        # program had already issued could not overwrite the answer
+        if accel.has_op('CLR_RESULT'):
+            asm.qpb_send(accel, 'CLR_RESULT')
+        if status_src is None and accel.has_op('GET_STATUS'):
+            asm.qpb_send(accel, 'GET_STATUS')
+            asm.qpb_wait_new()
+            asm.write_dmem(addr=plan.result_addr + RESULT_STATUS,
+                           src='s_core_r1')
+            asm.qpb_ack()
+            plan.writes_status = True
+        if plan.debug and accel.has_op('GET_DIAG'):
+            asm.qpb_send(accel, 'GET_DIAG')
+            asm.qpb_wait_new()
+            asm.write_dmem(addr=plan.result_addr + RESULT_DIAG,
+                           src='s_core_r1')
+            asm.qpb_ack()
+            plan.writes_diag = True
+        # written last, so a host that sees it knows the rest is settled
+        asm.write_dmem(addr=plan.result_addr + RESULT_DONE, src=DONE_SENTINEL)
+
+    # -- grid --------------------------------------------------------------
+
+    def _emit_grid(self, prog, asm, plan):
+        accel = plan.accel
+        reg_point = prog.add_reg('%s_point' % (plan.name))
+        reg_shot = prog.add_reg('%s_shot' % (plan.name))
+
+        self._config(prog, asm, plan)
+        self._load_tables(prog, asm, plan)
+        asm.qpb_send(accel, 'CFG_WINDOW', start_freq=plan.gen_start,
+                     step=plan.gen_step, n_points=plan.n_points,
+                     averager_value=plan.avg)
+
+        # seed both waveforms at the first point before the IP starts, so the
+        # very first shot already measures the frequency the IP believes it is
+        # measuring
+        self._seed_wave(asm, plan.gen_wave, plan.gen_start)
+        self._seed_wave(asm, plan.ro_wave, plan.ro_start)
+
+        asm.qpb_send(accel, 'START')
+        # confirm the peripheral actually took the job before polling for its
+        # completion: the READY still standing from before the START would
+        # otherwise read as an instant, bogus "done"
+        asm.qpb_wait_ready(invert=True)
+
+        point_label = self._label(prog, 'point')
+        asm.write_reg(dst=reg_point, src=0)
+        asm.label(point_label)
+        self._shot_loop(prog, asm, plan, reg_shot)
+        # step to the next point; the IP walks its own copy of the same grid
+        self._step_wave(asm, plan.gen_wave, plan.gen_step)
+        self._step_wave(asm, plan.ro_wave, plan.ro_step)
+        asm.append_macro(LoopBack(label=point_label, reg=reg_point,
+                                  last=plan.n_points - 1))
+
+        asm.qpb_wait_ready()
+        asm.qpb_wait_new()
+        self._store_result(prog, asm, plan, status_src=None)
+
+    # -- gd/kw handshake ---------------------------------------------------
+
+    def _emit_handshake(self, prog, asm, plan):
+        accel = plan.accel
+        reg_shot = prog.add_reg('%s_shot' % (plan.name))
+        reg_gen = prog.add_reg('%s_gen' % (plan.name))
+        reg_ro = prog.add_reg('%s_ro' % (plan.name))
+        reg_genbase = prog.add_reg('%s_genbase' % (plan.name))
+        reg_robase = prog.add_reg('%s_robase' % (plan.name))
+        reg_ratio = prog.add_reg('%s_ratio' % (plan.name))
+        prog.add_reg('qp2_tmp', allow_reuse=True)
+
+        self._config(prog, asm, plan)
+        asm.qpb_send(accel, 'CFG_WINDOW', start_freq=plan.gen_start,
+                     step=plan.gen_step, n_points=0,
+                     averager_value=plan.avg)
+        asm.qpb_send(accel, 'CFG_GDKW', f_lo=plan.f_lo, f_hi=plan.f_hi,
+                     m_min=plan.m_min, m_max=plan.m_max)
+        self._load_tables(prog, asm, plan)
+
+        # constants for the readout-word tracker
+        asm.write_reg(dst=reg_genbase, src=to_s32(plan.gen_base))
+        asm.write_reg(dst=reg_robase, src=to_s32(plan.ro_base))
+        asm.write_reg(dst=reg_ratio, src=to_s32(plan.ro_ratio))
+
+        self._seed_wave(asm, plan.gen_wave, plan.x0)
+        self._seed_wave(asm, plan.ro_wave, plan.ro_x0)
+
+        mnemonic = 'RUN_KW' if plan.algorithm == 'kw' else 'RUN_GD'
+        asm.qpb_send(accel, mnemonic, x0=plan.x0, use_lut=plan.use_lut,
+                     min_step=plan.min_step, max_iter=plan.max_iter,
+                     patience=plan.patience, **{'lambda': plan.lam})
+        asm.qpb_wait_ready(invert=True)
+
+        service = self._label(prog, 'service')
+        done = self._label(prog, 'done')
+        asm.label(service)
+        # READY high means the job is over.  Test it before touching the
+        # peripheral: any read would overwrite the final result registers.
+        asm.cond_jump(label=done, arg1='s_status', op='&', arg2=BIT_QPB_RDY,
+                      test='NZ')
+        asm.qpb_send(accel, 'GET_FREQ')
+        asm.qpb_wait_new()
+        asm.write_reg(dst=reg_gen, src='s_core_r1')
+        asm.write_reg(dst='qp2_tmp', src='s_core_r2')
+        asm.qpb_ack()
+        # dt2_o[0] is the pending flag; a read with nothing pending does not
+        # ack the engine, so spinning here is harmless
+        asm.cond_jump(label=service, arg1='qp2_tmp', op='&', arg2=1, test='Z')
+
+        self._emit_ro_track(prog, asm, plan, reg_gen, reg_ro, reg_genbase,
+                            reg_robase, reg_ratio)
+
+        asm.read_wmem(plan.gen_wave)
+        asm.write_reg(dst='w_freq', src=reg_gen)
+        asm.write_wmem(plan.gen_wave)
+        asm.read_wmem(plan.ro_wave)
+        asm.write_reg(dst='w_freq', src=reg_ro)
+        asm.write_wmem(plan.ro_wave)
+
+        self._shot_loop(prog, asm, plan, reg_shot)
+        asm.jump(service)
+
+        asm.label(done)
+        asm.qpb_wait_new()
+        self._store_result(prog, asm, plan, status_src='s_core_r2')
+
+    def _emit_ro_track(self, prog, asm, plan, reg_gen, reg_ro, reg_genbase,
+                       reg_robase, reg_ratio):
+        """Derive the readout word for a drive word the engine chose.
+
+        The engine only knows about the drive axis, but the two axes have
+        different sampling rates, so::
+
+            ro = ro_base + (((gen - gen_base) >> pre) * ratio) >> post
+
+        The tProc ALU has no multiplier, so the product comes from the ARITH
+        unit -- a 27x18 DSP whose 46-bit result is read back sign-extended as a
+        low/high pair.  ``pre`` shrinks the drive delta into the 27-bit input
+        and the host pre-scales ``ratio`` by ``2**(pre+post)`` to fit the
+        18-bit one; :func:`_ratio_scaling` picks both as small
+        as those widths allow.
+        """
+        asm.append_macro(AluReg(dst='qp2_tmp', arg1=reg_gen, op='-',
+                                arg2=reg_genbase))
+        if plan.ro_pre_shift:
+            asm.append_macro(AluReg(dst='qp2_tmp', arg1='qp2_tmp', op='ASR',
+                                    arg2=plan.ro_pre_shift))
+        # the ARITH unit answers on s_core_r1/r2, the same registers the custom
+        # peripheral uses, so hand the source select over and take it back
+        asm.write_reg(dst='s_cfg', src=CFG_SRC_ARITH)
+        asm.append_macro(Arith(op='T', r1='qp2_tmp', r2=reg_ratio, r3=None,
+                               r4=None))
+        # the unit takes a few cycles and the hazard unit does not stall for
+        # it, so poll the response bit
+        asm.append_macro(QpbPoll(mask=BIT_ARITH_NEW, want=1,
+                                 tag='%s_arith' % (plan.name)))
+        # (high << (32-post)) | (low >> post) is the low word of the 64-bit
+        # product shifted right by post.  The ALU's shift amount is only four
+        # bits wide in hardware, so the left shift is split into two -- left
+        # shifts compose, and each half stays inside the field.
+        hi_shift = 32 - plan.ro_post_shift
+        first = min(ALU_MAX_SHIFT, hi_shift)
+        asm.append_macro(AluReg(dst=reg_ro, arg1='s_core_r2', op='SL',
+                                arg2=first))
+        if hi_shift - first:
+            asm.append_macro(AluReg(dst=reg_ro, arg1=reg_ro, op='SL',
+                                    arg2=hi_shift - first))
+        asm.append_macro(AluReg(dst='qp2_tmp', arg1='s_core_r1', op='SR',
+                                arg2=plan.ro_post_shift))
+        asm.append_macro(AluReg(dst=reg_ro, arg1=reg_ro, op='OR',
+                                arg2='qp2_tmp'))
+        asm.append_macro(AluReg(dst=reg_ro, arg1=reg_ro, op='+',
+                                arg2=reg_robase))
+        # clear the ARITH response and re-select the peripheral in one write,
+        # for the same reason the QP2 ack does
+        asm.write_reg(dst='s_ctrl', src=ARITH_ACK_TO_QPB)
 
 # loops
 
@@ -1272,6 +3032,53 @@ class AsmV2:
         """
         self.append_macro(IncReg(dst=dst, src=src))
 
+    def alu_reg(self, dst, arg1, op=None, arg2=None):
+        """Write an ALU result into a register.
+
+        Parameters
+        ----------
+        dst : str
+            Name of the destination register.
+        arg1 : str
+            Name of the first operand register.
+        op : str or None
+            ALU operation: ``+``, ``-``, ``AND``, ``OR``, ``XOR``, ``ASR``
+            (arithmetic shift right), ``SR``/``SL`` (logical shifts), or any
+            other name the assembler's ALU table accepts.
+            If None, ``arg1`` is simply copied.
+        arg2 : int or str or None
+            Second operand: a literal (24-bit; wider values are staged through
+            a scratch register) or a register name.
+            Note the assembler caps *literal* shift amounts at 15 -- pass a
+            register for larger shifts.
+        """
+        self.append_macro(AluReg(dst=dst, arg1=arg1, op=op, arg2=arg2))
+
+    def arith(self, op, r1, r2, r3=None, r4=None):
+        """Start a multiply on the internal ARITH unit.
+
+        The unit computes one of nine forms of ``(D +/- A) * B +/- C`` and
+        parks a 64-bit result inside itself.  To read it, point the peripheral
+        source select at ARITH (``write_reg('s_cfg', CFG_SRC_ARITH)``) *before*
+        starting the operation, wait for ``bit_arith_new``, then read
+        ``s_core_r1`` (low word) and ``s_core_r2`` (high word).
+
+        Those are the same registers the QP2 custom peripheral answers on, so
+        the two cannot have responses in flight at the same time; hand the
+        select back afterwards with ``write_reg('s_ctrl', ARITH_ACK_TO_QPB)``,
+        which also clears the ARITH response.
+
+        Parameters
+        ----------
+        op : str
+            One of ``T`` (A*B), ``TP`` (A*B+C), ``TM``, ``PT`` ((D+A)*B),
+            ``MT`` ((D-A)*B), ``PTP``, ``PTM``, ``MTP``, ``MTM``.
+        r1, r2, r3, r4 : str or None
+            Source registers, in the order the chosen form needs them --
+            see ``ARITH_OPS``.
+        """
+        self.append_macro(Arith(op=op, r1=r1, r2=r2, r3=r3, r4=r4))
+
     def read_wmem(self, name):
         """Copy a waveform from waveform memory to waveform registers.
         This is usually used in combination with write_wmem() to make changes to a waveform.
@@ -1377,6 +3184,119 @@ class AsmV2:
         reg = {'I':'s_port_l', 'Q':'s_port_h'}[component]
         self.read_input(ro_ch)
         self.cond_jump(label=label, arg1=reg, op='-', test=test, arg2=threshold)
+
+    # QP2 custom peripheral
+
+    def qpb_select(self):
+        """Point the tProc's peripheral bus at the QPeriphB custom peripheral.
+
+        Writes ``cfg_src_qpb`` (0x05) to the config register.  This must happen
+        before any ``PB`` instruction, and again after anything that rewrites
+        that register.
+
+        Caution: ``s_cfg`` and ``s_ctrl`` are the same physical register (s2),
+        so a later write to one replaces the other.  This is why
+        :meth:`qpb_ack` rewrites the source select along with the clear bit.
+        """
+        self.write_reg(dst='s_cfg', src=CFG_SRC_QPB)
+
+    def pb(self, op, r1='s_zero', r2='s_zero', r3='s_zero', r4='s_zero', nop=True):
+        """Issue a raw ``PB`` instruction to the QPeriphB peripheral.
+
+        The peripheral has no immediate operands, so any literal must already
+        be staged in a register; use :meth:`qpb_send` if you'd rather give
+        named field values and let the library stage them.
+
+        Parameters
+        ----------
+        op : int
+            Opcode, 0 to 31.
+        r1, r2, r3, r4 : str
+            Register names supplying ``qtag_dt1_i`` .. ``qtag_dt4_i``.
+            The default ``s_zero`` supplies a hardwired zero.
+            r3 and r4 are address-type operands and cannot be w-registers.
+        nop : bool
+            Emit the mandatory NOP after the instruction.  Only set this False
+            if you are deliberately placing your own instruction between two
+            ``PB``s.
+        """
+        self.append_macro(PeriphB(op=op, r1=r1, r2=r2, r3=r3, r4=r4, nop=nop))
+
+    def qpb_send(self, accel, mnemonic, nop=True, **values):
+        """Issue a named accelerator operation, staging its ``dt`` words.
+
+        Parameters
+        ----------
+        accel : str or QP2Accel
+            Accelerator name, e.g. ``"adaptive_sweep"``.
+        mnemonic : str
+            Operation name from that accelerator's opcode map, e.g. ``"CFG_ACQ"``.
+        nop : bool
+            Emit the mandatory NOP after the ``PB``.
+        **values
+            Field values by name.  Omitted fields pack as zero.
+
+        See Also
+        --------
+        pack_op : the pure packing function.
+        """
+        self.append_macro(PeriphBOp(accel=accel, mnemonic=mnemonic,
+                                    values=values, nop=nop))
+
+    def qpb_wait_ready(self, invert=False):
+        """Spin until the peripheral's READY line reaches the wanted level.
+
+        Parameters
+        ----------
+        invert : bool
+            If False (the default), wait for READY high - the peripheral is
+            idle, so a job it was running has finished.
+            If True, wait for READY *low*: use this immediately after starting
+            a job, to confirm the peripheral really took it before you start
+            polling for completion.  Without that confirmation, the first poll
+            can see the READY that was still high from before the job started
+            and report an instant, bogus "done".
+        """
+        self.append_macro(QpbPoll(mask=BIT_QPB_RDY, want=0 if invert else 1,
+                                  tag='qpb_busy' if invert else 'qpb_ready'))
+
+    def qpb_wait_new(self):
+        """Spin until the peripheral has a response waiting (``bit_qpb_new``).
+
+        After this returns, the response words are readable from ``s_core_r1``
+        and ``s_core_r2``, and must be acknowledged with :meth:`qpb_ack`.
+        """
+        self.append_macro(QpbPoll(mask=BIT_QPB_NEW, want=1, tag='qpb_new'))
+
+    def qpb_ack(self):
+        """Acknowledge a peripheral response, clearing ``bit_qpb_new``.
+
+        Writes ``clr_qpb | cfg_src_qpb``, not a bare ``clr_qpb``: the control
+        and config registers are one register (s2), so acking with only the
+        clear bit would also deselect the peripheral and every later response
+        read would come back empty.
+        """
+        self.write_reg(dst='s_ctrl', src=QPB_ACK)
+
+    def qpb_read_resp(self, dst1=None, dst2=None, ack=True):
+        """Copy the peripheral's response words into registers.
+
+        Parameters
+        ----------
+        dst1 : str or None
+            Register to receive ``qtag_dt1_o`` (read from ``s_core_r1``).
+        dst2 : str or None
+            Register to receive ``qtag_dt2_o`` (read from ``s_core_r2``).
+        ack : bool
+            Acknowledge the response afterwards.  Leave this True unless you
+            are deliberately deferring the ack.
+        """
+        if dst1 is not None:
+            self.write_reg(dst=dst1, src='s_core_r1')
+        if dst2 is not None:
+            self.write_reg(dst=dst2, src='s_core_r2')
+        if ack:
+            self.qpb_ack()
 
     # loops
 
@@ -2073,7 +3993,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         # Attributes to dump when saving the program to JSON.
         # The dump just keeps enough information to execute the program - ASM and initial waveform values.
         # Most of the high-level information (macros, sweeps) is lost.
-        self.dump_keys += ['waves', 'prog_list', 'labels']
+        self.dump_keys += ['waves', 'prog_list', 'labels', 'dmem_image']
 
     def _init_declarations(self):
         # initialize the high-level objects that get filled in manually, or by a make_program()
@@ -2098,6 +4018,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         # allocated registers
         self.reg_dict = {}
 
+        # accelerated sweeps declared with adaptive_sweep(), by name
+        self._sweep_plans = {}
+
     def _init_instructions(self):
         # initialize the low-level objects that get filled by macro expansion
 
@@ -2120,6 +4043,14 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         self.p_addr = 1
         # line number
         self.line = 1
+        #: The compiled data-memory preload, as a plain list.  It travels with
+        #: dump_prog()/load_prog(), because a reloaded program has no macros
+        #: left for compile_datamem() to rebuild it from.
+        self.dmem_image = None
+        # counters for compiler-generated labels (poll loops etc.)
+        # these are reset per compile, and macro expansion order is
+        # deterministic, so recompiling a program reproduces the same names
+        self._auto_labels = defaultdict(int)
 
     def load_prog(self, progdict):
         # note that we only dump+load the raw waveforms and ASM (the low-level stuff that gets converted to binary)
@@ -2128,7 +4059,12 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         # re-create the Waveform objects
         self.waves = [Waveform(**w) for w in self.waves]
         # make the binary (this will prevent compile() from running and wiping out the low-level stuff)
+        loaded_dmem = self.dmem_image
         self._make_binprog()
+        if loaded_dmem is not None and self.binprog['dmem'] is None:
+            # the macros are gone, so compile_datamem() can no longer rebuild
+            # the preload; restore the one that was dumped
+            self.binprog['dmem'] = np.array(loaded_dmem, dtype=np.int32)
 
     def _compile_prog(self):
         # the assembler modifies some of the command dicts, so do a copy first
@@ -2147,12 +4083,33 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         For basic QICK programs no data needs to be written, and this method returns no values.
         If you need to write data, you should override this method.
 
+        An accelerated sweep whose tables are staged through data memory
+        supplies them here, so if you override this you should start from
+        ``super().compile_datamem()`` rather than from None.
+
         Returns
         -------
         numpy.ndarray of int or None
             data to write
         """
-        d_mem = None
+        if not self._sweep_plans:
+            return None
+        # Cover every result block as well as every staged table.  The result
+        # block has to be *written*, not just reserved: nothing else clears
+        # data memory between runs, so a second run of the same program would
+        # otherwise find the first run's done sentinel already set and report a
+        # stale answer as a fresh one.
+        size = 0
+        for plan in self._sweep_plans.values():
+            size = max(size, plan.result_addr + RESULT_BLOCK)
+            if plan.table_via_dmem:
+                size = max(size, plan.dmem_table_addr + len(table_image(plan)))
+        d_mem = np.zeros(size, dtype=np.int32)
+        for plan in self._sweep_plans.values():
+            if not plan.table_via_dmem:
+                continue
+            words = table_image(plan)
+            d_mem[plan.dmem_table_addr:plan.dmem_table_addr + len(words)] = words
         return d_mem
 
     def compile(self):
@@ -2165,6 +4122,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         self.binprog['pmem'] = self._compile_prog()
         self.binprog['wmem'] = self._compile_waves()
         self.binprog['dmem'] = self.compile_datamem()
+        if self.binprog['dmem'] is not None:
+            self.dmem_image = [int(w) for w in self.binprog['dmem']]
         # check that the program will fit
         for name in ['pmem', 'wmem', 'dmem']:
             progsize = 0
@@ -2215,6 +4174,27 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         self.p_addr += addr_inc
         self.line += 1
         self.prog_list.append(inst)
+
+    def _next_auto_label(self, tag):
+        """Make a fresh label name for compiler-generated control flow.
+
+        For internal use by macros that need to jump to themselves (poll
+        loops).  Names are ``<tag>_<n>`` with n counting per tag, so two polls
+        in one program can't collide and a recompile reproduces the names.
+
+        Parameters
+        ----------
+        tag : str
+            Prefix describing the loop, e.g. ``"qpb_ready"``.
+
+        Returns
+        -------
+        str
+            Label name.
+        """
+        n = self._auto_labels[tag]
+        self._auto_labels[tag] = n + 1
+        return "%s_%d" % (tag, n)
 
     def _add_label(self, label):
         if label in self.labels:
@@ -2420,6 +4400,295 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         pulse = self._ro_mgrs[ch[0]].make_pulse(kwargs)
         pulse.ro_chs = [ch]
         self._register_pulse(pulse, name)
+
+    # accelerated sweeps
+
+    def adaptive_sweep(self, name, accel, algorithm="grid", calc=None, **kwargs):
+        """Declare a sweep that runs on a QP2 co-processor.
+
+        The accelerator owns the search: it decides which frequency to measure
+        next and where the optimum is.  The tProcessor owns the tone -- it
+        writes waveform memory and fires shots.  This call validates the
+        parameters, converts them from physical units to the register words the
+        accelerator wants, and emits the whole program: configuration ops,
+        table loads, the run command, the service loop, and the result
+        read-back into data memory.
+
+        A program that uses this is a *job* program, not a shot-averaged one.
+        Call it from ``_initialize()``, leave ``_body()`` empty, and use
+        ``reps=1``; the sweep's own loops fire every shot it needs.  Read the
+        answer back with :meth:`get_sweep_result`.
+
+        Parameters
+        ----------
+        name : str
+            Name for this sweep, used to look the plan and result up later.
+        accel : str
+            Which accelerator to drive: ``"adaptive_sweep"`` or
+            ``"fine_tuning_sweep"``.
+        algorithm : str
+            ``"grid"`` (walk a fixed grid and take the argmax), or ``"gd"`` /
+            ``"kw"`` (gradient-descent or Kiefer-Wolfowitz search, where each
+            frequency arrives through a handshake).
+        calc : str
+            Measurement scheme: ``"acc64"``, ``"shift"``, ``"welford"``, or
+            ``"madstop"``.  Defaults to the accelerator's only option, or
+            ``"shift"``.  On ``adaptive_sweep`` these are presets over one
+            shared datapath (a 64-bit accumulator, MUX-selected reduction, and
+            an independently enabled early stop), not four separate pipelines.
+        gen_ch : int
+            Generator channel carrying the drive, already declared.
+        ro_ch : int
+            Readout channel, already declared.  Must be tProc-controlled, so
+            its downconversion can track the drive.
+        pulse : str
+            Name of the drive pulse from :meth:`add_pulse`.  Its waveform's
+            frequency field is what the sweep retunes.
+        ro_cfg : str
+            Name of the readout config from :meth:`add_readoutconfig`.
+        start, stop : float
+            Band edges (MHz).  For gd/kw these default the search window.
+        step : float
+            Grid step (MHz); for gd/kw, the probe spacing and racing-mode move.
+            Give this or ``n_points``.
+        n_points : int
+            Number of grid points.
+        avg : int
+            Shots averaged per point.
+        nsamp : int
+            Raw ADC samples folded per shot.  Defaults to the declared readout
+            window length, which is what the averaging buffer itself uses.
+        mode : str
+            ``"peak"`` to maximise, ``"dip"`` to minimise.
+        trig_time : float
+            Readout trigger time within a shot (us).
+        shot_period : float
+            Shot-to-shot period (us).  Must exceed ``trig_time`` plus the
+            readout length.
+        n0 : int
+            Warmup shots, for ``calc="welford"``.
+        n_min : int
+            First epoch that may stop early, for ``calc="madstop"``.  A power
+            of two, or 0 to disable early stopping.
+        thr_table : list of int
+            Per-epoch deviation thresholds in LSB units, for
+            ``calc="madstop"``; entry *j* applies at 2**j shots.
+        emit_mode : str
+            ``"drain"`` or ``"immediate"``, for ``calc="madstop"``.  Grid
+            sweeps must use ``"drain"``: an early emission would advance the
+            accelerator while the tProcessor keeps its fixed schedule.
+        x0 : float
+            Starting frequency for gd/kw (MHz).  Defaults to ``start``.
+        min_step : float
+            Convergence threshold on the step size (MHz), for gd/kw.
+        max_iter : int
+            Iteration cap for gd/kw.
+        patience : int
+            Consecutive converged/tied iterations required to declare
+            convergence.  The default of 0 means *never converge* -- the RTL
+            gates the convergence flag on ``patience != 0`` -- so a gd/kw
+            search left at the default always runs to ``max_iter`` and reports
+            itself capped.  Give it 1 or more to let the search stop early.
+        a_table, c_table : list of float
+            Step and probe-width schedules (MHz), for gd/kw in LUT mode.
+        use_lut : bool
+            True for the scheduled a/c tables, False for racing mode (repeat
+            the fixed-step pair until the accumulated difference beats its own
+            accumulated spread).  Inferred from whether tables were given.
+        lambda_ : int
+            Racing-mode certainty shift: a move needs
+            ``|sum(dp)| > sum(|dp|) >> lambda_``.
+        m_min, m_max : int
+            Racing-mode bounds on pairs per move.
+        f_lo, f_hi : float
+            Search window for gd/kw (MHz).  Default to ``start`` and ``stop``.
+        result_addr : int
+            Data-memory address of the result block.  Literal data-memory
+            addresses are 11-bit signed, so this must leave the 4-word block
+            ending at or below address 1024.  Sweeps in the same program must
+            not overlap here.
+        debug : bool
+            Also read the diagnostic counters into the result block.  Only
+            available on accelerators that have a diagnostic read.
+        count_shots : bool
+            Increment the externally readable shot counter once per shot, so a
+            host streaming the averaging buffer with
+            ``soc.start_readout(total_shots, counter_addr=1)`` can follow
+            along.  Off by default, because that is the same counter
+            ``acquire()`` and ``run_rounds()`` poll against ``reps``: with it
+            on, those would return after the sweep's first shot.  Read the
+            result with :meth:`wait_for_sweep` instead.
+        table_via_dmem : bool
+            Stage long tables through data memory and load them with a loop,
+            instead of one instruction group per entry.  Chosen automatically
+            when there are more than 16 entries.
+        dmem_table_addr : int
+            Where to put that staged table.
+
+        Raises
+        ------
+        ValueError
+            If the parameters are inconsistent, out of range, or ask an
+            accelerator for something it does not implement.  The message
+            names the parameter at fault.
+        """
+        self.append_macro(AdaptiveSweep(
+            name=name,
+            kwargs=dict(accel=accel, algorithm=algorithm, calc=calc, **kwargs)))
+
+    def get_sweep_plan(self, name):
+        """Look up the converted parameters of a declared sweep.
+
+        Only available after the program has been compiled, because the
+        conversion happens during compilation.
+
+        Parameters
+        ----------
+        name : str
+            The sweep's name.
+
+        Returns
+        -------
+        SweepPlan
+        """
+        if self.binprog is None:
+            raise RuntimeError("get_sweep_plan() can only be called on a "
+                               "program after it's been compiled")
+        try:
+            return self._sweep_plans[name]
+        except KeyError:
+            raise KeyError("no adaptive_sweep named %r in this program; it has "
+                           "%s" % (name, sorted(self._sweep_plans))) from None
+
+    def list_sweeps(self):
+        """Names of the accelerated sweeps declared in this program."""
+        return list(self._sweep_plans)
+
+    def get_sweep_result(self, soc, name=None):
+        """Read an accelerated sweep's result back from the board.
+
+        Parameters
+        ----------
+        soc : QickSoc
+            The board to read data memory from.
+        name : str or None
+            Which sweep; may be omitted if the program declares only one.
+
+        Returns
+        -------
+        dict
+            ``freq`` (MHz), ``freq_word`` (the raw drive word), and ``done``
+            (whether the sweep finished).  On accelerators that report them,
+            also ``status`` and its decoded fields, and ``n_used`` when the
+            sweep was declared with ``debug=True``.  Keys the accelerator
+            cannot produce are absent rather than filled with whatever data
+            memory happened to hold.
+        """
+        name = self._sweep_name(name)
+        plan = self.get_sweep_plan(name)
+        words = [int(w) & 0xFFFFFFFF for w in
+                 soc.tproc.read_mem('dmem', length=RESULT_BLOCK,
+                                    addr=plan.result_addr)]
+        return self.decode_sweep_result(words, name=name)
+
+    def wait_for_sweep(self, soc, name=None, timeout=60.0, poll=0.001):
+        """Block until an accelerated sweep has written its result.
+
+        The sweep signals completion by writing a sentinel into its result
+        block, as the very last thing it does, so seeing it means every other
+        result word has already settled.
+
+        Parameters
+        ----------
+        soc : QickSoc
+            The board to poll.
+        name : str or None
+            Which sweep; may be omitted if the program declares only one.
+        timeout : float
+            Seconds to wait before giving up.
+        poll : float
+            Seconds between reads.
+
+        Returns
+        -------
+        dict
+            The decoded result, as :meth:`get_sweep_result` returns it.
+
+        Raises
+        ------
+        TimeoutError
+            If the sentinel does not appear in time.
+        """
+        import time
+        name = self._sweep_name(name)
+        plan = self.get_sweep_plan(name)
+        deadline = time.time() + timeout
+        while True:
+            word = int(soc.tproc.read_mem(
+                'dmem', length=1,
+                addr=plan.result_addr + RESULT_DONE)[0]) & 0xFFFFFFFF
+            if word == DONE_SENTINEL:
+                return self.get_sweep_result(soc, name=name)
+            if time.time() > deadline:
+                raise TimeoutError(
+                    "sweep %r did not finish within %g s; its done word at "
+                    "dmem[%d] is 0x%x, not 0x%x"
+                    % (name, timeout, plan.result_addr + RESULT_DONE, word,
+                       DONE_SENTINEL))
+            time.sleep(poll)
+
+    def decode_sweep_result(self, words, name=None):
+        """Turn a raw result block into physical units.
+
+        Split out from :meth:`get_sweep_result` so the same decoding can be
+        applied to a result block obtained any other way.
+
+        Parameters
+        ----------
+        words : sequence of int
+            The ``RESULT_BLOCK`` words read from data memory.
+        name : str or None
+            Which sweep the block belongs to.
+
+        Returns
+        -------
+        dict
+        """
+        name = self._sweep_name(name)
+        plan = self.get_sweep_plan(name)
+        out = {
+            'name': name,
+            'freq_word': words[RESULT_FREQ],
+            'freq': plan.freq_of_word(self, words[RESULT_FREQ]),
+            'done': words[RESULT_DONE] == DONE_SENTINEL,
+        }
+        # only report words the generated program actually wrote; an
+        # accelerator without a status or diagnostic read leaves those slots
+        # untouched, and whatever data memory happened to hold is not a result
+        if plan.writes_status:
+            out['status'] = words[RESULT_STATUS]
+            if plan.handshake:
+                # for gd/kw the status slot carries the RUN response's second word
+                out['converged'] = bool(words[RESULT_STATUS] & 0x1)
+                out['capped'] = bool((words[RESULT_STATUS] >> 1) & 0x1)
+                out['iterations'] = (words[RESULT_STATUS] >> 16) & 0xFFFF
+            elif plan.accel.status_bits:
+                out.update(plan.accel.unpack_status(words[RESULT_STATUS]))
+        if plan.writes_diag:
+            out['n_used'] = words[RESULT_DIAG]
+        return out
+
+    def _sweep_name(self, name):
+        """Resolve an optional sweep name, defaulting only when unambiguous."""
+        if name is not None:
+            return name
+        if not self._sweep_plans:
+            raise ValueError("this program declares no accelerated sweeps")
+        if len(self._sweep_plans) != 1:
+            raise ValueError("this program declares %d sweeps (%s); say which "
+                             "one" % (len(self._sweep_plans),
+                                      sorted(self._sweep_plans)))
+        return next(iter(self._sweep_plans))
 
     def list_pulse_waveforms(self, pulsename, exclude_special=True):
         """Get the names of the waveforms in a given pulse.
