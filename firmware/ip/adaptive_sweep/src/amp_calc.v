@@ -102,10 +102,26 @@ module amp_calc (
     .y_o  (xs_q)
   );
 
-  wire signed [17:0] x_i = xs_i[17:0];
-  wire signed [17:0] x_q = xs_q[17:0];
-
   wire shot_v = v_in & r_in;
+
+  (* mark_debug = "true" *) reg signed [32:0] xs_i_r;
+  (* mark_debug = "true" *) reg signed [32:0] xs_q_r;
+  (* mark_debug = "true" *) reg shot_v_r;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      xs_i_r <= {33{1'b0}};
+      xs_q_r <= {33{1'b0}};
+      shot_v_r <= 1'b0;
+    end else begin
+      xs_i_r <= xs_i;
+      xs_q_r <= xs_q;
+      shot_v_r <= shot_v;
+    end
+  end
+
+  wire signed [17:0] x_i = xs_i_r[17:0];
+  wire signed [17:0] x_q = xs_q_r[17:0];
 
   wire seq_first;
   wire [31:0] seq_n;
@@ -121,7 +137,7 @@ module amp_calc (
     .clk               (clk),
     .rst_n             (rst_n),
     .arm_i             (arm_i),
-    .shot_i            (shot_v),
+    .shot_i            (shot_v_r),
     .averager_value_i  (averager_value_i),
     .n0_i              (n0_i),
     .stop_i            (es_stop),
@@ -141,8 +157,8 @@ module amp_calc (
     .n_used_o          (n_used_o)
   );
 
-  wire signed [63:0] acc_i_d = {{31{xs_i[32]}}, xs_i};
-  wire signed [63:0] acc_q_d = {{31{xs_q[32]}}, xs_q};
+  wire signed [63:0] acc_i_d = {{31{xs_i_r[32]}}, xs_i_r};
+  wire signed [63:0] acc_q_d = {{31{xs_q_r[32]}}, xs_q_r};
 
   wire signed [63:0] acc_i_nxt;
   wire signed [63:0] acc_q_nxt;
@@ -275,9 +291,6 @@ module amp_calc (
   );
 
   (* mark_debug = "true" *) reg arm_dbg;
-  (* mark_debug = "true" *) reg shot_v_dbg;
-  (* mark_debug = "true" *) reg signed [32:0] xs_i_dbg;
-  (* mark_debug = "true" *) reg signed [32:0] xs_q_dbg;
   (* mark_debug = "true" *) reg signed [63:0] acc_i_nxt_dbg;
   (* mark_debug = "true" *) reg signed [63:0] acc_q_nxt_dbg;
   (* mark_debug = "true" *) reg signed [17:0] red_i_dbg;
@@ -292,9 +305,6 @@ module amp_calc (
   always @(posedge clk) begin
     if (!rst_n) begin
       arm_dbg <= 1'b0;
-      shot_v_dbg <= 1'b0;
-      xs_i_dbg <= {33{1'b0}};
-      xs_q_dbg <= {33{1'b0}};
       acc_i_nxt_dbg <= {64{1'b0}};
       acc_q_nxt_dbg <= {64{1'b0}};
       red_i_dbg <= {18{1'b0}};
@@ -308,9 +318,6 @@ module amp_calc (
       thr_wr_addr_dbg <= 5'd0;
     end else begin
       arm_dbg <= arm_i;
-      shot_v_dbg <= shot_v;
-      xs_i_dbg <= xs_i;
-      xs_q_dbg <= xs_q;
       acc_i_nxt_dbg <= acc_i_nxt;
       acc_q_nxt_dbg <= acc_q_nxt;
       red_i_dbg <= red_i[17:0];
