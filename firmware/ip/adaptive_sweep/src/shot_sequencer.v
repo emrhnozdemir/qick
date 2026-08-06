@@ -10,6 +10,8 @@ module shot_sequencer (
   input wire [31:0] n0_i,
   input wire stop_i,
   input wire stop_hold_i,
+  input wire stop_np_i,
+  input wire [31:0] n_np_i,
 
   (* mark_debug = "true" *) output reg armed_o,
   (* mark_debug = "true" *) output reg stopped_o,
@@ -19,6 +21,7 @@ module shot_sequencer (
   output wire acc_en_o,
   output wire is_last_o,
   output wire stop_now_o,
+  output wire stop_np_now_o,
   output wire point_latch_o,
   output wire emit_o,
   output wire warmup_done_o,
@@ -41,9 +44,12 @@ module shot_sequencer (
   assign stop_now_o = stop_i & fold_en & ~is_last_o;
 
   wire cap_now = count_en & is_last_o;
+  wire np_act = stop_np_i & armed_o & ~stopped_o;
 
-  assign point_latch_o = stop_now_o | (cap_now & ~stopped_o);
-  assign emit_o = cap_now | (stop_now_o & ~stop_hold_i);
+  assign stop_np_now_o = np_act & ~cap_now & ~stop_now_o;
+
+  assign point_latch_o = stop_now_o | stop_np_now_o | (cap_now & ~stopped_o);
+  assign emit_o = cap_now | ((stop_now_o | stop_np_now_o) & ~stop_hold_i);
   assign warmup_done_o = armed_o & (shot_cnt >= n0_r);
 
   always @(posedge clk) begin
@@ -90,12 +96,38 @@ module shot_sequencer (
             stopped_o <= 1'b0;
             shot_cnt <= 32'd0;
           end
+        end else if (np_act) begin
+          early_o <= 1'b1;
+          n_used_o <= n_np_i;
+          if (stop_hold_i) begin
+            armed_o <= 1'b1;
+            stopped_o <= 1'b1;
+            shot_cnt <= shot_cnt + 32'd1;
+          end else begin
+            armed_o <= 1'b0;
+            stopped_o <= 1'b0;
+            shot_cnt <= 32'd0;
+          end
         end else begin
           armed_o <= 1'b1;
           stopped_o <= stopped_o;
           shot_cnt <= shot_cnt + 32'd1;
           early_o <= early_o;
           n_used_o <= n_used_o;
+        end
+      end else if (np_act) begin
+        avg_m1 <= avg_m1;
+        n0_r <= n0_r;
+        early_o <= 1'b1;
+        n_used_o <= n_np_i;
+        if (stop_hold_i) begin
+          armed_o <= 1'b1;
+          stopped_o <= 1'b1;
+          shot_cnt <= shot_cnt;
+        end else begin
+          armed_o <= 1'b0;
+          stopped_o <= 1'b0;
+          shot_cnt <= 32'd0;
         end
       end else begin
         armed_o <= armed_o;

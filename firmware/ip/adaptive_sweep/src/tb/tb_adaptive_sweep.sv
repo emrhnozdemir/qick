@@ -13,6 +13,11 @@ module tb_adaptive_sweep;
   localparam [31:0] CTRL_MADSTOP = 32'h0000_0062;
   localparam [31:0] CTRL_RAW = 32'h0000_0000;
   localparam [31:0] CTRL_MEAN = 32'h0000_0024;
+  localparam [31:0] CTRL_SPLIT = 32'h0002_0CC6;
+  localparam [31:0] CTRL_SPLIT_HOLD = 32'h0002_0CD6;
+  localparam [31:0] CTRL_CKDIFF = 32'h0002_0D46;
+  localparam [31:0] CTRL_HSPLIT = 32'h0003_4CC6;
+  localparam [31:0] CTRL_QUARTER = 32'h0005_8CC6;
 
   reg clk;
   reg s_axi_aclk;
@@ -104,6 +109,108 @@ module tb_adaptive_sweep;
   log2_floor u_l2_1 (.v_i(32'd1), .y_o(l2_1));
   log2_floor u_l2_0 (.v_i(32'd0), .y_o(l2_0));
 
+  reg div_start;
+  reg signed [63:0] div_num;
+  reg [31:0] div_den;
+  reg [5:0] div_kp1;
+  reg [53:0] div_mag;
+  reg [4:0] div_sft;
+  wire div_busy;
+  wire div_done;
+  wire signed [31:0] div_q;
+
+  gm_divider u_div_tb (
+    .clk     (clk),
+    .rst_n   (rst_n),
+    .start_i (div_start),
+    .num_i   (div_num),
+    .den_i   (div_den),
+    .kp1_i   (div_kp1),
+    .mag_i   (div_mag),
+    .sft_i   (div_sft),
+    .busy_o  (div_busy),
+    .done_o  (div_done),
+    .q_o     (div_q)
+  );
+
+  function automatic [5:0] f_ctz(input [31:0] v);
+    integer k;
+    reg [31:0] lsb;
+    reg [5:0] r;
+    begin
+      lsb = v & ((~v) + 32'd1);
+      r = 6'd0;
+      for (k = 1; k < 32; k = k + 1) begin
+        if (lsb[k]) begin
+          r = k[5:0];
+        end else begin
+          r = r;
+        end
+      end
+      f_ctz = r;
+    end
+  endfunction
+
+  function automatic [58:0] f_magic(input [31:0] d);
+    reg [127:0] pw;
+    reg [127:0] mg;
+    reg [127:0] er;
+    reg [53:0] mag_f;
+    reg [4:0] sft_f;
+    integer p;
+    integer s;
+    begin
+      mag_f = 54'd0;
+      sft_f = 5'd0;
+      for (p = 78; p >= 52; p = p - 1) begin
+        s = p - 52;
+        pw = 128'd1 << p;
+        mg = (pw + {96'd0, d} - 128'd1) / {96'd0, d};
+        er = mg * {96'd0, d} - pw;
+        if (er <= (128'd1 << s)) begin
+          mag_f = mg[53:0];
+          sft_f = s[4:0];
+        end else begin
+          mag_f = mag_f;
+          sft_f = sft_f;
+        end
+      end
+      f_magic = {mag_f, sft_f};
+    end
+  endfunction
+
+  task automatic div_check(input string name, input longint num, input longint den, input int expq);
+    integer guard;
+    longint d_odd;
+    reg [5:0] tz;
+    reg [58:0] ms;
+    begin
+      @(posedge clk);
+      tz = f_ctz(den[31:0]);
+      d_odd = den >> tz;
+      ms = f_magic(d_odd[31:0]);
+      div_num <= num;
+      div_den <= den[31:0];
+      div_kp1 <= tz + 6'd1;
+      div_mag <= ms[58:5];
+      div_sft <= ms[4:0];
+      div_start <= 1'b1;
+      @(posedge clk);
+      div_start <= 1'b0;
+      guard = 0;
+      while (!div_done && (guard < 20)) begin
+        @(posedge clk);
+        guard = guard + 1;
+      end
+      if (guard >= 20) begin
+        $display("FAIL %0s: divider timeout", name);
+        errors = errors + 1;
+      end else begin
+        check32(name, div_q, expq);
+      end
+    end
+  endtask
+
   task automatic check32(input string name, input [31:0] got, input [31:0] exp);
     begin
       if (got !== exp) begin
@@ -111,6 +218,17 @@ module tb_adaptive_sweep;
         errors = errors + 1;
       end else begin
         $display("PASS %0s = %0d (0x%08x)", name, got, got);
+      end
+    end
+  endtask
+
+  task automatic check64(input string name, input [63:0] got, input [63:0] exp);
+    begin
+      if (got !== exp) begin
+        $display("FAIL %0s: got %0d (0x%016x), expected %0d (0x%016x)", name, got, got, exp, exp);
+        errors = errors + 1;
+      end else begin
+        $display("PASS %0s = %0d (0x%016x)", name, got, got);
       end
     end
   endtask
@@ -272,12 +390,13 @@ module tb_adaptive_sweep;
   endtask
 
   initial begin
-    #500000;
+    #3000000;
     $display("FAIL: global timeout");
     $finish;
   end
 
   integer p;
+  reg [58:0] tb_ms;
   reg [31:0] amp_of_point [0:4];
   reg [31:0] status_t0;
   reg [31:0] n_used_t1, n_used_t2;
@@ -303,6 +422,12 @@ module tb_adaptive_sweep;
     s_axi_wdata = 32'd0;
     s_axi_wstrb = 4'd0;
     s_axi_wvalid = 1'b0;
+    div_start = 1'b0;
+    div_num = 64'd0;
+    div_den = 32'd1;
+    div_kp1 = 6'd1;
+    div_mag = 54'd0;
+    div_sft = 5'd0;
 
     amp_of_point[0] = 100 * 128;
     amp_of_point[1] = 200 * 128;
@@ -321,6 +446,42 @@ module tb_adaptive_sweep;
     check32("L2 flog2(1025)", {27'd0, l2_1025}, 32'd10);
     check32("L2 flog2(1)", {27'd0, l2_1}, 32'd0);
     check32("L2 flog2(0)", {27'd0, l2_0}, 32'd0);
+
+    check32("C0 ctz(1000)", {26'd0, f_ctz(32'd1000)}, 32'd3);
+    check32("C1 ctz(96)", {26'd0, f_ctz(32'd96)}, 32'd5);
+    check32("C2 ctz(1)", {26'd0, f_ctz(32'd1)}, 32'd0);
+    check32("C3 ctz(1048576)", {26'd0, f_ctz(32'd1048576)}, 32'd20);
+
+    tb_ms = f_magic(32'd3);
+    check64("M0 magic(3) M", {10'd0, tb_ms[58:5]}, 64'd3002399751580331);
+    check32("M0 magic(3) sft", {27'd0, tb_ms[4:0]}, 32'd1);
+    tb_ms = f_magic(32'd25);
+    check64("M1 magic(25) M", {10'd0, tb_ms[58:5]}, 64'd1441151880758559);
+    check32("M1 magic(25) sft", {27'd0, tb_ms[4:0]}, 32'd3);
+    tb_ms = f_magic(32'd15625);
+    check64("M2 magic(15625) M", {10'd0, tb_ms[58:5]}, 64'd2361183241434823);
+    check32("M2 magic(15625) sft", {27'd0, tb_ms[4:0]}, 32'd13);
+
+    div_check("D0 10/4", 64'sd10, 4, 3);
+    div_check("D1 -10/4", -64'sd10, 4, -2);
+    div_check("D2 0/5", 64'sd0, 5, 0);
+    div_check("D3 11988/12", 64'sd11988, 12, 999);
+    div_check("D4 9600000/100", 64'sd9600000, 100, 96000);
+    div_check("D5 7/3", 64'sd7, 3, 2);
+    div_check("D6 8/3", 64'sd8, 3, 3);
+    div_check("D7 -8/3", -64'sd8, 3, -3);
+    div_check("D8 -7/3", -64'sd7, 3, -2);
+    div_check("D9 1/2 rhu", 64'sd1, 2, 1);
+    div_check("D10 -1/2 rhu", -64'sd1, 2, 0);
+    div_check("D11 -2^51/2^20", -64'sd2251799813685248, 32'd1048576, -2147483648);
+    div_check("D12 max/2^20", 64'sd2251799812636672, 32'd1048576, 2147483647);
+    div_check("D13 1000/1000", 64'sd1000, 1000, 1);
+    div_check("D14 max/2^31", 64'sd4611686016279904256, 64'd2147483648,
+              2147483647);
+    div_check("D15 -2^62/2^31", -64'sd4611686018427387904, 64'd2147483648,
+              -2147483648);
+    div_check("D16 big odd-part cap", 64'sd1431652352000000, 64'd1431652352,
+              1000000);
 
     qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
     qp2_op(5'd0, START_FREQ, STEP, N_POINTS, AVG_T0);
@@ -448,6 +609,175 @@ module tb_adaptive_sweep;
     qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T5 status dest", {31'd0, qtag_dt1_o[11]}, 32'd1);
+
+    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd64);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+
+    feed_point(64, 1000, 500);
+    wait_finish;
+
+    check32("T6 split freq", qtag_dt1_o, START_FREQ);
+    check128("T6 split power", dut.u_peak_finder_wide.max_amplitude, 128'd1250000);
+    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T6 n_used", qtag_dt1_o, 32'd8);
+    check32("T6 diag word", qtag_dt2_o, 32'h0000_0118);
+    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T6 status early_stop", {31'd0, qtag_dt1_o[8]}, 32'd1);
+    check32("T6 status drift", {31'd0, qtag_dt1_o[0]}, 32'd0);
+    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T6 mean I", qtag_dt1_o, 32'd1000);
+    check32("T6 mean Q", qtag_dt2_o, 32'd500);
+    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T6 log entry 0", qtag_dt1_o, 32'h8000_0118);
+    check32("T6 log count", qtag_dt2_o, 32'd1);
+    qp2_op(5'd15, 32'd1, 32'd0, 32'd0, 32'd0);
+    check32("T6 log idx1 invalid", {31'd0, qtag_dt1_o[31]}, 32'd0);
+
+    qp2_op(5'd2, NSAMP, CTRL_SPLIT_HOLD, 32'd0, 32'd8);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd64);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+
+    feed_point(64, 1000, 500);
+    wait_finish;
+
+    check128("T6b drain power", dut.u_peak_finder_wide.max_amplitude, 128'd1250000);
+    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T6b n_used", qtag_dt1_o, 32'd8);
+    check32("T6b diag word", qtag_dt2_o, 32'h0000_0118);
+
+    qp2_op(5'd2, NSAMP, CTRL_CKDIFF, 32'd0, 32'd8);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd64);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+
+    feed_point(64, -1500, 250);
+    wait_finish;
+
+    check128("T7 ckdiff power", dut.u_peak_finder_wide.max_amplitude, 128'd2312500);
+    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T7 n_used", qtag_dt1_o, 32'd16);
+    check32("T7 diag word", qtag_dt2_o, 32'h0000_0120);
+    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T7 mean I", qtag_dt1_o, 32'hFFFF_FA24);
+    check32("T7 mean Q", qtag_dt2_o, 32'd250);
+
+    qp2_op(5'd2, NSAMP, CTRL_HSPLIT, 32'd0, 32'd12);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd64);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+
+    feed_point(64, 999, -999);
+    wait_finish;
+
+    check128("T8 hsplit power", dut.u_peak_finder_wide.max_amplitude, 128'd1996002);
+    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T8 n_used", qtag_dt1_o, 32'd12);
+    check32("T8 diag word", qtag_dt2_o, 32'h0000_0111);
+    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T8 log entry 0", qtag_dt1_o, 32'h8000_0111);
+    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T8 mean I", qtag_dt1_o, 32'd999);
+    check32("T8 mean Q", qtag_dt2_o, 32'hFFFF_FC19);
+
+    qp2_op(5'd16, 32'h51EB851F, 32'h00C51EB8, 32'd3, 32'd0);
+    qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd4);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd100);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+
+    feed_alternating(100, 128000, 64000);
+    wait_finish;
+
+    check128("T9 cap power", dut.u_peak_finder_wide.max_amplitude, 128'd9216000000);
+    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T9 n_used", qtag_dt1_o, 32'd100);
+    check32("T9 diag word", qtag_dt2_o, 32'h0001_0204);
+    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T9 status early_stop", {31'd0, qtag_dt1_o[8]}, 32'd0);
+    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T9 mean I", qtag_dt1_o, 32'd96000);
+    check32("T9 mean Q", qtag_dt2_o, 32'd0);
+    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T9 log entry 0", qtag_dt1_o, 32'h8000_0204);
+    check32("T9 log count", qtag_dt2_o, 32'd1);
+
+    qp2_op(5'd2, NSAMP, CTRL_QUARTER, 32'd0, 32'd8);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd64);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+
+    feed_point(64, 2000, -1000);
+    wait_finish;
+
+    check32("TQ1 quarter freq", qtag_dt1_o, START_FREQ);
+    check128("TQ1 quarter power", dut.u_peak_finder_wide.max_amplitude, 128'd5000000);
+    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TQ1 n_used", qtag_dt1_o, 32'd16);
+    check32("TQ1 diag word", qtag_dt2_o, 32'h0000_0120);
+    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TQ1 mean I", qtag_dt1_o, 32'd2000);
+    check32("TQ1 mean Q", qtag_dt2_o, 32'hFFFF_FC18);
+    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TQ1 log entry 0", qtag_dt1_o, 32'h8000_0120);
+    check32("TQ1 log count", qtag_dt2_o, 32'd1);
+
+    qp2_op(5'd2, NSAMP, CTRL_QUARTER, 32'd0, 32'd20);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd64);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+
+    feed_point(64, -3000, 700);
+    wait_finish;
+
+    check128("TQ2 m5 power", dut.u_peak_finder_wide.max_amplitude, 128'd9490000);
+    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TQ2 n_used", qtag_dt1_o, 32'd20);
+    check32("TQ2 diag word", qtag_dt2_o, 32'h0000_0112);
+    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TQ2 mean I", qtag_dt1_o, 32'hFFFF_F448);
+    check32("TQ2 mean Q", qtag_dt2_o, 32'h0000_02BC);
+    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TQ2 log entry 0", qtag_dt1_o, 32'h8000_0112);
+
+    qp2_op(5'd2, NSAMP, CTRL_QUARTER, 32'd0, 32'd28);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd64);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+
+    feed_point(64, 511, -512);
+    wait_finish;
+
+    check128("TQ3 m7 power", dut.u_peak_finder_wide.max_amplitude, 128'd523265);
+    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TQ3 n_used", qtag_dt1_o, 32'd28);
+    check32("TQ3 diag word", qtag_dt2_o, 32'h0000_0113);
+    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TQ3 mean I", qtag_dt1_o, 32'd511);
+    check32("TQ3 mean Q", qtag_dt2_o, 32'hFFFF_FE00);
+    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TQ3 log entry 0", qtag_dt1_o, 32'h8000_0113);
+
+    qp2_op(5'd2, NSAMP, CTRL_QUARTER, 32'd0, 32'd24);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd64);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+
+    feed_point(64, 100000, 100000);
+    wait_finish;
+
+    check128("TQ4 m3 power", dut.u_peak_finder_wide.max_amplitude, 128'd20000000000);
+    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TQ4 n_used", qtag_dt1_o, 32'd24);
+    check32("TQ4 diag word", qtag_dt2_o, 32'h0000_0119);
+    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TQ4 mean I", qtag_dt1_o, 32'h0001_86A0);
+    check32("TQ4 mean Q", qtag_dt2_o, 32'h0001_86A0);
+    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TQ4 log entry 0", qtag_dt1_o, 32'h8000_0119);
 
     if (errors == 0)
       $display("ALL TESTS PASSED");

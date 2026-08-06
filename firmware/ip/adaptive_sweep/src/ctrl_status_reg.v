@@ -33,7 +33,13 @@ module ctrl_status_reg (
   output wire estop_hold_o,
   output wire prescale_en_o,
   output wire estop_en_o,
+  output wire [1:0] estop_sel_o,
+  output wire [3:0] m_o,
+  output wire ckmon_o,
+  output wire [1:0] density_o,
+  output wire [2:0] confirm_o,
 
+  input wire drift_i,
   input wire [15:0] point_idx_i,
   input wire busy_i,
   input wire finish_seen_i,
@@ -56,6 +62,11 @@ module ctrl_status_reg (
   assign estop_hold_o = ctrl_r[4];
   assign prescale_en_o = ctrl_r[5];
   assign estop_en_o = ctrl_r[6];
+  assign estop_sel_o = ctrl_r[8:7];
+  assign m_o = ctrl_r[12:9];
+  assign ckmon_o = ctrl_r[13];
+  assign density_o = ctrl_r[15:14];
+  assign confirm_o = ctrl_r[18:16];
 
   assign status_o = {point_idx_i,
                      eng_freq_valid_i,
@@ -71,7 +82,7 @@ module ctrl_status_reg (
                      search_mode_o,
                      busy_i,
                      finish_seen_i,
-                     1'b0};
+                     drift_i};
 
   always @(posedge clk) begin
     if (!rst_n)

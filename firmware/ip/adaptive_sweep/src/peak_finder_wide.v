@@ -12,6 +12,8 @@ module peak_finder_wide (
 
   input wire amp_valid,
   input wire [127:0] amp_data,
+  input wire [31:0] mean_i_i,
+  input wire [31:0] mean_q_i,
 
   (* mark_debug = "true" *) output reg [31:0] freq_word,
   (* mark_debug = "true" *) output reg freq_valid,
@@ -19,6 +21,8 @@ module peak_finder_wide (
 
   (* mark_debug = "true" *) output reg [127:0] max_amplitude,
   (* mark_debug = "true" *) output reg [31:0] freq_at_max,
+  output reg [31:0] best_mean_i,
+  output reg [31:0] best_mean_q,
   (* mark_debug = "true" *) output reg [31:0] point_idx
 );
 
@@ -67,6 +71,8 @@ module peak_finder_wide (
       finish <= 1'b0;
       max_amplitude <= {128{1'b0}};
       freq_at_max <= 32'd0;
+      best_mean_i <= 32'd0;
+      best_mean_q <= 32'd0;
       cur_freq <= 32'd0;
       cur_step <= 32'd0;
       n_pts <= 32'd0;
@@ -88,6 +94,8 @@ module peak_finder_wide (
           mode_r <= mode;
           max_amplitude <= mode ? {128{1'b1}} : {128{1'b0}};
           freq_at_max <= 32'd0;
+          best_mean_i <= 32'd0;
+          best_mean_q <= 32'd0;
         end else begin
           cur_freq <= cur_freq;
           cur_step <= cur_step;
@@ -97,6 +105,8 @@ module peak_finder_wide (
           mode_r <= mode_r;
           max_amplitude <= max_amplitude;
           freq_at_max <= freq_at_max;
+          best_mean_i <= best_mean_i;
+          best_mean_q <= best_mean_q;
         end
       end
 
@@ -106,6 +116,8 @@ module peak_finder_wide (
         finish <= 1'b0;
         max_amplitude <= max_amplitude;
         freq_at_max <= freq_at_max;
+        best_mean_i <= best_mean_i;
+        best_mean_q <= best_mean_q;
         cur_freq <= cur_freq;
         cur_step <= cur_step;
         n_pts <= n_pts;
@@ -123,9 +135,13 @@ module peak_finder_wide (
           if (is_better) begin
             max_amplitude <= amp_data;
             freq_at_max <= cur_freq;
+            best_mean_i <= mean_i_i;
+            best_mean_q <= mean_q_i;
           end else begin
             max_amplitude <= max_amplitude;
             freq_at_max <= freq_at_max;
+            best_mean_i <= best_mean_i;
+            best_mean_q <= best_mean_q;
           end
 
           if (last_point_r) begin
@@ -146,6 +162,8 @@ module peak_finder_wide (
           finish <= 1'b0;
           max_amplitude <= max_amplitude;
           freq_at_max <= freq_at_max;
+          best_mean_i <= best_mean_i;
+          best_mean_q <= best_mean_q;
           cur_freq <= cur_freq;
           point_idx <= point_idx;
           last_point_r <= last_point_r;
@@ -158,6 +176,8 @@ module peak_finder_wide (
         finish <= 1'b0;
         max_amplitude <= max_amplitude;
         freq_at_max <= freq_at_max;
+        best_mean_i <= best_mean_i;
+        best_mean_q <= best_mean_q;
         cur_freq <= cur_freq;
         cur_step <= cur_step;
         n_pts <= n_pts;

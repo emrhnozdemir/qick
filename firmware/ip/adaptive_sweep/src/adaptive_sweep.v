@@ -67,6 +67,29 @@ module adaptive_sweep (
   wire gdkw_diag_rd = en_rise & (qtag_op_i == 5'd11);
   wire cfg_gdkw = en_rise & (qtag_op_i == 5'd12);
   wire clr_result = en_rise & (qtag_op_i == 5'd13);
+  wire getmean_rd = en_rise & (qtag_op_i == 5'd14);
+  wire getlog_rd = en_rise & (qtag_op_i == 5'd15);
+  wire cfg_capdiv = en_rise & (qtag_op_i == 5'd16);
+
+  reg [53:0] cap_mag_r;
+  reg [5:0] cap_kp1_r;
+  reg [4:0] cap_sft_r;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      cap_mag_r <= 54'd4503599627370496;
+      cap_kp1_r <= 6'd1;
+      cap_sft_r <= 5'd0;
+    end else if (cfg_capdiv) begin
+      cap_mag_r <= {qtag_dt2_i[21:0], qtag_dt1_i};
+      cap_kp1_r <= qtag_dt2_i[27:22];
+      cap_sft_r <= qtag_dt3_i[4:0];
+    end else begin
+      cap_mag_r <= cap_mag_r;
+      cap_kp1_r <= cap_kp1_r;
+      cap_sft_r <= cap_sft_r;
+    end
+  end
 
   wire [31:0] REG0_REG;
   wire [31:0] REG1_REG;
@@ -181,6 +204,11 @@ module adaptive_sweep (
   wire estop_hold;
   wire prescale_en;
   wire estop_en;
+  wire [1:0] cfg_estop_sel;
+  wire [3:0] cfg_m;
+  wire cfg_ckmon;
+  wire [1:0] cfg_density;
+  wire [2:0] cfg_confirm;
   wire [31:0] status_word;
 
   wire [31:0] pf_freq_word;
@@ -188,14 +216,26 @@ module adaptive_sweep (
   wire pf_finish;
   wire [127:0] max_amplitude;
   wire [31:0] freq_at_max;
+  wire [31:0] pf_best_mean_i;
+  wire [31:0] pf_best_mean_q;
   wire [31:0] pf_point_idx;
 
   wire ac_warmup_done;
   wire ac_early_stop;
   wire [31:0] ac_n_used;
   wire [45:0] ac_dev_acc;
+  wire [31:0] ac_mean_i;
+  wire [31:0] ac_mean_q;
+  wire ac_log_wr;
+  wire [15:0] ac_log_entry;
+  wire ac_drift;
   wire [127:0] ac_power;
   wire ac_power_valid;
+  wire [15:0] log_cnt;
+  wire [15:0] log_rd_data;
+  wire log_rd_valid;
+  reg getlog_d1;
+  reg [15:0] nconv_cnt;
 
   wire [31:0] eng_freq_word;
   wire eng_freq_valid;
@@ -272,6 +312,12 @@ module adaptive_sweep (
     .estop_hold_o     (estop_hold),
     .prescale_en_o    (prescale_en),
     .estop_en_o       (estop_en),
+    .estop_sel_o      (cfg_estop_sel),
+    .m_o              (cfg_m),
+    .ckmon_o          (cfg_ckmon),
+    .density_o        (cfg_density),
+    .confirm_o        (cfg_confirm),
+    .drift_i          (ac_drift),
     .point_idx_i      (pf_point_idx[15:0]),
     .busy_i           (busy),
     .finish_seen_i    (finish_seen),
@@ -325,7 +371,7 @@ module adaptive_sweep (
       qtag_vld_o <= 1'b1;
     end else if (diag_rd & ~res_pend) begin
       qtag_dt1_o <= ac_n_used;
-      qtag_dt2_o <= ac_dev_acc[45:14];
+      qtag_dt2_o <= (cfg_estop_sel == 2'd0) ? ac_dev_acc[45:14] : {nconv_cnt, 5'd0, ac_log_entry[10:0]};
       qtag_vld_o <= 1'b1;
     end else if (getfreq_rd & ~res_pend) begin
       qtag_dt1_o <= eng_freq_word;
@@ -334,6 +380,14 @@ module adaptive_sweep (
     end else if (gdkw_diag_rd & ~res_pend) begin
       qtag_dt1_o <= {eng_pairs, eng_iter};
       qtag_dt2_o <= eng_sd_hi;
+      qtag_vld_o <= 1'b1;
+    end else if (getmean_rd & ~res_pend) begin
+      qtag_dt1_o <= dest_r ? ac_mean_i : pf_best_mean_i;
+      qtag_dt2_o <= dest_r ? ac_mean_q : pf_best_mean_q;
+      qtag_vld_o <= 1'b1;
+    end else if (getlog_d1) begin
+      qtag_dt1_o <= {log_rd_valid, 15'd0, log_rd_data};
+      qtag_dt2_o <= {16'd0, log_cnt};
       qtag_vld_o <= 1'b1;
     end else begin
       qtag_dt1_o <= qtag_dt1_o;
@@ -370,6 +424,14 @@ module adaptive_sweep (
     .prescale_en_i     (prescale_en),
     .estop_en_i        (estop_en),
     .estop_hold_i      (estop_hold),
+    .estop_sel_i       (cfg_estop_sel),
+    .m_i               (cfg_m),
+    .ckmon_i           (cfg_ckmon),
+    .dens_i            (cfg_density),
+    .confirm_i         (cfg_confirm),
+    .cap_kp1_i         (cap_kp1_r),
+    .cap_mag_i         (cap_mag_r),
+    .cap_sft_i         (cap_sft_r),
     .thr_wr_en_i       (thr_wr_en),
     .thr_wr_addr_i     (thr_wr_addr),
     .thr_wr_data_i     (thr_wr_data),
@@ -377,13 +439,49 @@ module adaptive_sweep (
     .early_stop_o      (ac_early_stop),
     .n_used_o          (ac_n_used),
     .dev_acc_o         (ac_dev_acc),
+    .mean_i_o          (ac_mean_i),
+    .mean_q_o          (ac_mean_q),
+    .log_wr_o          (ac_log_wr),
+    .log_entry_o       (ac_log_entry),
+    .drift_o           (ac_drift),
     .power_o           (ac_power),
     .power_valid_o     (ac_power_valid)
   );
 
+  always @(posedge clk) begin
+    if (!rst_n)
+      getlog_d1 <= 1'b0;
+    else
+      getlog_d1 <= getlog_rd & ~res_pend;
+  end
+
+  always @(posedge clk) begin
+    if (!rst_n)
+      nconv_cnt <= 16'd0;
+    else if (start_now | run_gdkw)
+      nconv_cnt <= 16'd0;
+    else if (ac_log_wr & ~ac_log_entry[8])
+      nconv_cnt <= nconv_cnt + 16'd1;
+    else
+      nconv_cnt <= nconv_cnt;
+  end
+
+  stop_log u_stop_log (
+    .clk        (clk),
+    .rst_n      (rst_n),
+    .clr_i      (start_now | run_gdkw),
+    .wr_i       (ac_log_wr),
+    .wr_entry_i (ac_log_entry),
+    .rd_en_i    (getlog_rd),
+    .rd_addr_i  (qtag_dt1_i[11:0]),
+    .rd_data_o  (log_rd_data),
+    .rd_valid_o (log_rd_valid),
+    .cnt_o      (log_cnt)
+  );
+
   wire [127:0] grid_data;
   wire grid_valid;
-  wire [35:0] search_data;
+  wire [63:0] search_data;
   wire search_valid;
 
   result_router u_result_router (
@@ -447,11 +545,15 @@ module adaptive_sweep (
     .mode          (search_mode),
     .amp_valid     (grid_valid),
     .amp_data      (grid_data),
+    .mean_i_i      (ac_mean_i),
+    .mean_q_i      (ac_mean_q),
     .freq_word     (pf_freq_word),
     .freq_valid    (pf_freq_valid),
     .finish        (pf_finish),
     .max_amplitude (max_amplitude),
     .freq_at_max   (freq_at_max),
+    .best_mean_i   (pf_best_mean_i),
+    .best_mean_q   (pf_best_mean_q),
     .point_idx     (pf_point_idx)
   );
 
@@ -500,7 +602,7 @@ module adaptive_sweep (
   (* mark_debug = "true" *) reg eng_freq_ack_dbg;
   (* mark_debug = "true" *) reg grid_valid_dbg;
   (* mark_debug = "true" *) reg search_valid_dbg;
-  (* mark_debug = "true" *) reg [35:0] search_data_dbg;
+  (* mark_debug = "true" *) reg [63:0] search_data_dbg;
   always @(posedge clk) begin
     if (!rst_n) begin
       qtag_en_dbg <= 1'b0;
@@ -548,7 +650,7 @@ module adaptive_sweep (
       eng_freq_ack_dbg <= 1'b0;
       grid_valid_dbg <= 1'b0;
       search_valid_dbg <= 1'b0;
-      search_data_dbg <= 36'd0;
+      search_data_dbg <= 64'd0;
     end else begin
       qtag_en_dbg <= qtag_en_i;
       qtag_op_dbg <= qtag_op_i;

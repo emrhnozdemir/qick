@@ -33,7 +33,7 @@ module gd_kw_engine (
   input wire freq_ack_i,
   (* mark_debug = "true" *) output reg probe_arm_o,
   input wire amp_valid_i,
-  input wire [35:0] amp_data_i,
+  input wire [63:0] amp_data_i,
 
   (* mark_debug = "true" *) output reg busy_o,
   (* mark_debug = "true" *) output reg done_o,
@@ -61,7 +61,7 @@ module gd_kw_engine (
   (* mark_debug = "true" *) reg [4:0] lambda_r;
 
   (* mark_debug = "true" *) reg [31:0] x;
-  (* mark_debug = "true" *) reg [35:0] p_a_r, p_b_r;
+  (* mark_debug = "true" *) reg [63:0] p_a_r, p_b_r;
 
   assign x_o = x;
 
@@ -130,8 +130,8 @@ module gd_kw_engine (
   wire [31:0] probe_a = kw_mode_r ? x_minus : x;
   wire [31:0] probe_b = x_plus;
 
-  wire signed [36:0] dp;
-  wire [36:0] dp_abs;
+  wire signed [64:0] dp;
+  wire [64:0] dp_abs;
   wire dp_pos, dp_neg;
 
   probe_diff u_diff (
@@ -144,15 +144,15 @@ module gd_kw_engine (
     .neg_o    (dp_neg)
   );
 
-  (* mark_debug = "true" *) reg signed [36:0] dp_r;
-  (* mark_debug = "true" *) reg [36:0] dp_abs_r;
+  (* mark_debug = "true" *) reg signed [64:0] dp_r;
+  (* mark_debug = "true" *) reg [64:0] dp_abs_r;
   (* mark_debug = "true" *) reg dp_pos_r;
   (* mark_debug = "true" *) reg dp_neg_r;
 
   always @(posedge clk) begin
     if (!rst_n) begin
-      dp_r <= {37{1'b0}};
-      dp_abs_r <= {37{1'b0}};
+      dp_r <= {65{1'b0}};
+      dp_abs_r <= {65{1'b0}};
       dp_pos_r <= 1'b0;
       dp_neg_r <= 1'b0;
     end else if (state == S_DIFF) begin
@@ -169,20 +169,20 @@ module gd_kw_engine (
   end
 
   wire acc_clr, acc_en;
-  wire signed [52:0] sd_q, ad_q;
-  wire signed [52:0] sd_nxt, ad_nxt;
+  wire signed [80:0] sd_q, ad_q;
+  wire signed [80:0] sd_nxt, ad_nxt;
 
-  signed_accumulator #(.W(53)) u_sd_acc (
+  signed_accumulator #(.W(81)) u_sd_acc (
     .clk     (clk),
     .rst_n   (rst_n),
     .clr     (acc_clr),
     .en      (acc_en),
-    .d_i     ({{16{dp_r[36]}}, dp_r}),
+    .d_i     ({{16{dp_r[64]}}, dp_r}),
     .q_o     (sd_q),
     .q_nxt_o (sd_nxt)
   );
 
-  signed_accumulator #(.W(53)) u_ad_acc (
+  signed_accumulator #(.W(81)) u_ad_acc (
     .clk     (clk),
     .rst_n   (rst_n),
     .clr     (acc_clr),
@@ -192,24 +192,24 @@ module gd_kw_engine (
     .q_nxt_o (ad_nxt)
   );
 
-  assign sd_hi_o = sd_q[52:21];
+  assign sd_hi_o = sd_q[80:49];
 
-  wire [52:0] sd_nxt_abs;
+  wire [80:0] sd_nxt_abs;
 
-  abs_value #(.W(53)) u_sd_abs (
+  abs_value #(.W(81)) u_sd_abs (
     .a_i (sd_nxt),
     .y_o (sd_nxt_abs)
   );
 
-  wire [52:0] ad_nxt_shift = ad_nxt >> lambda_r;
+  wire [80:0] ad_nxt_shift = ad_nxt >> lambda_r;
 
-  (* mark_debug = "true" *) reg [52:0] sd_abs_r;
-  (* mark_debug = "true" *) reg [52:0] ad_shift_r;
+  (* mark_debug = "true" *) reg [80:0] sd_abs_r;
+  (* mark_debug = "true" *) reg [80:0] ad_shift_r;
 
   always @(posedge clk) begin
     if (!rst_n) begin
-      sd_abs_r <= {53{1'b0}};
-      ad_shift_r <= {53{1'b0}};
+      sd_abs_r <= {81{1'b0}};
+      ad_shift_r <= {81{1'b0}};
     end else if (state == S_CERT) begin
       sd_abs_r <= sd_nxt_abs;
       ad_shift_r <= ad_nxt_shift;
@@ -221,7 +221,7 @@ module gd_kw_engine (
 
   wire cert_gt;
 
-  value_comparator #(.W(53)) u_cert_cmp (
+  value_comparator #(.W(81)) u_cert_cmp (
     .a_i         (sd_abs_r),
     .b_i         (ad_shift_r),
     .is_signed_i (1'b0),
@@ -401,8 +401,8 @@ module gd_kw_engine (
   always @(posedge clk) begin
     if (!rst_n) begin
       x <= 32'd0;
-      p_a_r <= 36'd0;
-      p_b_r <= 36'd0;
+      p_a_r <= 64'd0;
+      p_b_r <= 64'd0;
       freq_word_o <= 32'd0;
       freq_valid_o <= 1'b0;
       probe_arm_o <= 1'b0;
@@ -621,7 +621,7 @@ module gd_kw_engine (
   (* mark_debug = "true" *) reg start_dbg;
   (* mark_debug = "true" *) reg freq_ack_dbg;
   (* mark_debug = "true" *) reg amp_valid_dbg;
-  (* mark_debug = "true" *) reg [35:0] amp_data_dbg;
+  (* mark_debug = "true" *) reg [63:0] amp_data_dbg;
   (* mark_debug = "true" *) reg [3:0] next_state_dbg;
   (* mark_debug = "true" *) reg [15:0] k_q_dbg;
   (* mark_debug = "true" *) reg [15:0] m_q_dbg;
@@ -629,8 +629,8 @@ module gd_kw_engine (
   (* mark_debug = "true" *) reg [31:0] c_val_dbg;
   (* mark_debug = "true" *) reg [31:0] x_plus_dbg;
   (* mark_debug = "true" *) reg [31:0] x_minus_dbg;
-  (* mark_debug = "true" *) reg signed [52:0] sd_q_dbg;
-  (* mark_debug = "true" *) reg signed [52:0] ad_q_dbg;
+  (* mark_debug = "true" *) reg signed [80:0] sd_q_dbg;
+  (* mark_debug = "true" *) reg signed [80:0] ad_q_dbg;
   (* mark_debug = "true" *) reg cert_gt_dbg;
   (* mark_debug = "true" *) reg certified_dbg;
   (* mark_debug = "true" *) reg race_exhausted_dbg;
@@ -644,7 +644,7 @@ module gd_kw_engine (
       start_dbg <= 1'b0;
       freq_ack_dbg <= 1'b0;
       amp_valid_dbg <= 1'b0;
-      amp_data_dbg <= 36'd0;
+      amp_data_dbg <= 64'd0;
       next_state_dbg <= 4'd0;
       k_q_dbg <= 16'd0;
       m_q_dbg <= 16'd0;
@@ -652,8 +652,8 @@ module gd_kw_engine (
       c_val_dbg <= 32'd0;
       x_plus_dbg <= 32'd0;
       x_minus_dbg <= 32'd0;
-      sd_q_dbg <= {53{1'b0}};
-      ad_q_dbg <= {53{1'b0}};
+      sd_q_dbg <= {81{1'b0}};
+      ad_q_dbg <= {81{1'b0}};
       cert_gt_dbg <= 1'b0;
       certified_dbg <= 1'b0;
       race_exhausted_dbg <= 1'b0;
