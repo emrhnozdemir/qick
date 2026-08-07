@@ -58,18 +58,15 @@ module adaptive_sweep (
   wire start_now = en_rise & (qtag_op_i == 5'd1);
   wire cfg_meas = en_rise & (qtag_op_i == 5'd2);
   wire status_rd = en_rise & (qtag_op_i == 5'd3);
-  wire op_thr_wr = en_rise & (qtag_op_i == 5'd4);
-  wire diag_rd = en_rise & (qtag_op_i == 5'd5);
-  wire run_gdkw = en_rise & ((qtag_op_i == 5'd6) | (qtag_op_i == 5'd7));
-  wire op_alut_wr = en_rise & (qtag_op_i == 5'd8);
-  wire op_clut_wr = en_rise & (qtag_op_i == 5'd9);
-  wire getfreq_rd = en_rise & (qtag_op_i == 5'd10);
-  wire gdkw_diag_rd = en_rise & (qtag_op_i == 5'd11);
-  wire cfg_gdkw = en_rise & (qtag_op_i == 5'd12);
-  wire clr_result = en_rise & (qtag_op_i == 5'd13);
-  wire getmean_rd = en_rise & (qtag_op_i == 5'd14);
-  wire getlog_rd = en_rise & (qtag_op_i == 5'd15);
-  wire cfg_capdiv = en_rise & (qtag_op_i == 5'd16);
+  wire diag_rd = en_rise & (qtag_op_i == 5'd4);
+  wire run_gdkw = en_rise & ((qtag_op_i == 5'd5) | (qtag_op_i == 5'd6));
+  wire getfreq_rd = en_rise & (qtag_op_i == 5'd7);
+  wire gdkw_diag_rd = en_rise & (qtag_op_i == 5'd8);
+  wire cfg_gdkw = en_rise & (qtag_op_i == 5'd9);
+  wire clr_result = en_rise & (qtag_op_i == 5'd10);
+  wire getmean_rd = en_rise & (qtag_op_i == 5'd11);
+  wire getlog_rd = en_rise & (qtag_op_i == 5'd12);
+  wire cfg_capdiv = en_rise & (qtag_op_i == 5'd13);
 
   reg [53:0] cap_mag_r;
   reg [5:0] cap_kp1_r;
@@ -152,17 +149,17 @@ module adaptive_sweep (
   wire axi_thr_wr = axi_tbl_wr & (REG0_REG[9:8] == 2'd2);
   wire axi_ctrl_wr = axi_tbl_wr & (REG0_REG[9:8] == 2'd3);
 
-  wire alut_wr_en = op_alut_wr | axi_alut_wr;
-  wire [5:0] alut_wr_addr = op_alut_wr ? qtag_dt1_i[5:0] : REG0_REG[5:0];
-  wire [31:0] alut_wr_data = op_alut_wr ? qtag_dt2_i : REG1_REG;
+  wire alut_wr_en = axi_alut_wr;
+  wire [5:0] alut_wr_addr = REG0_REG[5:0];
+  wire [31:0] alut_wr_data = REG1_REG;
 
-  wire clut_wr_en = op_clut_wr | axi_clut_wr;
-  wire [5:0] clut_wr_addr = op_clut_wr ? qtag_dt1_i[5:0] : REG0_REG[5:0];
-  wire [31:0] clut_wr_data = op_clut_wr ? qtag_dt2_i : REG1_REG;
+  wire clut_wr_en = axi_clut_wr;
+  wire [5:0] clut_wr_addr = REG0_REG[5:0];
+  wire [31:0] clut_wr_data = REG1_REG;
 
-  wire thr_wr_en = op_thr_wr | axi_thr_wr;
-  wire [4:0] thr_wr_addr = op_thr_wr ? qtag_dt1_i[4:0] : REG0_REG[4:0];
-  wire [45:0] thr_wr_data = op_thr_wr ? {qtag_dt3_i[13:0], qtag_dt2_i} : {REG2_REG[13:0], REG1_REG};
+  wire thr_wr_en = axi_thr_wr;
+  wire [4:0] thr_wr_addr = REG0_REG[4:0];
+  wire [45:0] thr_wr_data = {REG2_REG[13:0], REG1_REG};
 
   (* mark_debug = "true" *) reg [6:0] reg_alut_len, reg_clut_len;
 
@@ -171,16 +168,12 @@ module adaptive_sweep (
       reg_alut_len <= 7'd64;
       reg_clut_len <= 7'd64;
     end else begin
-      if (op_alut_wr & (qtag_dt3_i[6:0] != 7'd0))
-        reg_alut_len <= qtag_dt3_i[6:0];
-      else if (axi_alut_wr & (REG3_REG[6:0] != 7'd0))
+      if (axi_alut_wr & (REG3_REG[6:0] != 7'd0))
         reg_alut_len <= REG3_REG[6:0];
       else
         reg_alut_len <= reg_alut_len;
 
-      if (op_clut_wr & (qtag_dt3_i[6:0] != 7'd0))
-        reg_clut_len <= qtag_dt3_i[6:0];
-      else if (axi_clut_wr & (REG3_REG[6:0] != 7'd0))
+      if (axi_clut_wr & (REG3_REG[6:0] != 7'd0))
         reg_clut_len <= REG3_REG[6:0];
       else
         reg_clut_len <= reg_clut_len;
@@ -498,7 +491,7 @@ module adaptive_sweep (
     .clk          (clk),
     .rst_n        (rst_n),
     .start        (run_gdkw),
-    .kw_mode_i    (qtag_op_i[0]),
+    .kw_mode_i    (qtag_op_i == 5'd6),
     .use_lut_i    (qtag_dt2_i[0]),
     .dip_i        (search_mode),
     .x0_i         (qtag_dt1_i),
@@ -571,11 +564,8 @@ module adaptive_sweep (
   (* mark_debug = "true" *) reg start_now_dbg;
   (* mark_debug = "true" *) reg cfg_meas_dbg;
   (* mark_debug = "true" *) reg status_rd_dbg;
-  (* mark_debug = "true" *) reg op_thr_wr_dbg;
   (* mark_debug = "true" *) reg diag_rd_dbg;
   (* mark_debug = "true" *) reg run_gdkw_dbg;
-  (* mark_debug = "true" *) reg op_alut_wr_dbg;
-  (* mark_debug = "true" *) reg op_clut_wr_dbg;
   (* mark_debug = "true" *) reg getfreq_rd_dbg;
   (* mark_debug = "true" *) reg gdkw_diag_rd_dbg;
   (* mark_debug = "true" *) reg cfg_gdkw_dbg;
@@ -603,6 +593,14 @@ module adaptive_sweep (
   (* mark_debug = "true" *) reg grid_valid_dbg;
   (* mark_debug = "true" *) reg search_valid_dbg;
   (* mark_debug = "true" *) reg [63:0] search_data_dbg;
+  (* mark_debug = "true" *) reg getmean_rd_dbg;
+  (* mark_debug = "true" *) reg getlog_rd_dbg;
+  (* mark_debug = "true" *) reg getlog_d1_dbg;
+  (* mark_debug = "true" *) reg cfg_capdiv_dbg;
+  (* mark_debug = "true" *) reg [53:0] cap_mag_dbg;
+  (* mark_debug = "true" *) reg [5:0] cap_kp1_dbg;
+  (* mark_debug = "true" *) reg [4:0] cap_sft_dbg;
+  (* mark_debug = "true" *) reg [15:0] nconv_cnt_dbg;
   always @(posedge clk) begin
     if (!rst_n) begin
       qtag_en_dbg <= 1'b0;
@@ -619,11 +617,8 @@ module adaptive_sweep (
       start_now_dbg <= 1'b0;
       cfg_meas_dbg <= 1'b0;
       status_rd_dbg <= 1'b0;
-      op_thr_wr_dbg <= 1'b0;
       diag_rd_dbg <= 1'b0;
       run_gdkw_dbg <= 1'b0;
-      op_alut_wr_dbg <= 1'b0;
-      op_clut_wr_dbg <= 1'b0;
       getfreq_rd_dbg <= 1'b0;
       gdkw_diag_rd_dbg <= 1'b0;
       cfg_gdkw_dbg <= 1'b0;
@@ -651,6 +646,14 @@ module adaptive_sweep (
       grid_valid_dbg <= 1'b0;
       search_valid_dbg <= 1'b0;
       search_data_dbg <= 64'd0;
+      getmean_rd_dbg <= 1'b0;
+      getlog_rd_dbg <= 1'b0;
+      getlog_d1_dbg <= 1'b0;
+      cfg_capdiv_dbg <= 1'b0;
+      cap_mag_dbg <= 54'd0;
+      cap_kp1_dbg <= 6'd0;
+      cap_sft_dbg <= 5'd0;
+      nconv_cnt_dbg <= 16'd0;
     end else begin
       qtag_en_dbg <= qtag_en_i;
       qtag_op_dbg <= qtag_op_i;
@@ -666,11 +669,8 @@ module adaptive_sweep (
       start_now_dbg <= start_now;
       cfg_meas_dbg <= cfg_meas;
       status_rd_dbg <= status_rd;
-      op_thr_wr_dbg <= op_thr_wr;
       diag_rd_dbg <= diag_rd;
       run_gdkw_dbg <= run_gdkw;
-      op_alut_wr_dbg <= op_alut_wr;
-      op_clut_wr_dbg <= op_clut_wr;
       getfreq_rd_dbg <= getfreq_rd;
       gdkw_diag_rd_dbg <= gdkw_diag_rd;
       cfg_gdkw_dbg <= cfg_gdkw;
@@ -698,6 +698,14 @@ module adaptive_sweep (
       grid_valid_dbg <= grid_valid;
       search_valid_dbg <= search_valid;
       search_data_dbg <= search_data;
+      getmean_rd_dbg <= getmean_rd;
+      getlog_rd_dbg <= getlog_rd;
+      getlog_d1_dbg <= getlog_d1;
+      cfg_capdiv_dbg <= cfg_capdiv;
+      cap_mag_dbg <= cap_mag_r;
+      cap_kp1_dbg <= cap_kp1_r;
+      cap_sft_dbg <= cap_sft_r;
+      nconv_cnt_dbg <= nconv_cnt;
     end
   end
 

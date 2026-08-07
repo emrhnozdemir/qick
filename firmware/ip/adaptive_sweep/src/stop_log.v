@@ -10,32 +10,28 @@ module stop_log (
 
   input wire rd_en_i,
   input wire [11:0] rd_addr_i,
-  output reg [15:0] rd_data_o,
+  output wire [15:0] rd_data_o,
   output wire rd_valid_o,
   output reg [15:0] cnt_o
 );
 
-  reg [15:0] mem [0:4095];
   reg [11:0] rd_addr_r;
 
-  integer mi;
-
-  initial begin
-    for (mi = 0; mi < 4096; mi = mi + 1)
-      mem[mi] = 16'd0;
-  end
-
-  always @(posedge clk) begin
-    if (wr_i)
-      mem[cnt_o[11:0]] <= wr_entry_i;
-  end
+  bram_stop_log u_mem (
+    .clka  (clk),
+    .wea   (wr_i),
+    .addra (cnt_o[11:0]),
+    .dina  (wr_entry_i),
+    .clkb  (clk),
+    .enb   (rd_en_i),
+    .addrb (rd_addr_i),
+    .doutb (rd_data_o)
+  );
 
   always @(posedge clk) begin
     if (rd_en_i) begin
-      rd_data_o <= mem[rd_addr_i];
       rd_addr_r <= rd_addr_i;
     end else begin
-      rd_data_o <= rd_data_o;
       rd_addr_r <= rd_addr_r;
     end
   end
@@ -51,6 +47,33 @@ module stop_log (
       cnt_o <= cnt_o + 16'd1;
     else
       cnt_o <= cnt_o;
+  end
+
+  (* mark_debug = "true" *) reg wr_dbg;
+  (* mark_debug = "true" *) reg [15:0] wr_entry_dbg;
+  (* mark_debug = "true" *) reg [15:0] cnt_dbg;
+  (* mark_debug = "true" *) reg rd_en_dbg;
+  (* mark_debug = "true" *) reg [11:0] rd_addr_dbg;
+  (* mark_debug = "true" *) reg [15:0] rd_data_dbg;
+  (* mark_debug = "true" *) reg rd_valid_dbg;
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      wr_dbg <= 1'b0;
+      wr_entry_dbg <= 16'd0;
+      cnt_dbg <= 16'd0;
+      rd_en_dbg <= 1'b0;
+      rd_addr_dbg <= 12'd0;
+      rd_data_dbg <= 16'd0;
+      rd_valid_dbg <= 1'b0;
+    end else begin
+      wr_dbg <= wr_i;
+      wr_entry_dbg <= wr_entry_i;
+      cnt_dbg <= cnt_o;
+      rd_en_dbg <= rd_en_i;
+      rd_addr_dbg <= rd_addr_i;
+      rd_data_dbg <= rd_data_o;
+      rd_valid_dbg <= rd_valid_o;
+    end
   end
 
 endmodule

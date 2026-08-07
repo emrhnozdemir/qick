@@ -683,6 +683,22 @@ module amp_calc (
   (* mark_debug = "true" *) reg es_stop_dbg;
   (* mark_debug = "true" *) reg thr_wr_en_dbg;
   (* mark_debug = "true" *) reg [4:0] thr_wr_addr_dbg;
+  (* mark_debug = "true" *) reg [2:0] r_state_dbg;
+  (* mark_debug = "true" *) reg trig_np_dbg;
+  (* mark_debug = "true" *) reg trig_cap_dbg;
+  (* mark_debug = "true" *) reg pend_dbg;
+  (* mark_debug = "true" *) reg [31:0] den_dbg;
+  (* mark_debug = "true" *) reg [5:0] kp1_dbg;
+  (* mark_debug = "true" *) reg [4:0] sft_dbg;
+  (* mark_debug = "true" *) reg retire_fin_dbg;
+  (* mark_debug = "true" *) reg [31:0] mean_i_dbg;
+  (* mark_debug = "true" *) reg [31:0] mean_q_dbg;
+  (* mark_debug = "true" *) reg [15:0] log_entry_dbg;
+  (* mark_debug = "true" *) reg grid_stop_dbg;
+  (* mark_debug = "true" *) reg ckdiff_stop_dbg;
+  (* mark_debug = "true" *) reg [31:0] np_n_dbg;
+  (* mark_debug = "true" *) reg [4:0] np_j_dbg;
+  (* mark_debug = "true" *) reg [1:0] np_midx_dbg;
   always @(posedge clk) begin
     if (!rst_n) begin
       arm_dbg <= 1'b0;
@@ -697,6 +713,22 @@ module amp_calc (
       es_stop_dbg <= 1'b0;
       thr_wr_en_dbg <= 1'b0;
       thr_wr_addr_dbg <= 5'd0;
+      r_state_dbg <= 3'd0;
+      trig_np_dbg <= 1'b0;
+      trig_cap_dbg <= 1'b0;
+      pend_dbg <= 1'b0;
+      den_dbg <= 32'd0;
+      kp1_dbg <= 6'd0;
+      sft_dbg <= 5'd0;
+      retire_fin_dbg <= 1'b0;
+      mean_i_dbg <= 32'd0;
+      mean_q_dbg <= 32'd0;
+      log_entry_dbg <= 16'd0;
+      grid_stop_dbg <= 1'b0;
+      ckdiff_stop_dbg <= 1'b0;
+      np_n_dbg <= 32'd0;
+      np_j_dbg <= 5'd0;
+      np_midx_dbg <= 2'd0;
     end else begin
       arm_dbg <= arm_i;
       acc_i_nxt_dbg <= acc_i_nxt;
@@ -710,6 +742,22 @@ module amp_calc (
       es_stop_dbg <= es_stop;
       thr_wr_en_dbg <= thr_wr_en_i;
       thr_wr_addr_dbg <= thr_wr_addr_i;
+      r_state_dbg <= r_state;
+      trig_np_dbg <= trig_np;
+      trig_cap_dbg <= trig_cap;
+      pend_dbg <= pend_r;
+      den_dbg <= den_r;
+      kp1_dbg <= kp1_r;
+      sft_dbg <= sft_r;
+      retire_fin_dbg <= retire_fin;
+      mean_i_dbg <= mean_i_r;
+      mean_q_dbg <= mean_q_r;
+      log_entry_dbg <= log_entry_o;
+      grid_stop_dbg <= grid_stop;
+      ckdiff_stop_dbg <= ckdiff_stop;
+      np_n_dbg <= np_n_mux;
+      np_j_dbg <= np_j_mux;
+      np_midx_dbg <= np_midx_mux;
     end
   end
 

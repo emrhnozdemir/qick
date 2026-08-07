@@ -278,6 +278,20 @@ module tb_adaptive_sweep;
     end
   endtask
 
+  reg axi_tog;
+
+  task automatic axi_tbl_write(input [1:0] target, input [5:0] addr, input [31:0] data, input [13:0] hi, input [6:0] len);
+    begin
+      axi_write(8'h04, data);
+      axi_write(8'h08, {18'd0, hi});
+      axi_write(8'h0C, {25'd0, len});
+      axi_write(8'h00, {axi_tog, 21'd0, target, 2'd0, addr});
+      axi_tog = ~axi_tog;
+      axi_write(8'h00, {axi_tog, 21'd0, target, 2'd0, addr});
+      repeat (10) @(posedge clk);
+    end
+  endtask
+
   integer arm_count;
   integer arm_taken;
 
@@ -360,7 +374,7 @@ module tb_adaptive_sweep;
     begin
       g = 0;
       while (!qtag_rdy_o && (g < guardmax)) begin
-        qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+        qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
         if (!qtag_rdy_o && qtag_dt2_o[0])
           feed_point(avg, isum, 0);
         else
@@ -403,10 +417,14 @@ module tb_adaptive_sweep;
   reg [31:0] status_t1, status_t2;
   reg [127:0] raw_sum_expect;
   integer grid_before, search_before;
+  reg [31:0] tl_probes [0:9];
+  integer tl_i;
+  integer tl_g;
 
   initial begin
     errors = 0;
     arm_taken = 0;
+    axi_tog = 1'b0;
     rst_n = 1'b0;
     s_axi_aresetn = 1'b0;
     qtag_en_i = 1'b0;
@@ -495,20 +513,20 @@ module tb_adaptive_sweep;
     check32("T0 rdy after finish", {31'd0, qtag_rdy_o}, 32'd1);
     check128("T0 peak power", dut.u_peak_finder_wide.max_amplitude, 128'd250000);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T0 result survives a late OP10", qtag_dt1_o,
             START_FREQ + 2 * STEP);
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T0 result survives a late OP3", qtag_dt1_o,
             START_FREQ + 2 * STEP);
-    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T0 result survives a late OP5", qtag_dt1_o,
             START_FREQ + 2 * STEP);
-    qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd8, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T0 result survives a late OP11", qtag_dt1_o,
             START_FREQ + 2 * STEP);
 
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T0 vld cleared by OP13", {31'd0, qtag_vld_o}, 32'd0);
 
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
@@ -529,8 +547,8 @@ module tb_adaptive_sweep;
     feed_alternating(AVG_MAD, 100 * 128, 102 * 128);
     wait_finish;
 
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     n_used_t1 = qtag_dt1_o;
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     status_t1 = qtag_dt1_o;
@@ -538,10 +556,7 @@ module tb_adaptive_sweep;
     check32("T1 early_stop (no table)", {31'd0, status_t1[8]}, 32'd0);
     check32("T1 estop_en", {31'd0, status_t1[10]}, 32'd1);
 
-    axi_write(8'h04, 32'hFFFF_FFFF);
-    axi_write(8'h08, 32'h0000_3FFF);
-    axi_write(8'h00, 32'h0000_0202);
-    axi_write(8'h00, 32'h8000_0202);
+    axi_tbl_write(2'd2, 6'd2, 32'hFFFF_FFFF, 14'h3FFF, 7'd0);
     repeat (40) @(posedge clk);
 
     qp2_op(5'd2, NSAMP, CTRL_MADSTOP, 32'd0, 32'd4);
@@ -551,14 +566,31 @@ module tb_adaptive_sweep;
     feed_alternating(AVG_MAD, 100 * 128, 102 * 128);
     wait_finish;
 
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     n_used_t2 = qtag_dt1_o;
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     status_t2 = qtag_dt1_o;
     check32("T2 n_used (AXI table)", n_used_t2, 32'd4);
     check32("T2 early_stop (AXI table)", {31'd0, status_t2[8]}, 32'd1);
     check128("T2 stopped-epoch power", dut.u_peak_finder_wide.max_amplitude, 128'd10201);
+
+    axi_tbl_write(2'd2, 6'd1, 32'hFFFF_FFFF, 14'h3FFF, 7'd0);
+    repeat (40) @(posedge clk);
+
+    qp2_op(5'd2, NSAMP, CTRL_MADSTOP, 32'd0, 32'd2);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd1, AVG_MAD);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+
+    feed_alternating(AVG_MAD, 100 * 128, 102 * 128);
+    wait_finish;
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T2b n_used (n=2 epoch)", qtag_dt1_o, 32'd2);
+    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T2b early_stop", {31'd0, qtag_dt1_o[8]}, 32'd1);
+    check128("T2b n=2 epoch power", dut.u_peak_finder_wide.max_amplitude, 128'd10201);
 
     raw_sum_expect = 128'd4 * 128'd500 * 128'd128;
     raw_sum_expect = raw_sum_expect * raw_sum_expect;
@@ -573,7 +605,7 @@ module tb_adaptive_sweep;
     wait_finish;
     check32("T3 raw-sum peak freq_word", qtag_dt1_o, START_FREQ + 2 * STEP);
     check128("T3 raw-sum peak power", dut.u_peak_finder_wide.max_amplitude, raw_sum_expect);
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T3 status reduce_sel", {29'd0, qtag_dt1_o[6:4]}, 32'd0);
     check32("T3 status prescale_en", {31'd0, qtag_dt1_o[9]}, 32'd0);
@@ -586,19 +618,19 @@ module tb_adaptive_sweep;
     wait_finish;
 
     check128("T4 running-mean power", dut.u_peak_finder_wide.max_amplitude, 128'd10201);
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T4 status reduce_sel", {29'd0, qtag_dt1_o[6:4]}, 32'd2);
 
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
     qp2_op(5'd0, START_FREQ, STEP, N_POINTS, 32'd2);
-    qp2_op(5'd12, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd2);
+    qp2_op(5'd9, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd2);
 
     grid_before = grid_valid_cnt;
     search_before = search_valid_cnt;
 
-    qp2_op(5'd6, START_FREQ, 32'h0002_0000, 32'd0, 32'd4);
+    qp2_op(5'd5, START_FREQ, 32'h0002_0000, 32'd0, 32'd4);
     run_probes(2, 100 * 128, 400);
 
     check32("T5 gd result x", qtag_dt1_o, START_FREQ);
@@ -606,11 +638,11 @@ module tb_adaptive_sweep;
     check32("T5 grid path stayed idle", grid_valid_cnt - grid_before, 32'd0);
     check32("T5 search path saw every probe", search_valid_cnt - search_before, 32'd8);
 
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T5 status dest", {31'd0, qtag_dt1_o[11]}, 32'd1);
 
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
     qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd64);
     qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
@@ -620,20 +652,20 @@ module tb_adaptive_sweep;
 
     check32("T6 split freq", qtag_dt1_o, START_FREQ);
     check128("T6 split power", dut.u_peak_finder_wide.max_amplitude, 128'd1250000);
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T6 n_used", qtag_dt1_o, 32'd8);
     check32("T6 diag word", qtag_dt2_o, 32'h0000_0118);
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T6 status early_stop", {31'd0, qtag_dt1_o[8]}, 32'd1);
     check32("T6 status drift", {31'd0, qtag_dt1_o[0]}, 32'd0);
-    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T6 mean I", qtag_dt1_o, 32'd1000);
     check32("T6 mean Q", qtag_dt2_o, 32'd500);
-    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd12, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T6 log entry 0", qtag_dt1_o, 32'h8000_0118);
     check32("T6 log count", qtag_dt2_o, 32'd1);
-    qp2_op(5'd15, 32'd1, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd12, 32'd1, 32'd0, 32'd0, 32'd0);
     check32("T6 log idx1 invalid", {31'd0, qtag_dt1_o[31]}, 32'd0);
 
     qp2_op(5'd2, NSAMP, CTRL_SPLIT_HOLD, 32'd0, 32'd8);
@@ -644,8 +676,8 @@ module tb_adaptive_sweep;
     wait_finish;
 
     check128("T6b drain power", dut.u_peak_finder_wide.max_amplitude, 128'd1250000);
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T6b n_used", qtag_dt1_o, 32'd8);
     check32("T6b diag word", qtag_dt2_o, 32'h0000_0118);
 
@@ -657,11 +689,11 @@ module tb_adaptive_sweep;
     wait_finish;
 
     check128("T7 ckdiff power", dut.u_peak_finder_wide.max_amplitude, 128'd2312500);
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T7 n_used", qtag_dt1_o, 32'd16);
     check32("T7 diag word", qtag_dt2_o, 32'h0000_0120);
-    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T7 mean I", qtag_dt1_o, 32'hFFFF_FA24);
     check32("T7 mean Q", qtag_dt2_o, 32'd250);
 
@@ -673,17 +705,17 @@ module tb_adaptive_sweep;
     wait_finish;
 
     check128("T8 hsplit power", dut.u_peak_finder_wide.max_amplitude, 128'd1996002);
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T8 n_used", qtag_dt1_o, 32'd12);
     check32("T8 diag word", qtag_dt2_o, 32'h0000_0111);
-    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd12, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T8 log entry 0", qtag_dt1_o, 32'h8000_0111);
-    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T8 mean I", qtag_dt1_o, 32'd999);
     check32("T8 mean Q", qtag_dt2_o, 32'hFFFF_FC19);
 
-    qp2_op(5'd16, 32'h51EB851F, 32'h00C51EB8, 32'd3, 32'd0);
+    qp2_op(5'd13, 32'h51EB851F, 32'h00C51EB8, 32'd3, 32'd0);
     qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd4);
     qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd100);
     qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
@@ -692,16 +724,16 @@ module tb_adaptive_sweep;
     wait_finish;
 
     check128("T9 cap power", dut.u_peak_finder_wide.max_amplitude, 128'd9216000000);
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T9 n_used", qtag_dt1_o, 32'd100);
     check32("T9 diag word", qtag_dt2_o, 32'h0001_0204);
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T9 status early_stop", {31'd0, qtag_dt1_o[8]}, 32'd0);
-    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T9 mean I", qtag_dt1_o, 32'd96000);
     check32("T9 mean Q", qtag_dt2_o, 32'd0);
-    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd12, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T9 log entry 0", qtag_dt1_o, 32'h8000_0204);
     check32("T9 log count", qtag_dt2_o, 32'd1);
 
@@ -714,14 +746,14 @@ module tb_adaptive_sweep;
 
     check32("TQ1 quarter freq", qtag_dt1_o, START_FREQ);
     check128("TQ1 quarter power", dut.u_peak_finder_wide.max_amplitude, 128'd5000000);
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ1 n_used", qtag_dt1_o, 32'd16);
     check32("TQ1 diag word", qtag_dt2_o, 32'h0000_0120);
-    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ1 mean I", qtag_dt1_o, 32'd2000);
     check32("TQ1 mean Q", qtag_dt2_o, 32'hFFFF_FC18);
-    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd12, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ1 log entry 0", qtag_dt1_o, 32'h8000_0120);
     check32("TQ1 log count", qtag_dt2_o, 32'd1);
 
@@ -733,14 +765,14 @@ module tb_adaptive_sweep;
     wait_finish;
 
     check128("TQ2 m5 power", dut.u_peak_finder_wide.max_amplitude, 128'd9490000);
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ2 n_used", qtag_dt1_o, 32'd20);
     check32("TQ2 diag word", qtag_dt2_o, 32'h0000_0112);
-    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ2 mean I", qtag_dt1_o, 32'hFFFF_F448);
     check32("TQ2 mean Q", qtag_dt2_o, 32'h0000_02BC);
-    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd12, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ2 log entry 0", qtag_dt1_o, 32'h8000_0112);
 
     qp2_op(5'd2, NSAMP, CTRL_QUARTER, 32'd0, 32'd28);
@@ -751,14 +783,14 @@ module tb_adaptive_sweep;
     wait_finish;
 
     check128("TQ3 m7 power", dut.u_peak_finder_wide.max_amplitude, 128'd523265);
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ3 n_used", qtag_dt1_o, 32'd28);
     check32("TQ3 diag word", qtag_dt2_o, 32'h0000_0113);
-    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ3 mean I", qtag_dt1_o, 32'd511);
     check32("TQ3 mean Q", qtag_dt2_o, 32'hFFFF_FE00);
-    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd12, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ3 log entry 0", qtag_dt1_o, 32'h8000_0113);
 
     qp2_op(5'd2, NSAMP, CTRL_QUARTER, 32'd0, 32'd24);
@@ -769,15 +801,77 @@ module tb_adaptive_sweep;
     wait_finish;
 
     check128("TQ4 m3 power", dut.u_peak_finder_wide.max_amplitude, 128'd20000000000);
-    qp2_op(5'd13, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd5, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ4 n_used", qtag_dt1_o, 32'd24);
     check32("TQ4 diag word", qtag_dt2_o, 32'h0000_0119);
-    qp2_op(5'd14, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ4 mean I", qtag_dt1_o, 32'h0001_86A0);
     check32("TQ4 mean Q", qtag_dt2_o, 32'h0001_86A0);
-    qp2_op(5'd15, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd12, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ4 log entry 0", qtag_dt1_o, 32'h8000_0119);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+
+    axi_tbl_write(2'd0, 6'd0, 32'd64, 14'd0, 7'd4);
+    axi_tbl_write(2'd0, 6'd1, 32'd32, 14'd0, 7'd4);
+    axi_tbl_write(2'd0, 6'd2, 32'd8, 14'd0, 7'd4);
+    axi_tbl_write(2'd0, 6'd3, 32'd2, 14'd0, 7'd4);
+    axi_tbl_write(2'd1, 6'd0, 32'd100, 14'd0, 7'd4);
+    axi_tbl_write(2'd1, 6'd1, 32'd50, 14'd0, 7'd4);
+    axi_tbl_write(2'd1, 6'd2, 32'd20, 14'd0, 7'd4);
+    axi_tbl_write(2'd1, 6'd3, 32'd10, 14'd0, 7'd4);
+
+    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(5'd0, START_FREQ, STEP, N_POINTS, 32'd2);
+    qp2_op(5'd9, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd1);
+
+    tl_probes[0] = 32'd268435356;
+    tl_probes[1] = 32'd268435556;
+    tl_probes[2] = 32'd268435470;
+    tl_probes[3] = 32'd268435570;
+    tl_probes[4] = 32'd268435532;
+    tl_probes[5] = 32'd268435572;
+    tl_probes[6] = 32'd268435550;
+    tl_probes[7] = 32'd268435570;
+    tl_probes[8] = 32'd268435552;
+    tl_probes[9] = 32'd268435572;
+
+    grid_before = grid_valid_cnt;
+    search_before = search_valid_cnt;
+
+    qp2_op(5'd6, 32'h1000_0000, 32'h0003_0001, 32'd16, 32'd10);
+
+    tl_i = 0;
+    tl_g = 0;
+    while (!qtag_rdy_o && (tl_g < 400)) begin
+      qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
+      if (!qtag_rdy_o && qtag_dt2_o[0]) begin
+        if (tl_i < 10) begin
+          check32($sformatf("TL1 probe %0d freq", tl_i), qtag_dt1_o, tl_probes[tl_i]);
+        end else begin
+          $display("FAIL TL1: more than 10 probes");
+          errors = errors + 1;
+        end
+        feed_point(2, ((tl_i % 2) == 0) ? 100 * 128 : 200 * 128, 0);
+        tl_i = tl_i + 1;
+      end else begin
+        tl_i = tl_i;
+      end
+      tl_g = tl_g + 1;
+    end
+    if (tl_g >= 400) begin
+      $display("FAIL TL1: timed out serving schedule-mode probes");
+      errors = errors + 1;
+    end else begin
+      tl_g = tl_g;
+    end
+
+    check32("TL1 probes served", tl_i, 32'd10);
+    check32("TL1 kw result x", qtag_dt1_o, 32'h1000_006C);
+    check32("TL1 kw done word", qtag_dt2_o, 32'h0005_0001);
+    check32("TL1 grid path stayed idle", grid_valid_cnt - grid_before, 32'd0);
+    check32("TL1 search path saw every probe", search_valid_cnt - search_before, 32'd10);
 
     if (errors == 0)
       $display("ALL TESTS PASSED");

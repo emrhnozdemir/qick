@@ -232,4 +232,37 @@ module estop_ckdiff (
     end
   end
 
+  (* mark_debug = "true" *) reg at1_dbg;
+  (* mark_debug = "true" *) reg [31:0] ckpt_dbg;
+  (* mark_debug = "true" *) reg [31:0] n1_dbg;
+  (* mark_debug = "true" *) reg [4:0] k1_dbg;
+  (* mark_debug = "true" *) reg pass_dbg;
+  (* mark_debug = "true" *) reg hist_dbg;
+  (* mark_debug = "true" *) reg confirmed_dbg;
+  (* mark_debug = "true" *) reg stop_dbg;
+  (* mark_debug = "true" *) reg sat_dbg;
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      at1_dbg <= 1'b0;
+      ckpt_dbg <= 32'd0;
+      n1_dbg <= 32'd0;
+      k1_dbg <= 5'd0;
+      pass_dbg <= 1'b0;
+      hist_dbg <= 1'b0;
+      confirmed_dbg <= 1'b0;
+      stop_dbg <= 1'b0;
+      sat_dbg <= 1'b0;
+    end else begin
+      at1_dbg <= at1;
+      ckpt_dbg <= ckpt_w;
+      n1_dbg <= n1;
+      k1_dbg <= k1;
+      pass_dbg <= pass_w;
+      hist_dbg <= hist;
+      confirmed_dbg <= confirmed;
+      stop_dbg <= stop_o;
+      sat_dbg <= sat_o;
+    end
+  end
+
 endmodule

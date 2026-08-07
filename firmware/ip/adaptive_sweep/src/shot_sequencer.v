@@ -156,6 +156,9 @@ module shot_sequencer (
   (* mark_debug = "true" *) reg point_latch_dbg;
   (* mark_debug = "true" *) reg emit_dbg;
   (* mark_debug = "true" *) reg warmup_done_dbg;
+  (* mark_debug = "true" *) reg stop_np_dbg;
+  (* mark_debug = "true" *) reg [31:0] n_np_dbg;
+  (* mark_debug = "true" *) reg stop_np_now_dbg;
   always @(posedge clk) begin
     if (!rst_n) begin
       arm_dbg <= 1'b0;
@@ -173,6 +176,9 @@ module shot_sequencer (
       point_latch_dbg <= 1'b0;
       emit_dbg <= 1'b0;
       warmup_done_dbg <= 1'b0;
+      stop_np_dbg <= 1'b0;
+      n_np_dbg <= 32'd0;
+      stop_np_now_dbg <= 1'b0;
     end else begin
       arm_dbg <= arm_i;
       shot_dbg <= shot_i;
@@ -189,6 +195,9 @@ module shot_sequencer (
       point_latch_dbg <= point_latch_o;
       emit_dbg <= emit_o;
       warmup_done_dbg <= warmup_done_o;
+      stop_np_dbg <= stop_np_i;
+      n_np_dbg <= n_np_i;
+      stop_np_now_dbg <= stop_np_now_o;
     end
   end
 

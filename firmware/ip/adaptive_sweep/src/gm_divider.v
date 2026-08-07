@@ -134,4 +134,22 @@ module gm_divider (
     end
   end
 
+  (* mark_debug = "true" *) reg start_dbg;
+  (* mark_debug = "true" *) reg busy_dbg;
+  (* mark_debug = "true" *) reg done_dbg;
+  (* mark_debug = "true" *) reg signed [31:0] q_dbg;
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      start_dbg <= 1'b0;
+      busy_dbg <= 1'b0;
+      done_dbg <= 1'b0;
+      q_dbg <= 32'd0;
+    end else begin
+      start_dbg <= start_i;
+      busy_dbg <= busy_o;
+      done_dbg <= done_o;
+      q_dbg <= q_o;
+    end
+  end
+
 endmodule

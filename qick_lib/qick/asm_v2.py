@@ -397,18 +397,8 @@ _AS_OPS = {
         resp={"dt1": _word("status"), "dt2": _word("freq_at_max", signed=True)},
         doc="status read -> dt1_o = status word, dt2_o = freq_at_max",
     ),
-    "THR_WR": QP2Op(
-        number=4, mnemonic="THR_WR",
-        args={
-            "dt1": (Field("index", 5, 0),),
-            "dt2": _word("thr_lo"),
-            "dt3": (Field("thr_hi", 14, 0),),
-        },
-        doc="madstop threshold table write: thr[index] = {thr_hi, thr_lo}, "
-            "46 bits total, index = log2(n) of the epoch",
-    ),
     "GET_DIAG": QP2Op(
-        number=5, mnemonic="GET_DIAG", responds=True,
+        number=4, mnemonic="GET_DIAG", responds=True,
         resp={"dt1": _word("n_used"), "dt2": _word("dev_acc_hi")},
         doc="diag read -> dt1 = n_used (shots folded into the last emitted "
             "point); dt2 depends on CTRL estop_sel: mad gives dev_acc[45:14] "
@@ -417,7 +407,7 @@ _AS_OPS = {
             "- decode with AS_DIAG_FIELDS",
     ),
     "RUN_GD": QP2Op(
-        number=6, mnemonic="RUN_GD", blocking=True, responds=True,
+        number=5, mnemonic="RUN_GD", blocking=True, responds=True,
         args={
             "dt1": _word("x0", signed=True),
             "dt2": (Field("use_lut", 1, 0),
@@ -433,7 +423,7 @@ _AS_OPS = {
         doc="gradient-descent search, forward pair P(x+step) - P(x)",
     ),
     "RUN_KW": QP2Op(
-        number=7, mnemonic="RUN_KW", blocking=True, responds=True,
+        number=6, mnemonic="RUN_KW", blocking=True, responds=True,
         args={
             "dt1": _word("x0", signed=True),
             "dt2": (Field("use_lut", 1, 0),
@@ -448,27 +438,8 @@ _AS_OPS = {
                       Field("iter", 16, 16))},
         doc="Kiefer-Wolfowitz search, symmetric pair P(x+c) - P(x-c)",
     ),
-    "ALUT_WR": QP2Op(
-        number=8, mnemonic="ALUT_WR",
-        args={
-            "dt1": (Field("index", 6, 0),),
-            "dt2": _word("value", signed=True),
-            "dt3": (Field("length", 7, 0),),
-        },
-        doc="a-LUT (step schedule) write; 'length' is latched when nonzero, "
-            "default 64",
-    ),
-    "CLUT_WR": QP2Op(
-        number=9, mnemonic="CLUT_WR",
-        args={
-            "dt1": (Field("index", 6, 0),),
-            "dt2": _word("value", signed=True),
-            "dt3": (Field("length", 7, 0),),
-        },
-        doc="c-LUT (probe-width schedule) write; same layout as ALUT_WR",
-    ),
     "GET_FREQ": QP2Op(
-        number=10, mnemonic="GET_FREQ", responds=True,
+        number=7, mnemonic="GET_FREQ", responds=True,
         resp={"dt1": _word("freq_word", signed=True),
               "dt2": (Field("freq_pending", 1, 0),)},
         doc="GD/KW probe handshake: returns the probe word; reading it while "
@@ -476,13 +447,13 @@ _AS_OPS = {
             "averager_value shots",
     ),
     "GET_GDKW_DIAG": QP2Op(
-        number=11, mnemonic="GET_GDKW_DIAG", responds=True,
+        number=8, mnemonic="GET_GDKW_DIAG", responds=True,
         resp={"dt1": (Field("iter", 16, 0), Field("pairs", 16, 16)),
               "dt2": _word("sd_hi")},
         doc="GD/KW diag -> {pairs, iter} and the top 32 bits of S_d",
     ),
     "CLR_RESULT": QP2Op(
-        number=13, mnemonic="CLR_RESULT",
+        number=10, mnemonic="CLR_RESULT",
         doc="release a finished job's answer and drop the response-valid bit. "
             "Between a job finishing and this op, every read is held off so it "
             "cannot overwrite the answer: READY reaches the tProc a couple of "
@@ -490,7 +461,7 @@ _AS_OPS = {
             "in after completion",
     ),
     "CFG_GDKW": QP2Op(
-        number=12, mnemonic="CFG_GDKW",
+        number=9, mnemonic="CFG_GDKW",
         args={
             "dt1": _word("f_lo", signed=True),
             "dt2": _word("f_hi", signed=True),
@@ -500,7 +471,7 @@ _AS_OPS = {
         doc="GD/KW search window [f_lo, f_hi] and racing pair-count bounds",
     ),
     "GET_MEAN": QP2Op(
-        number=14, mnemonic="GET_MEAN", responds=True,
+        number=11, mnemonic="GET_MEAN", responds=True,
         resp={"dt1": _word("mean_i", signed=True),
               "dt2": _word("mean_q", signed=True)},
         doc="32-bit mean I/Q read-back: the winning grid point's means when "
@@ -508,7 +479,7 @@ _AS_OPS = {
             "meaningful for the mean32 (reduce_sel=3) calcs",
     ),
     "GET_LOG": QP2Op(
-        number=15, mnemonic="GET_LOG", responds=True,
+        number=12, mnemonic="GET_LOG", responds=True,
         args={"dt1": (Field("index", 12, 0),)},
         resp={"dt1": (Field("log_type", 3, 0),
                       Field("log_k", 5, 3),
@@ -525,7 +496,7 @@ _AS_OPS = {
             "4096 measurements of a job",
     ),
     "CAP_DIV": QP2Op(
-        number=16, mnemonic="CAP_DIV",
+        number=13, mnemonic="CAP_DIV",
         args={
             "dt1": _word("mag_lo"),
             "dt2": (Field("mag_hi", 22, 0),
@@ -773,7 +744,7 @@ def gm_magic(n, w=52):
     -------
     (mag, kp1, sft) : tuple of int
         The 54-bit magic, the pre-shift ctz(n)+1, and the post-shift p-52,
-        exactly as OP16 CAP_DIV wants them.
+        exactly as OP13 CAP_DIV wants them.
     """
     n = int(n)
     if not 1 <= n <= (1 << 31):
@@ -901,8 +872,6 @@ class SweepPlan:
     writes_status: bool = False
     writes_diag: bool = False
     count_shots: bool = False
-    table_via_dmem: bool = False
-    dmem_table_addr: int = 0
 
     @property
     def handshake(self):
@@ -1054,7 +1023,6 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                use_lut=None, lambda_=0, m_min=2, m_max=8,
                f_lo=None, f_hi=None,
                result_addr=0, debug=False, count_shots=False,
-               table_via_dmem=None, dmem_table_addr=None,
                dump_log=None, log_addr=None):
     """Validate a sweep declaration and convert it to machine units.
 
@@ -1432,29 +1400,6 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
             _require(value is None,
                      "%s only applies to algorithm='gd' or 'kw'" % (label,))
 
-    # --- table transport ---------------------------------------------------
-    n_table = len(plan.thr_table) + len(plan.a_words) + len(plan.c_words)
-    if table_via_dmem is None:
-        # straight-line PBs cost ~4 instructions per entry; past this many it
-        # is cheaper to preload the values into data memory and loop
-        table_via_dmem = n_table > 16
-    plan.table_via_dmem = bool(table_via_dmem) and n_table > 0
-    if plan.table_via_dmem:
-        base = dmem_table_addr
-        if base is None:
-            base = plan.result_addr + RESULT_BLOCK
-        plan.dmem_table_addr = int(base)
-        _require(plan.dmem_table_addr >= 0, "dmem_table_addr must be >= 0")
-        _require(plan.dmem_table_addr >= plan.result_addr + RESULT_BLOCK
-                 or plan.dmem_table_addr + _table_words(plan) <= plan.result_addr,
-                 "the dmem table at %d would overlap the result block at %d"
-                 % (plan.dmem_table_addr, plan.result_addr))
-        limit = prog.tproccfg["dmem_size"]
-        _require(plan.dmem_table_addr + _table_words(plan) <= limit,
-                 "the dmem table needs %d words at address %d, past the end of "
-                 "data memory (%d)"
-                 % (_table_words(plan), plan.dmem_table_addr, limit))
-
     # --- stop-log dump -----------------------------------------------------
     if dump_log is None:
         dump_log = (algorithm == "grid"
@@ -1464,7 +1409,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     if plan.dump_log:
         _require(algorithm == "grid",
                  "dump_log applies to grid sweeps; a gd/kw run reads its "
-                 "probe log with OP15 directly")
+                 "probe log with OP12 directly")
         _require(calc_fields.get("reduce_sel") == 3
                  and accel.has_op("GET_LOG"),
                  "dump_log needs a mean32 calc (split/ckdiff/hsplit/"
@@ -1476,21 +1421,11 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         base = log_addr
         if base is None:
             base = plan.result_addr + RESULT_BLOCK
-            if plan.table_via_dmem:
-                base = max(base, plan.dmem_table_addr + _table_words(plan))
         plan.log_addr = int(base)
         _require(plan.log_addr >= plan.result_addr + RESULT_BLOCK
                  or plan.log_addr + plan.n_points <= plan.result_addr,
                  "the stop-log dump at %d would overlap the result block at "
                  "%d" % (plan.log_addr, plan.result_addr))
-        if plan.table_via_dmem:
-            _require(plan.log_addr >= plan.dmem_table_addr
-                     + _table_words(plan)
-                     or plan.log_addr + plan.n_points
-                     <= plan.dmem_table_addr,
-                     "the stop-log dump at %d would overlap the staged "
-                     "table at %d"
-                     % (plan.log_addr, plan.dmem_table_addr))
         limit = prog.tproccfg["dmem_size"]
         _require(0 <= plan.log_addr
                  and plan.log_addr + plan.n_points <= limit,
@@ -1521,9 +1456,6 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
 def _blocks(plan):
     """The data-memory ranges a plan writes, as ``(start, stop, what)``."""
     out = [(plan.result_addr, plan.result_addr + RESULT_BLOCK, "result block")]
-    if plan.table_via_dmem:
-        out.append((plan.dmem_table_addr,
-                    plan.dmem_table_addr + _table_words(plan), "staged table"))
     if plan.dump_log:
         out.append((plan.log_addr, plan.log_addr + plan.n_points,
                     "stop-log dump"))
@@ -1544,32 +1476,9 @@ def _check_no_overlap(prog, plan):
                 _require(hi <= olo or ohi <= lo,
                          "sweep %r puts its %s at data-memory [%d, %d) which "
                          "overlaps sweep %r's %s at [%d, %d); give one of them "
-                         "a different result_addr (or dmem_table_addr)"
+                         "a different result_addr"
                          % (plan.name, what, lo, hi, other.name, owhat,
                             olo, ohi))
-
-
-def _table_words(plan):
-    """Words the dmem-staged table occupies (2 per thr entry, 1 per LUT entry)."""
-    return 2 * len(plan.thr_table) + len(plan.a_words) + len(plan.c_words)
-
-
-def table_image(plan):
-    """The data-memory image of a dmem-staged table.
-
-    Returns
-    -------
-    list of int
-        Words to place at ``plan.dmem_table_addr``.  Threshold entries occupy
-        two words each (low then high), LUT entries one each.
-    """
-    words = []
-    for t in plan.thr_table:
-        words.append(to_s32(t & 0xFFFFFFFF))
-        words.append((t >> 32) & 0x3FFF)
-    words.extend(to_s32(w) for w in plan.a_words)
-    words.extend(to_s32(w) for w in plan.c_words)
-    return words
 
 
 # user units, multi-dimension
@@ -2520,70 +2429,6 @@ class AdaptiveSweep(Macro):
             asm.inc_ext_counter(addr=1)
         asm.append_macro(LoopBack(label=label, reg=reg_shot, last=last))
 
-    def _load_tables(self, prog, asm, plan):
-        """Emit the threshold and schedule table writes.
-
-        Short tables become straight-line ``PB``s.  Long ones are staged
-        through data memory and written by a loop, which keeps program memory
-        flat as the table grows.
-        """
-        accel = plan.accel
-        entries = []
-        if plan.thr_table:
-            entries.append(('THR_WR', plan.thr_table, 'thr'))
-        if plan.a_words:
-            entries.append(('ALUT_WR', plan.a_words, 'a'))
-        if plan.c_words:
-            entries.append(('CLUT_WR', plan.c_words, 'c'))
-        if not entries:
-            return
-
-        if not plan.table_via_dmem:
-            for mnemonic, values, _ in entries:
-                for i, value in enumerate(values):
-                    if mnemonic == 'THR_WR':
-                        asm.qpb_send(accel, mnemonic, index=i,
-                                     thr_lo=value & 0xFFFFFFFF,
-                                     thr_hi=(value >> 32) & 0x3FFF)
-                    else:
-                        asm.qpb_send(accel, mnemonic, index=i, value=value,
-                                     length=len(values))
-            return
-
-        # dmem-staged: walk an index register over the preloaded words
-        reg_i = prog.add_reg('%s_tbl_i' % (plan.name))
-        reg_a = prog.add_reg('%s_tbl_a' % (plan.name))
-        prog.add_reg('qp2_dt1', allow_reuse=True)
-        prog.add_reg('qp2_dt2', allow_reuse=True)
-        prog.add_reg('qp2_dt3', allow_reuse=True)
-        base = plan.dmem_table_addr
-        for mnemonic, values, tag in entries:
-            label = self._label(prog, 'tbl_%s' % (tag))
-            # a threshold occupies two data-memory words, a LUT entry one, so
-            # the index register counts words and the entry index is derived
-            width = 2 if mnemonic == 'THR_WR' else 1
-            asm.write_reg(dst=reg_i, src=0)
-            asm.label(label)
-            asm.append_macro(AluReg(dst=reg_a, arg1=reg_i, op='+', arg2=base))
-            asm.read_dmem(dst='qp2_dt2', addr=reg_a)
-            if width == 2:
-                asm.append_macro(AluReg(dst=reg_a, arg1=reg_a, op='+', arg2=1))
-                asm.read_dmem(dst='qp2_dt3', addr=reg_a)
-                asm.append_macro(AluReg(dst='qp2_dt1', arg1=reg_i, op='ASR',
-                                        arg2=1))
-                asm.pb(accel.op(mnemonic).number, r1='qp2_dt1', r2='qp2_dt2',
-                       r3='qp2_dt3')
-                # step over this entry's second word before the loop test,
-                # which contributes the other +1
-                asm.append_macro(AluReg(dst=reg_i, arg1=reg_i, op='+', arg2=1))
-            else:
-                asm.write_reg(dst='qp2_dt3', src=len(values))
-                asm.pb(accel.op(mnemonic).number, r1=reg_i, r2='qp2_dt2',
-                       r3='qp2_dt3')
-            asm.append_macro(LoopBack(label=label, reg=reg_i,
-                                      last=len(values) * width - 1))
-            base += len(values) * width
-
     def _store_result(self, prog, asm, plan, status_src):
         """Copy the response words into the result block and raise the flag.
 
@@ -2641,7 +2486,6 @@ class AdaptiveSweep(Macro):
         reg_shot = prog.add_reg('%s_shot' % (plan.name))
 
         self._config(prog, asm, plan)
-        self._load_tables(prog, asm, plan)
         asm.qpb_send(accel, 'CFG_WINDOW', start_freq=plan.gen_start,
                      step=plan.gen_step, n_points=plan.n_points,
                      averager_value=plan.avg)
@@ -2690,7 +2534,6 @@ class AdaptiveSweep(Macro):
                      averager_value=plan.avg)
         asm.qpb_send(accel, 'CFG_GDKW', f_lo=plan.f_lo, f_hi=plan.f_hi,
                      m_min=plan.m_min, m_max=plan.m_max)
-        self._load_tables(prog, asm, plan)
 
         # constants for the readout-word tracker
         asm.write_reg(dst=reg_genbase, src=to_s32(plan.gen_base))
@@ -4407,22 +4250,14 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         """
         if not self._sweep_plans:
             return None
-        # Cover every result block as well as every staged table.  The result
-        # block has to be *written*, not just reserved: nothing else clears
-        # data memory between runs, so a second run of the same program would
-        # otherwise find the first run's done sentinel already set and report a
-        # stale answer as a fresh one.
+        # The result block has to be *written*, not just reserved: nothing
+        # else clears data memory between runs, so a second run of the same
+        # program would otherwise find the first run's done sentinel already
+        # set and report a stale answer as a fresh one.
         size = 0
         for plan in self._sweep_plans.values():
             size = max(size, plan.result_addr + RESULT_BLOCK)
-            if plan.table_via_dmem:
-                size = max(size, plan.dmem_table_addr + len(table_image(plan)))
         d_mem = np.zeros(size, dtype=np.int32)
-        for plan in self._sweep_plans.values():
-            if not plan.table_via_dmem:
-                continue
-            words = table_image(plan)
-            d_mem[plan.dmem_table_addr:plan.dmem_table_addr + len(words)] = words
         return d_mem
 
     def compile(self):
@@ -4808,7 +4643,11 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             every checkpoint eligible; it does NOT disable the stop).
         thr_table : list of int
             Per-epoch deviation thresholds in LSB units, for
-            ``calc="madstop"``; entry *j* applies at 2**j shots.
+            ``calc="madstop"``; entry *j* applies at 2**j shots.  The
+            generated program does NOT write the table: load it from the
+            host over AXI-Lite with the ``Adaptive_Sweep`` driver
+            (``soc.adaptive_sweep_0.load_tables(plan)``) before starting
+            the program, or every point runs to the averager cap.
         emit_mode : str
             ``"drain"`` or ``"immediate"``, for the early-stopping calcs.
             Grid sweeps must use ``"drain"``: an early emission would advance
@@ -4828,7 +4667,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         dump_log : bool
             After a grid sweep with a split-family calc, have the generated
             program copy every point's stop-log entry into data memory (one
-            word per point, via OP15).  Defaults to True exactly in that
+            word per point, via OP12).  Defaults to True exactly in that
             case.  ``get_sweep_result`` / ``wait_for_sweep`` then return a
             ``stop_log`` dict of per-frequency arrays: ``n_used`` (the shot
             count each point actually stopped at), ``converged``,
@@ -4837,7 +4676,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             4096 (the log depth).
         log_addr : int
             Data-memory address of the dumped log.  Defaults to just past
-            the result block and any staged table.
+            the result block.
         x0 : float
             Starting frequency for gd/kw (MHz).  Defaults to ``start``.
         min_step : float
@@ -4852,6 +4691,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             itself capped.  Give it 1 or more to let the search stop early.
         a_table, c_table : list of float
             Step and probe-width schedules (MHz), for gd/kw in LUT mode.
+            Like ``thr_table``, these load over AXI-Lite through the
+            ``Adaptive_Sweep`` driver's ``load_tables(plan)``, not from
+            the generated program.
         use_lut : bool
             True for the scheduled a/c tables, False for racing mode (repeat
             the fixed-step pair until the accumulated difference beats its own
@@ -4879,13 +4721,6 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             ``acquire()`` and ``run_rounds()`` poll against ``reps``: with it
             on, those would return after the sweep's first shot.  Read the
             result with :meth:`wait_for_sweep` instead.
-        table_via_dmem : bool
-            Stage long tables through data memory and load them with a loop,
-            instead of one instruction group per entry.  Chosen automatically
-            when there are more than 16 entries.
-        dmem_table_addr : int
-            Where to put that staged table.
-
         Raises
         ------
         ValueError
@@ -4961,7 +4796,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
     def decode_stop_log(self, words, name=None):
         """Turn dumped stop-log words into per-point arrays.
 
-        Each word is one point's OP15 response (dt1_o): the log entry in the
+        Each word is one point's OP12 response (dt1_o): the log entry in the
         low bits and the valid flag at bit 31.  The generated grid program
         dumps them to data memory in point order when the plan has
         ``dump_log``, so entry *i* belongs to grid point *i*.

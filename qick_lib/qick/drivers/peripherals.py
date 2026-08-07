@@ -910,3 +910,87 @@ class QICK_XTalk_Compensation(SocIP):
         print('---------------------------------------------')
         print('--- AXI XTalk DEBUG')
         print( ' debug_bin : ' + debug_bin    )
+
+
+class Adaptive_Sweep(SocIP):
+    """
+    Adaptive_Sweep table-load port.
+
+    The adaptive_sweep IP's AXI-Lite slave is a host-side write port for its
+    three host-computed tables: the madstop per-epoch thresholds and the gd/kw
+    a_k (step) and c_k (probe-width) schedules.  The generated tProc program
+    does not load these tables; call :meth:`load_tables` with the sweep's plan
+    (or the individual loaders) before starting a program that needs them.
+
+    Protocol: REG0 is ``{[31] toggle, [9:8] target, [5:0] addr}`` with target
+    0 = a-LUT, 1 = c-LUT, 2 = threshold table.  Data goes in REG1 (plus
+    REG2[13:0] for the threshold high bits) and the LUT length in REG3, all
+    written before REG0[31] is FLIPPED - the toggle edge, synchronized into
+    the fabric clock, commits exactly one table write.
+    """
+    bindto = ['emrhnozdemir:QICK:adaptive_sweep:1.0']
+
+    def _init_config(self, description):
+        self.REGISTERS = {
+            'tbl_sel': 0,
+            'tbl_data_lo': 1,
+            'tbl_data_hi': 2,
+            'tbl_len': 3,
+        }
+
+    def _init_firmware(self):
+        # REG0[31] is a toggle, not a strobe: learn its current state instead
+        # of writing it, so re-initializing the driver cannot commit a stray
+        # table write.
+        self._toggle = (self.tbl_sel >> 31) & 1
+
+    def _tbl_commit(self, target, addr):
+        word = ((target & 0x3) << 8) | (addr & 0x3F)
+        # address and target first, with the toggle unchanged...
+        self.tbl_sel = (self._toggle << 31) | word
+        # ...then the flip commits
+        self._toggle ^= 1
+        self.tbl_sel = (self._toggle << 31) | word
+
+    def _load_lut(self, target, values, what):
+        values = [int(v) & 0xFFFFFFFF for v in values]
+        if not 1 <= len(values) <= 64:
+            raise ValueError("%s must have 1..64 entries, got %d"
+                             % (what, len(values)))
+        self.tbl_len = len(values)
+        for i, v in enumerate(values):
+            self.tbl_data_lo = v
+            self._tbl_commit(target, i)
+
+    def load_alut(self, values):
+        """Load the gd/kw a_k step-size schedule (frequency words)."""
+        self._load_lut(0, values, 'a_table')
+
+    def load_clut(self, values):
+        """Load the gd/kw c_k probe-width schedule (frequency words)."""
+        self._load_lut(1, values, 'c_table')
+
+    def load_thresholds(self, values):
+        """Load the madstop threshold table (46-bit values, entry j for 2**j shots)."""
+        values = [int(v) for v in values]
+        if not 1 <= len(values) <= 32:
+            raise ValueError("thr_table must have 1..32 entries, got %d"
+                             % (len(values),))
+        for i, t in enumerate(values):
+            if not 0 <= t < (1 << 46):
+                raise ValueError("thr_table[%d]=%d does not fit in 46 bits"
+                                 % (i, t))
+        self.tbl_len = 0
+        for i, t in enumerate(values):
+            self.tbl_data_lo = t & 0xFFFFFFFF
+            self.tbl_data_hi = (t >> 32) & 0x3FFF
+            self._tbl_commit(2, i)
+
+    def load_tables(self, plan):
+        """Load every table a SweepPlan carries (thresholds, a-LUT, c-LUT)."""
+        if plan.thr_table:
+            self.load_thresholds(plan.thr_table)
+        if plan.a_words:
+            self.load_alut(plan.a_words)
+        if plan.c_words:
+            self.load_clut(plan.c_words)

@@ -93,24 +93,32 @@ module gd_kw_engine (
 
   wire [31:0] a_lut_val, c_lut_val;
 
-  sched_lut #(.DEPTH(64), .AW(6), .W(32)) u_a_lut (
-    .clk       (clk),
-    .wr_en     (alut_wr_en),
-    .wr_addr   (alut_wr_addr),
-    .wr_din    (alut_wr_data),
-    .idx_i     (k_q),
-    .len_i     (alut_len_i),
-    .rd_data_o (a_lut_val)
+  wire [6:0] a_len_eff = (alut_len_i == 7'd0) ? 7'd1 : alut_len_i;
+  wire [6:0] a_last = a_len_eff - 7'd1;
+  wire [5:0] a_addr = (k_q >= {9'd0, a_len_eff}) ? a_last[5:0] : k_q[5:0];
+
+  wire [6:0] c_len_eff = (clut_len_i == 7'd0) ? 7'd1 : clut_len_i;
+  wire [6:0] c_last = c_len_eff - 7'd1;
+  wire [5:0] c_addr = (k_q >= {9'd0, c_len_eff}) ? c_last[5:0] : k_q[5:0];
+
+  bram_sched_lut u_a_lut (
+    .clka  (clk),
+    .wea   (alut_wr_en),
+    .addra (alut_wr_addr),
+    .dina  (alut_wr_data),
+    .clkb  (clk),
+    .addrb (a_addr),
+    .doutb (a_lut_val)
   );
 
-  sched_lut #(.DEPTH(64), .AW(6), .W(32)) u_c_lut (
-    .clk       (clk),
-    .wr_en     (clut_wr_en),
-    .wr_addr   (clut_wr_addr),
-    .wr_din    (clut_wr_data),
-    .idx_i     (k_q),
-    .len_i     (clut_len_i),
-    .rd_data_o (c_lut_val)
+  bram_sched_lut u_c_lut (
+    .clka  (clk),
+    .wea   (clut_wr_en),
+    .addra (clut_wr_addr),
+    .dina  (clut_wr_data),
+    .clkb  (clk),
+    .addrb (c_addr),
+    .doutb (c_lut_val)
   );
 
   wire [31:0] a_val = use_lut_r ? a_lut_val : fstep_r;

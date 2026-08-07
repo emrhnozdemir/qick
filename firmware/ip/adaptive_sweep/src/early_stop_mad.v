@@ -25,19 +25,6 @@ module early_stop_mad (
   output wire [45:0] dev_acc_o
 );
 
-  reg [45:0] thr_table [0:31];
-  integer ti;
-
-  initial begin
-    for (ti = 0; ti < 32; ti = ti + 1)
-      thr_table[ti] = {46{1'b0}};
-  end
-
-  always @(posedge clk) begin
-    if (thr_wr_en_i)
-      thr_table[thr_wr_addr_i] <= thr_wr_data_i;
-  end
-
   (* mark_debug = "true" *) reg [31:0] epoch_r;
   (* mark_debug = "true" *) reg [4:0] j_r;
   (* mark_debug = "true" *) reg signed [17:0] mean_lat_i;
@@ -60,7 +47,20 @@ module early_stop_mad (
   wire dev_en = fold_i & ~first_i;
   wire [45:0] dev_next = dev_en ? (dev_acc + {29'd0, dev_term}) : dev_acc;
 
-  wire [45:0] thr_cur = thr_table[j_r];
+  wire [4:0] thr_addr = at_epoch ? (j_r + 5'd1) : j_r;
+
+  wire [45:0] thr_cur;
+
+  bram_thr_table u_thr_table (
+    .clka  (clk),
+    .wea   (thr_wr_en_i),
+    .addra (thr_wr_addr_i),
+    .dina  (thr_wr_data_i),
+    .clkb  (clk),
+    .addrb (thr_addr),
+    .doutb (thr_cur)
+  );
+
   wire stop_ok = (n_min_i != 32'd0) & (epoch_r >= n_min_i);
 
   assign stop_o = en_i & at_epoch & stop_ok & (dev_next <= thr_cur);
