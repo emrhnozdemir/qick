@@ -29,10 +29,10 @@ module early_stop_mad (
   (* mark_debug = "true" *) reg [4:0] j_r;
   (* mark_debug = "true" *) reg signed [17:0] mean_lat_i;
   (* mark_debug = "true" *) reg signed [17:0] mean_lat_q;
-  (* mark_debug = "true" *) reg [45:0] dev_acc;
+  (* mark_debug = "true" *) reg [47:0] dev_acc;
 
   assign j_o = j_r;
-  assign dev_acc_o = dev_acc;
+  assign dev_acc_o = dev_acc[45:0];
 
   wire at_epoch = fold_i & (n_i == epoch_r);
 
@@ -45,7 +45,7 @@ module early_stop_mad (
   wire [16:0] dev_term = {1'b0, c_i} + {1'b0, c_q};
 
   wire dev_en = fold_i & ~first_i;
-  wire [45:0] dev_next = dev_en ? (dev_acc + {29'd0, dev_term}) : dev_acc;
+  wire [47:0] dev_next = dev_en ? (dev_acc + {31'd0, dev_term}) : dev_acc;
 
   wire [4:0] thr_addr = at_epoch ? (j_r + 5'd1) : j_r;
 
@@ -71,13 +71,13 @@ module early_stop_mad (
       j_r <= 5'd0;
       mean_lat_i <= {18{1'b0}};
       mean_lat_q <= {18{1'b0}};
-      dev_acc <= {46{1'b0}};
+      dev_acc <= {48{1'b0}};
     end else if (arm_i) begin
       epoch_r <= 32'd1;
       j_r <= 5'd0;
       mean_lat_i <= {18{1'b0}};
       mean_lat_q <= {18{1'b0}};
-      dev_acc <= {46{1'b0}};
+      dev_acc <= {48{1'b0}};
     end else if (fold_i) begin
       dev_acc <= dev_next;
       if (at_epoch) begin
@@ -107,7 +107,7 @@ module early_stop_mad (
   (* mark_debug = "true" *) reg at_epoch_dbg;
   (* mark_debug = "true" *) reg dev_en_dbg;
   (* mark_debug = "true" *) reg [16:0] dev_term_dbg;
-  (* mark_debug = "true" *) reg [45:0] dev_next_dbg;
+  (* mark_debug = "true" *) reg [47:0] dev_next_dbg;
   (* mark_debug = "true" *) reg [45:0] thr_cur_dbg;
   (* mark_debug = "true" *) reg stop_ok_dbg;
   (* mark_debug = "true" *) reg stop_dbg;
@@ -122,7 +122,7 @@ module early_stop_mad (
       at_epoch_dbg <= 1'b0;
       dev_en_dbg <= 1'b0;
       dev_term_dbg <= 17'd0;
-      dev_next_dbg <= {46{1'b0}};
+      dev_next_dbg <= {48{1'b0}};
       thr_cur_dbg <= {46{1'b0}};
       stop_ok_dbg <= 1'b0;
       stop_dbg <= 1'b0;

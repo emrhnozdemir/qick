@@ -1,6 +1,8 @@
 `timescale 1ns / 1ps
 
-module gm_divider (
+module gm_divider #(
+  parameter POW2_ONLY = 0
+) (
   input wire clk,
   input wire rst_n,
 
@@ -33,19 +35,14 @@ module gm_divider (
   reg [4:0] sft_r1;
 
   reg v2;
-  reg [78:0] pp0_r;
-  reg [78:0] pp1_r;
-  reg [4:0] sft_r2;
-
   reg v3;
-  reg [105:0] prod_r;
-  reg [4:0] sft_r3;
-
   reg v4;
   reg [33:0] q34_r;
 
   wire [65:0] t_sh = a_r >> kp1_r;
-  wire [53:0] hi54 = prod_r[105:52];
+
+  wire [53:0] hi54;
+  wire [4:0] sft_r3;
   wire [53:0] hi_sh = hi54 >> sft_r3;
   wire signed [34:0] qs = {1'b0, q34_r} - 35'sd4294967296;
 
@@ -63,12 +60,7 @@ module gm_divider (
       mag_r1 <= 54'd0;
       sft_r1 <= 5'd0;
       v2 <= 1'b0;
-      pp0_r <= 79'd0;
-      pp1_r <= 79'd0;
-      sft_r2 <= 5'd0;
       v3 <= 1'b0;
-      prod_r <= 106'd0;
-      sft_r3 <= 5'd0;
       v4 <= 1'b0;
       q34_r <= 34'd0;
       done_o <= 1'b0;
@@ -99,24 +91,7 @@ module gm_divider (
       end
 
       v2 <= v1;
-      if (v1) begin
-        pp0_r <= t_r * mag_r1[26:0];
-        pp1_r <= t_r * mag_r1[53:27];
-        sft_r2 <= sft_r1;
-      end else begin
-        pp0_r <= pp0_r;
-        pp1_r <= pp1_r;
-        sft_r2 <= sft_r2;
-      end
-
       v3 <= v2;
-      if (v2) begin
-        prod_r <= {pp1_r, 27'd0} + {27'd0, pp0_r};
-        sft_r3 <= sft_r2;
-      end else begin
-        prod_r <= prod_r;
-        sft_r3 <= sft_r3;
-      end
 
       v4 <= v3;
       if (v3) begin
@@ -133,6 +108,70 @@ module gm_divider (
       end
     end
   end
+
+  generate
+    if (POW2_ONLY != 0) begin : g_pow2_only
+      reg [51:0] t1_r;
+      reg [51:0] t2_r;
+
+      always @(posedge clk) begin
+        if (!rst_n) begin
+          t1_r <= 52'd0;
+          t2_r <= 52'd0;
+        end else begin
+          if (v1)
+            t1_r <= t_r;
+          else
+            t1_r <= t1_r;
+
+          if (v2)
+            t2_r <= t1_r;
+          else
+            t2_r <= t2_r;
+        end
+      end
+
+      assign hi54 = {2'd0, t2_r};
+      assign sft_r3 = 5'd0;
+    end else begin : g_gm_mulhi
+      reg [78:0] pp0_r;
+      reg [78:0] pp1_r;
+      reg [4:0] sft_r2;
+      reg [105:0] prod_r;
+      reg [4:0] sft_r3_q;
+
+      always @(posedge clk) begin
+        if (!rst_n) begin
+          pp0_r <= 79'd0;
+          pp1_r <= 79'd0;
+          sft_r2 <= 5'd0;
+          prod_r <= 106'd0;
+          sft_r3_q <= 5'd0;
+        end else begin
+          if (v1) begin
+            pp0_r <= t_r * mag_r1[26:0];
+            pp1_r <= t_r * mag_r1[53:27];
+            sft_r2 <= sft_r1;
+          end else begin
+            pp0_r <= pp0_r;
+            pp1_r <= pp1_r;
+            sft_r2 <= sft_r2;
+          end
+
+          if (v2) begin
+            prod_r <= {pp1_r, 27'd0} + {27'd0, pp0_r};
+            sft_r3_q <= sft_r2;
+          end else begin
+            prod_r <= prod_r;
+            sft_r3_q <= sft_r3_q;
+          end
+        end
+      end
+
+      assign hi54 = prod_r[105:52];
+      assign sft_r3 = sft_r3_q;
+    end
+  endgenerate
 
   (* mark_debug = "true" *) reg start_dbg;
   (* mark_debug = "true" *) reg busy_dbg;

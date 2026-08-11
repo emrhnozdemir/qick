@@ -22,7 +22,6 @@ module estop_split (
   output reg [31:0] np_n_o,
   output reg [4:0] j_o,
   output reg [1:0] midx_o,
-  output reg pass_o,
   output reg sat_o,
   output wire at_d1_o
 );
@@ -132,8 +131,8 @@ module estop_split (
   );
 
   reg at1;
-  (* mark_debug = "true" *) reg [63:0] lhs_r;
-  (* mark_debug = "true" *) reg [63:0] rhs_r;
+  (* mark_debug = "true" *) reg [64:0] lhs_r;
+  (* mark_debug = "true" *) reg [64:0] rhs_r;
   reg [31:0] n1;
   reg [4:0] j1;
   reg [1:0] midx1;
@@ -141,8 +140,8 @@ module estop_split (
   always @(posedge clk) begin
     if (!rst_n) begin
       at1 <= 1'b0;
-      lhs_r <= {64{1'b0}};
-      rhs_r <= {64{1'b0}};
+      lhs_r <= {65{1'b0}};
+      rhs_r <= {65{1'b0}};
       n1 <= 32'd0;
       j1 <= 5'd0;
       midx1 <= 2'd0;
@@ -177,13 +176,13 @@ module estop_split (
   wire [3:0] mag_r_mant;
 
   mag_class u_mag_l (
-    .v_i    (lhs_r),
+    .v_i    (lhs_r[63:0]),
     .exp_o  (mag_l_exp),
     .mant_o (mag_l_mant)
   );
 
   mag_class u_mag_r (
-    .v_i    (rhs_r),
+    .v_i    (rhs_r[63:0]),
     .exp_o  (mag_r_exp),
     .mant_o (mag_r_mant)
   );
@@ -201,7 +200,6 @@ module estop_split (
       np_n_o <= 32'd0;
       j_o <= 5'd0;
       midx_o <= 2'd0;
-      pass_o <= 1'b0;
       sat_o <= 1'b0;
       streak <= 3'd0;
       rprev <= 11'sd1023;
@@ -211,7 +209,6 @@ module estop_split (
       np_n_o <= np_n_o;
       j_o <= j_o;
       midx_o <= midx_o;
-      pass_o <= 1'b0;
       sat_o <= 1'b0;
       streak <= 3'd0;
       rprev <= 11'sd1023;
@@ -221,7 +218,6 @@ module estop_split (
       np_n_o <= n1;
       j_o <= j1;
       midx_o <= midx1;
-      pass_o <= pass_w;
       streak <= pass_w ? ((streak == 3'd7) ? 3'd7 : (streak + 3'd1)) : 3'd0;
       if (~pass_w & elig_w) begin
         sat_o <= sat_o | (nondec & ndprev);
@@ -237,7 +233,6 @@ module estop_split (
       np_n_o <= np_n_o;
       j_o <= j_o;
       midx_o <= midx_o;
-      pass_o <= pass_o;
       sat_o <= sat_o;
       streak <= streak;
       rprev <= rprev;

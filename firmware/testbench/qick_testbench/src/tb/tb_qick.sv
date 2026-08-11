@@ -1720,11 +1720,15 @@ initial begin
       ro_decimated_length  = 2000.0 / (2.0*T_RO_CLK);
       ro_average_length    = 190;
 
-      // The tProc paces n_points*averager_value shots at shot_period, so the run
-      // has to outlast that: 61 points x 16 shots x 1us = 976us for the window
-      // in iq_shots.mem. The full 4001-point grid needs ~64ms instead.
-      TEST_RUN_TIME        = 2ms;
+      // With AS_SRC_IQFILE the sweep is paced by the IP's own point arming, not
+      // by the tProc: 61 points x 16 shots x (gap_i+1) core clocks is ~49us, so
+      // 100us covers the whole sweep plus the result read-back and the run ends
+      // there. With AS_SRC_AVGBUF the tProc paces the shots instead (976 shots
+      // at shot_period; ~1ms for this window, ~64ms for the 4001-point grid) and
+      // this has to be raised to match.
+      TEST_RUN_TIME        = 100us;
       TEST_READ_TIME       = 10us;
+      REPEAT_EXEC          = 1;
 
       wait (tb_qick.AXIS_QPROC.t_resetn == 1'b1);
       #100ns;

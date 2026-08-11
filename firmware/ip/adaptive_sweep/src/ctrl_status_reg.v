@@ -27,7 +27,6 @@ module ctrl_status_reg (
   (* mark_debug = "true" *) output reg [15:0] m_min_o,
   (* mark_debug = "true" *) output reg [15:0] m_max_o,
 
-  output wire [31:0] ctrl_o,
   output wire search_mode_o,
   output wire [2:0] reduce_sel_o,
   output wire estop_hold_o,
@@ -36,6 +35,7 @@ module ctrl_status_reg (
   output wire [1:0] estop_sel_o,
   output wire [3:0] m_o,
   output wire ckmon_o,
+  output wire [2:0] nmul_o,
   output wire [1:0] density_o,
   output wire [2:0] confirm_o,
 
@@ -56,7 +56,6 @@ module ctrl_status_reg (
 
   (* mark_debug = "true" *) reg [31:0] ctrl_r;
 
-  assign ctrl_o = ctrl_r;
   assign search_mode_o = ctrl_r[0];
   assign reduce_sel_o = ctrl_r[3:1];
   assign estop_hold_o = ctrl_r[4];
@@ -65,8 +64,9 @@ module ctrl_status_reg (
   assign estop_sel_o = ctrl_r[8:7];
   assign m_o = ctrl_r[12:9];
   assign ckmon_o = ctrl_r[13];
-  assign density_o = ctrl_r[15:14];
-  assign confirm_o = ctrl_r[18:16];
+  assign nmul_o = ctrl_r[16:14];
+  assign density_o = (nmul_o >= 3'd4) ? 2'd2 : (nmul_o >= 3'd2) ? 2'd1 : 2'd0;
+  assign confirm_o = ctrl_r[19:17];
 
   assign status_o = {point_idx_i,
                      eng_freq_valid_i,

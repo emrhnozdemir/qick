@@ -2,9 +2,10 @@
   "schema": "xilinx.com:schema:json_instance:1.0",
   "ip_inst": {
     "xci_name": "bram_thr_table",
+    "cell_name": "u_amp_calc/u_early_stop_mad/u_thr_table",
     "component_reference": "xilinx.com:ip:blk_mem_gen:8.4",
     "ip_revision": "6",
-    "gen_directory": ".",
+    "gen_directory": "../../../../../../../../../users/emirh/desktop/qick/firmware/projects/qick_tprocv2_4x2_standard/top/top.tmp/adaptive_sweep_v1_0_project/adaptive_sweep_v1_0_project.gen/sources_1/ip/bram_thr_table",
     "parameters": {
       "component_parameters": {
         "Component_Name": [ { "value": "bram_thr_table", "resolve_type": "user", "usage": "all" } ],
@@ -174,11 +175,11 @@
         "IPCONTEXT": [ { "value": "IP_Flow" } ],
         "IPREVISION": [ { "value": "6" } ],
         "MANAGED": [ { "value": "TRUE" } ],
-        "OUTPUTDIR": [ { "value": "." } ],
+        "OUTPUTDIR": [ { "value": "../../../../../../../../../users/emirh/desktop/qick/firmware/projects/qick_tprocv2_4x2_standard/top/top.tmp/adaptive_sweep_v1_0_project/adaptive_sweep_v1_0_project.gen/sources_1/ip/bram_thr_table" } ],
         "SELECTEDSIMMODEL": [ { "value": "" } ],
         "SHAREDDIR": [ { "value": "." } ],
         "SWVERSION": [ { "value": "2023.1" } ],
-        "SYNTHESISFLOW": [ { "value": "OUT_OF_CONTEXT" } ]
+        "SYNTHESISFLOW": [ { "value": "GLOBAL" } ]
       }
     },
     "boundary": {

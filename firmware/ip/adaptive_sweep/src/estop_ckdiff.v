@@ -19,7 +19,6 @@ module estop_ckdiff (
   output reg stop_o,
   output reg [31:0] np_n_o,
   output reg [4:0] k_o,
-  output reg is3_o,
   output reg pass_o,
   output reg sat_o,
   output wire at_d1_o
@@ -124,16 +123,16 @@ module estop_ckdiff (
   );
 
   reg at1;
-  (* mark_debug = "true" *) reg [63:0] lhs_r;
-  (* mark_debug = "true" *) reg [63:0] rhs_r;
+  (* mark_debug = "true" *) reg [64:0] lhs_r;
+  (* mark_debug = "true" *) reg [64:0] rhs_r;
   reg [31:0] n1;
   reg [4:0] k1;
 
   always @(posedge clk) begin
     if (!rst_n) begin
       at1 <= 1'b0;
-      lhs_r <= {64{1'b0}};
-      rhs_r <= {64{1'b0}};
+      lhs_r <= {65{1'b0}};
+      rhs_r <= {65{1'b0}};
       n1 <= 32'd0;
       k1 <= 5'd0;
     end else if (at0) begin
@@ -164,13 +163,13 @@ module estop_ckdiff (
   wire [3:0] mag_r_mant;
 
   mag_class u_mag_l (
-    .v_i    (lhs_r),
+    .v_i    (lhs_r[63:0]),
     .exp_o  (mag_l_exp),
     .mant_o (mag_l_mant)
   );
 
   mag_class u_mag_r (
-    .v_i    (rhs_r),
+    .v_i    (rhs_r[63:0]),
     .exp_o  (mag_r_exp),
     .mant_o (mag_r_mant)
   );
@@ -187,7 +186,6 @@ module estop_ckdiff (
       stop_o <= 1'b0;
       np_n_o <= 32'd0;
       k_o <= 5'd0;
-      is3_o <= 1'b0;
       pass_o <= 1'b0;
       sat_o <= 1'b0;
       hist <= 1'b0;
@@ -197,7 +195,6 @@ module estop_ckdiff (
       stop_o <= 1'b0;
       np_n_o <= np_n_o;
       k_o <= k_o;
-      is3_o <= 1'b0;
       pass_o <= 1'b0;
       sat_o <= 1'b0;
       hist <= 1'b0;
@@ -207,7 +204,6 @@ module estop_ckdiff (
       stop_o <= en_i & confirmed & elig_w;
       np_n_o <= n1;
       k_o <= k1;
-      is3_o <= 1'b0;
       pass_o <= pass_w;
       hist <= pass_w;
       if (~pass_w & elig_w) begin
@@ -223,7 +219,6 @@ module estop_ckdiff (
       stop_o <= 1'b0;
       np_n_o <= np_n_o;
       k_o <= k_o;
-      is3_o <= is3_o;
       pass_o <= pass_o;
       sat_o <= sat_o;
       hist <= hist;

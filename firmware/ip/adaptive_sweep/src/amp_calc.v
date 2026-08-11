@@ -1,6 +1,8 @@
 `timescale 1ns / 1ps
 
-module amp_calc (
+module amp_calc #(
+  parameter POW2_DIV_ONLY = 0
+) (
   input wire clk,
   input wire rst_n,
 
@@ -42,7 +44,7 @@ module amp_calc (
   output wire [15:0] log_entry_o,
   output wire drift_o,
 
-  output wire [127:0] power_o,
+  output wire [63:0] power_o,
   output wire power_valid_o
 );
 
@@ -64,6 +66,8 @@ module amp_calc (
       r_in <= s_axis_tready;
     end
   end
+
+  wire [1:0] dens_eff = (POW2_DIV_ONLY != 0) ? 2'd0 : dens_i;
 
   wire [4:0] s1_w;
   wire [4:0] s2_w;
@@ -147,8 +151,8 @@ module amp_calc (
 
   wire seq_first;
   wire [31:0] seq_n;
-  wire acc_clr;
-  wire acc_en;
+  (* max_fanout = 64 *) wire acc_clr;
+  (* max_fanout = 64 *) wire acc_en;
   wire is_last;
   wire stop_now;
   wire stop_np_now;
@@ -225,7 +229,6 @@ module amp_calc (
     .en      (acc_en),
     .sub_i   (d_sub),
     .d_i     (acc_i_d),
-    .q_o     (),
     .q_nxt_o (dacc_i_nxt)
   );
 
@@ -236,7 +239,6 @@ module amp_calc (
     .en      (acc_en),
     .sub_i   (d_sub),
     .d_i     (acc_q_d),
-    .q_o     (),
     .q_nxt_o (dacc_q_nxt)
   );
 
@@ -251,7 +253,6 @@ module amp_calc (
     .first_i    (seq_first),
     .n_i        (seq_n),
     .x_i        (x_i),
-    .mean_o     (),
     .mean_nxt_o (mean_i_nxt)
   );
 
@@ -263,27 +264,26 @@ module amp_calc (
     .first_i    (seq_first),
     .n_i        (seq_n),
     .x_i        (x_q),
-    .mean_o     (),
     .mean_nxt_o (mean_q_nxt)
   );
 
   wire [4:0] es_j;
   wire [4:0] shift_amt = is_last ? s2_r : es_j;
 
-  wire signed [64:0] acc_i_nxt65 = {acc_i_nxt[63], acc_i_nxt};
-  wire signed [64:0] acc_q_nxt65 = {acc_q_nxt[63], acc_q_nxt};
+  wire signed [49:0] acc_i_red = acc_i_nxt[49:0];
+  wire signed [49:0] acc_q_red = acc_q_nxt[49:0];
 
-  wire signed [64:0] red_i;
-  wire signed [64:0] red_q;
+  wire signed [49:0] red_i;
+  wire signed [49:0] red_q;
 
-  round_shift #(.W(65)) u_reduce_i (
-    .d_i  (acc_i_nxt65),
+  round_shift #(.W(50)) u_reduce_i (
+    .d_i  (acc_i_red),
     .sh_i (shift_amt),
     .y_o  (red_i)
   );
 
-  round_shift #(.W(65)) u_reduce_q (
-    .d_i  (acc_q_nxt65),
+  round_shift #(.W(50)) u_reduce_q (
+    .d_i  (acc_q_red),
     .sh_i (shift_amt),
     .y_o  (red_q)
   );
@@ -321,7 +321,6 @@ module amp_calc (
   wire [31:0] grid_n;
   wire [4:0] grid_j;
   wire [1:0] grid_midx;
-  wire grid_pass;
   wire grid_sat;
   wire grid_d1;
 
@@ -334,7 +333,7 @@ module amp_calc (
     .n_i       (seq_n),
     .n_min_i   (n_min_i),
     .m_i       (m_i),
-    .dens_i    (dens_i),
+    .dens_i    (dens_eff),
     .confirm_i (confirm_i),
     .d_i_i     (dacc_i_nxt),
     .d_q_i     (dacc_q_nxt),
@@ -344,7 +343,6 @@ module amp_calc (
     .np_n_o    (grid_n),
     .j_o       (grid_j),
     .midx_o    (grid_midx),
-    .pass_o    (grid_pass),
     .sat_o     (grid_sat),
     .at_d1_o   (grid_d1)
   );
@@ -352,7 +350,6 @@ module amp_calc (
   wire ckdiff_stop;
   wire [31:0] ckdiff_n;
   wire [4:0] ckdiff_k;
-  wire ckdiff_is3;
   wire ckdiff_pass;
   wire ckdiff_sat;
   wire ckdiff_d1;
@@ -373,7 +370,6 @@ module amp_calc (
     .stop_o  (ckdiff_stop),
     .np_n_o  (ckdiff_n),
     .k_o     (ckdiff_k),
-    .is3_o   (ckdiff_is3),
     .pass_o  (ckdiff_pass),
     .sat_o   (ckdiff_sat),
     .at_d1_o (ckdiff_d1)
@@ -430,9 +426,12 @@ module amp_calc (
   wire trig_np = stop_np_now & sel3;
   wire trig_cap = emit & sel3 & ~stop_np_now;
 
-  wire [53:0] rom_mag = (np_midx_mux == 2'd1) ? 54'd3002399751580331 :
+  wire [53:0] rom_mag = (POW2_DIV_ONLY != 0) ? 54'd4503599627370496 :
+                        (np_midx_mux == 2'd1) ? 54'd3002399751580331 :
                         (np_midx_mux == 2'd2) ? 54'd3602879701896397 :
                         (np_midx_mux == 2'd3) ? 54'd5146971002709139 : 54'd4503599627370496;
+
+  wire [4:0] rom_sft = (POW2_DIV_ONLY != 0) ? 5'd0 : {3'd0, np_midx_mux};
 
   reg signed [63:0] num_i_r;
   reg signed [63:0] num_q_r;
@@ -480,7 +479,7 @@ module amp_calc (
       den_r <= np_n_mux;
       kp1_r <= {1'b0, np_j_mux} + 6'd1;
       mag_r <= rom_mag;
-      sft_r <= {3'd0, np_midx_mux};
+      sft_r <= rom_sft;
       typ_r <= {1'b0, np_midx_mux};
       k_r <= np_j_mux;
       conv_r <= 1'b1;
@@ -593,7 +592,7 @@ module amp_calc (
   wire signed [63:0] gm_num = (r_state == R_STARTI) ? num_i_r : num_q_r;
   wire retire_fin = (r_state == R_FIN);
 
-  gm_divider u_gm_divider (
+  gm_divider #(.POW2_ONLY(POW2_DIV_ONLY)) u_gm_divider (
     .clk     (clk),
     .rst_n   (rst_n),
     .start_i (gm_start),
@@ -628,28 +627,26 @@ module amp_calc (
   assign log_wr_o = retire_fin;
   assign log_entry_o = {5'd0, driftl_r, satl_r, conv_r, k_r, typ_r};
 
-  wire signed [63:0] pt_i_shift = {{46{red_i[17]}}, red_i[17:0]};
-  wire signed [63:0] pt_q_shift = {{46{red_q[17]}}, red_q[17:0]};
-  wire signed [63:0] pt_i_mean = {{46{mean_i_nxt[17]}}, mean_i_nxt};
-  wire signed [63:0] pt_q_mean = {{46{mean_q_nxt[17]}}, mean_q_nxt};
+  wire signed [31:0] pt_i_shift = {{14{red_i[17]}}, red_i[17:0]};
+  wire signed [31:0] pt_q_shift = {{14{red_q[17]}}, red_q[17:0]};
+  wire signed [31:0] pt_i_mean = {{14{mean_i_nxt[17]}}, mean_i_nxt};
+  wire signed [31:0] pt_q_mean = {{14{mean_q_nxt[17]}}, mean_q_nxt};
 
-  wire signed [63:0] pt_i_new = (red_sel_r == 3'd0) ? acc_i_nxt :
-                                (red_sel_r == 3'd1) ? pt_i_shift :
-                                (red_sel_r == 3'd2) ? pt_i_mean : {64{1'b0}};
-  wire signed [63:0] pt_q_new = (red_sel_r == 3'd0) ? acc_q_nxt :
-                                (red_sel_r == 3'd1) ? pt_q_shift :
-                                (red_sel_r == 3'd2) ? pt_q_mean : {64{1'b0}};
+  wire signed [31:0] pt_i_new = (red_sel_r == 3'd1) ? pt_i_shift :
+                                (red_sel_r == 3'd2) ? pt_i_mean : {32{1'b0}};
+  wire signed [31:0] pt_q_new = (red_sel_r == 3'd1) ? pt_q_shift :
+                                (red_sel_r == 3'd2) ? pt_q_mean : {32{1'b0}};
 
-  (* mark_debug = "true" *) reg signed [63:0] point_i;
-  (* mark_debug = "true" *) reg signed [63:0] point_q;
+  (* mark_debug = "true" *) reg signed [31:0] point_i;
+  (* mark_debug = "true" *) reg signed [31:0] point_q;
 
   always @(posedge clk) begin
     if (!rst_n) begin
-      point_i <= {64{1'b0}};
-      point_q <= {64{1'b0}};
+      point_i <= {32{1'b0}};
+      point_q <= {32{1'b0}};
     end else if (retire_fin) begin
-      point_i <= {{32{div_i_q_r[31]}}, div_i_q_r};
-      point_q <= {{32{gm_q[31]}}, gm_q};
+      point_i <= div_i_q_r;
+      point_q <= gm_q;
     end else if (point_latch) begin
       point_i <= pt_i_new;
       point_q <= pt_q_new;

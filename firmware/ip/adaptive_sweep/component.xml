@@ -425,7 +425,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>d036a317</spirit:value>
+            <spirit:value>5314c300</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -444,7 +444,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>d036a317</spirit:value>
+            <spirit:value>5314c300</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -459,7 +459,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>4ba2a50e</spirit:value>
+            <spirit:value>46e47e68</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -1184,10 +1184,12 @@
       <spirit:file>
         <spirit:name>src/bram_stop_log/bram_stop_log.xci</spirit:name>
         <spirit:userFileType>xci</spirit:userFileType>
+        <spirit:userFileType>CELL_NAME_u_stop_log/u_mem</spirit:userFileType>
       </spirit:file>
       <spirit:file>
         <spirit:name>src/bram_sched_lut/bram_sched_lut.xci</spirit:name>
         <spirit:userFileType>xci</spirit:userFileType>
+        <spirit:userFileType>CELL_NAME_u_gd_kw_engine/u_a_lut</spirit:userFileType>
       </spirit:file>
       <spirit:file>
         <spirit:name>src/bram_thr_table/bram_thr_table.xci</spirit:name>
@@ -1326,10 +1328,12 @@
       <spirit:file>
         <spirit:name>src/bram_stop_log/bram_stop_log.xci</spirit:name>
         <spirit:userFileType>xci</spirit:userFileType>
+        <spirit:userFileType>CELL_NAME_u_stop_log/u_mem</spirit:userFileType>
       </spirit:file>
       <spirit:file>
         <spirit:name>src/bram_sched_lut/bram_sched_lut.xci</spirit:name>
         <spirit:userFileType>xci</spirit:userFileType>
+        <spirit:userFileType>CELL_NAME_u_gd_kw_engine/u_a_lut</spirit:userFileType>
       </spirit:file>
       <spirit:file>
         <spirit:name>src/bram_thr_table/bram_thr_table.xci</spirit:name>
@@ -1393,17 +1397,17 @@
       <xilinx:xpmLibraries>
         <xilinx:xpmLibrary>XPM_MEMORY</xilinx:xpmLibrary>
       </xilinx:xpmLibraries>
-      <xilinx:coreRevision>16</xilinx:coreRevision>
+      <xilinx:coreRevision>17</xilinx:coreRevision>
       <xilinx:upgrades>
         <xilinx:canUpgradeFrom>xilinx.com:user:adaptive_sweep:1.0</xilinx:canUpgradeFrom>
       </xilinx:upgrades>
-      <xilinx:coreCreationDateTime>2026-08-07T14:19:43Z</xilinx:coreCreationDateTime>
+      <xilinx:coreCreationDateTime>2026-08-07T22:05:38Z</xilinx:coreCreationDateTime>
     </xilinx:coreExtensions>
     <xilinx:packagingInfo>
       <xilinx:xilinxVersion>2023.1</xilinx:xilinxVersion>
       <xilinx:checksum xilinx:scope="busInterfaces" xilinx:value="3c60e00d"/>
       <xilinx:checksum xilinx:scope="memoryMaps" xilinx:value="c930e363"/>
-      <xilinx:checksum xilinx:scope="fileGroups" xilinx:value="7882d99a"/>
+      <xilinx:checksum xilinx:scope="fileGroups" xilinx:value="1df67397"/>
       <xilinx:checksum xilinx:scope="ports" xilinx:value="7f1a8882"/>
       <xilinx:checksum xilinx:scope="parameters" xilinx:value="cb881b10"/>
     </xilinx:packagingInfo>

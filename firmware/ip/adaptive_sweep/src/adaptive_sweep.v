@@ -1,6 +1,8 @@
 `timescale 1ns / 1ps
 
-module adaptive_sweep (
+module adaptive_sweep #(
+  parameter POW2_DIV_ONLY = 0
+) (
   input wire clk,
   input wire rst_n,
 
@@ -200,6 +202,7 @@ module adaptive_sweep (
   wire [1:0] cfg_estop_sel;
   wire [3:0] cfg_m;
   wire cfg_ckmon;
+  wire [2:0] cfg_nmul;
   wire [1:0] cfg_density;
   wire [2:0] cfg_confirm;
   wire [31:0] status_word;
@@ -207,7 +210,6 @@ module adaptive_sweep (
   wire [31:0] pf_freq_word;
   wire pf_freq_valid;
   wire pf_finish;
-  wire [127:0] max_amplitude;
   wire [31:0] freq_at_max;
   wire [31:0] pf_best_mean_i;
   wire [31:0] pf_best_mean_q;
@@ -222,7 +224,7 @@ module adaptive_sweep (
   wire ac_log_wr;
   wire [15:0] ac_log_entry;
   wire ac_drift;
-  wire [127:0] ac_power;
+  wire [63:0] ac_power;
   wire ac_power_valid;
   wire [15:0] log_cnt;
   wire [15:0] log_rd_data;
@@ -299,7 +301,6 @@ module adaptive_sweep (
     .f_hi_o           (cfg_fhi),
     .m_min_o          (cfg_mmin),
     .m_max_o          (cfg_mmax),
-    .ctrl_o           (),
     .search_mode_o    (search_mode),
     .reduce_sel_o     (reduce_sel),
     .estop_hold_o     (estop_hold),
@@ -308,6 +309,7 @@ module adaptive_sweep (
     .estop_sel_o      (cfg_estop_sel),
     .m_o              (cfg_m),
     .ckmon_o          (cfg_ckmon),
+    .nmul_o           (cfg_nmul),
     .density_o        (cfg_density),
     .confirm_o        (cfg_confirm),
     .drift_i          (ac_drift),
@@ -402,7 +404,7 @@ module adaptive_sweep (
 
   wire point_arm = start_now | pf_freq_valid | eng_probe_arm;
 
-  amp_calc u_amp_calc (
+  amp_calc #(.POW2_DIV_ONLY(POW2_DIV_ONLY)) u_amp_calc (
     .clk               (clk),
     .rst_n             (rst_n),
     .s_axis_tvalid     (s_axis_tvalid),
@@ -472,7 +474,7 @@ module adaptive_sweep (
     .cnt_o      (log_cnt)
   );
 
-  wire [127:0] grid_data;
+  wire [63:0] grid_data;
   wire grid_valid;
   wire [63:0] search_data;
   wire search_valid;
@@ -543,7 +545,6 @@ module adaptive_sweep (
     .freq_word     (pf_freq_word),
     .freq_valid    (pf_freq_valid),
     .finish        (pf_finish),
-    .max_amplitude (max_amplitude),
     .freq_at_max   (freq_at_max),
     .best_mean_i   (pf_best_mean_i),
     .best_mean_q   (pf_best_mean_q),
@@ -601,6 +602,7 @@ module adaptive_sweep (
   (* mark_debug = "true" *) reg [5:0] cap_kp1_dbg;
   (* mark_debug = "true" *) reg [4:0] cap_sft_dbg;
   (* mark_debug = "true" *) reg [15:0] nconv_cnt_dbg;
+  (* mark_debug = "true" *) reg [2:0] cfg_nmul_dbg;
   always @(posedge clk) begin
     if (!rst_n) begin
       qtag_en_dbg <= 1'b0;
@@ -654,6 +656,7 @@ module adaptive_sweep (
       cap_kp1_dbg <= 6'd0;
       cap_sft_dbg <= 5'd0;
       nconv_cnt_dbg <= 16'd0;
+      cfg_nmul_dbg <= 3'd0;
     end else begin
       qtag_en_dbg <= qtag_en_i;
       qtag_op_dbg <= qtag_op_i;
@@ -706,6 +709,7 @@ module adaptive_sweep (
       cap_kp1_dbg <= cap_kp1_r;
       cap_sft_dbg <= cap_sft_r;
       nconv_cnt_dbg <= nconv_cnt;
+      cfg_nmul_dbg <= cfg_nmul;
     end
   end
 

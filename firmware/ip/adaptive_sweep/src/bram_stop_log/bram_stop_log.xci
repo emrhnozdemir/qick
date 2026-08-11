@@ -4,7 +4,7 @@
     "xci_name": "bram_stop_log",
     "component_reference": "xilinx.com:ip:blk_mem_gen:8.4",
     "ip_revision": "6",
-    "gen_directory": ".",
+    "gen_directory": "../../../../../../../../../users/emirh/desktop/qick/firmware/projects/qick_tprocv2_4x2_standard/top/top.tmp/adaptive_sweep_v1_0_project/adaptive_sweep_v1_0_project.gen/sources_1/ip/bram_stop_log",
     "parameters": {
       "component_parameters": {
         "Component_Name": [ { "value": "bram_stop_log", "resolve_type": "user", "usage": "all" } ],
@@ -174,11 +174,11 @@
         "IPCONTEXT": [ { "value": "IP_Flow" } ],
         "IPREVISION": [ { "value": "6" } ],
         "MANAGED": [ { "value": "TRUE" } ],
-        "OUTPUTDIR": [ { "value": "." } ],
+        "OUTPUTDIR": [ { "value": "../../../../../../../../../users/emirh/desktop/qick/firmware/projects/qick_tprocv2_4x2_standard/top/top.tmp/adaptive_sweep_v1_0_project/adaptive_sweep_v1_0_project.gen/sources_1/ip/bram_stop_log" } ],
         "SELECTEDSIMMODEL": [ { "value": "" } ],
         "SHAREDDIR": [ { "value": "." } ],
         "SWVERSION": [ { "value": "2023.1" } ],
-        "SYNTHESISFLOW": [ { "value": "OUT_OF_CONTEXT" } ]
+        "SYNTHESISFLOW": [ { "value": "GLOBAL" } ]
       }
     },
     "boundary": {

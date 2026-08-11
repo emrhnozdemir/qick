@@ -29,7 +29,9 @@ module stop_log (
   );
 
   always @(posedge clk) begin
-    if (rd_en_i) begin
+    if (!rst_n) begin
+      rd_addr_r <= 12'd0;
+    end else if (rd_en_i) begin
       rd_addr_r <= rd_addr_i;
     end else begin
       rd_addr_r <= rd_addr_r;

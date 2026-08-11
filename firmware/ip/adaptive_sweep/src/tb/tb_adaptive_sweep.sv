@@ -11,13 +11,13 @@ module tb_adaptive_sweep;
 
   localparam [31:0] CTRL_SHIFT = 32'h0000_0022;
   localparam [31:0] CTRL_MADSTOP = 32'h0000_0062;
-  localparam [31:0] CTRL_RAW = 32'h0000_0000;
+  localparam [31:0] CTRL_MEAN32 = 32'h0000_0006;
   localparam [31:0] CTRL_MEAN = 32'h0000_0024;
-  localparam [31:0] CTRL_SPLIT = 32'h0002_0CC6;
-  localparam [31:0] CTRL_SPLIT_HOLD = 32'h0002_0CD6;
-  localparam [31:0] CTRL_CKDIFF = 32'h0002_0D46;
-  localparam [31:0] CTRL_HSPLIT = 32'h0003_4CC6;
-  localparam [31:0] CTRL_QUARTER = 32'h0005_8CC6;
+  localparam [31:0] CTRL_SPLIT = 32'h0004_0CC6;
+  localparam [31:0] CTRL_SPLIT_HOLD = 32'h0004_0CD6;
+  localparam [31:0] CTRL_CKDIFF = 32'h0004_0D46;
+  localparam [31:0] CTRL_HSPLIT = 32'h0006_8CC6;
+  localparam [31:0] CTRL_QUARTER = 32'h000B_0CC6;
 
   reg clk;
   reg s_axi_aclk;
@@ -233,17 +233,6 @@ module tb_adaptive_sweep;
     end
   endtask
 
-  task automatic check128(input string name, input [127:0] got, input [127:0] exp);
-    begin
-      if (got !== exp) begin
-        $display("FAIL %0s: got %0d (0x%032x), expected %0d (0x%032x)", name, got, got, exp, exp);
-        errors = errors + 1;
-      end else begin
-        $display("PASS %0s = %0d (0x%032x)", name, got, got);
-      end
-    end
-  endtask
-
   task automatic qp2_op(input [4:0] op, input [31:0] d1, input [31:0] d2, input [31:0] d3, input [31:0] d4);
     begin
       @(posedge clk);
@@ -415,7 +404,6 @@ module tb_adaptive_sweep;
   reg [31:0] status_t0;
   reg [31:0] n_used_t1, n_used_t2;
   reg [31:0] status_t1, status_t2;
-  reg [127:0] raw_sum_expect;
   integer grid_before, search_before;
   reg [31:0] tl_probes [0:9];
   integer tl_i;
@@ -511,7 +499,7 @@ module tb_adaptive_sweep;
     wait_finish;
     check32("T0 peak freq_word", qtag_dt1_o, START_FREQ + 2 * STEP);
     check32("T0 rdy after finish", {31'd0, qtag_rdy_o}, 32'd1);
-    check128("T0 peak power", dut.u_peak_finder_wide.max_amplitude, 128'd250000);
+    check64("T0 peak power", dut.u_peak_finder_wide.max_amplitude, 64'd250000);
 
     qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T0 result survives a late OP10", qtag_dt1_o,
@@ -573,7 +561,7 @@ module tb_adaptive_sweep;
     status_t2 = qtag_dt1_o;
     check32("T2 n_used (AXI table)", n_used_t2, 32'd4);
     check32("T2 early_stop (AXI table)", {31'd0, status_t2[8]}, 32'd1);
-    check128("T2 stopped-epoch power", dut.u_peak_finder_wide.max_amplitude, 128'd10201);
+    check64("T2 stopped-epoch power", dut.u_peak_finder_wide.max_amplitude, 64'd10201);
 
     axi_tbl_write(2'd2, 6'd1, 32'hFFFF_FFFF, 14'h3FFF, 7'd0);
     repeat (40) @(posedge clk);
@@ -590,24 +578,20 @@ module tb_adaptive_sweep;
     check32("T2b n_used (n=2 epoch)", qtag_dt1_o, 32'd2);
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T2b early_stop", {31'd0, qtag_dt1_o[8]}, 32'd1);
-    check128("T2b n=2 epoch power", dut.u_peak_finder_wide.max_amplitude, 128'd10201);
+    check64("T2b n=2 epoch power", dut.u_peak_finder_wide.max_amplitude, 64'd10201);
 
-    raw_sum_expect = 128'd4 * 128'd500 * 128'd128;
-    raw_sum_expect = raw_sum_expect * raw_sum_expect;
-
-    qp2_op(5'd2, NSAMP, CTRL_RAW, 32'd0, 32'd0);
-    qp2_op(5'd0, START_FREQ, STEP, N_POINTS, AVG_T0);
+    qp2_op(5'd2, NSAMP, CTRL_MEAN32, 32'd0, 32'd0);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd1);
     qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
 
-    for (p = 0; p < 5; p = p + 1)
-      feed_point(AVG_T0, amp_of_point[p], 0);
+    feed_point(1, 32'h7FFF_FFFF, 32'h8000_0000);
 
     wait_finish;
-    check32("T3 raw-sum peak freq_word", qtag_dt1_o, START_FREQ + 2 * STEP);
-    check128("T3 raw-sum peak power", dut.u_peak_finder_wide.max_amplitude, raw_sum_expect);
+    check32("T3 rail peak freq_word", qtag_dt1_o, START_FREQ);
+    check64("T3 int32 rail power", dut.u_peak_finder_wide.max_amplitude, 64'h7FFF_FFFF_0000_0001);
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
-    check32("T3 status reduce_sel", {29'd0, qtag_dt1_o[6:4]}, 32'd0);
+    check32("T3 status reduce_sel", {29'd0, qtag_dt1_o[6:4]}, 32'd3);
     check32("T3 status prescale_en", {31'd0, qtag_dt1_o[9]}, 32'd0);
 
     qp2_op(5'd2, NSAMP, CTRL_MEAN, 32'd0, 32'd0);
@@ -617,7 +601,7 @@ module tb_adaptive_sweep;
     feed_alternating(AVG_T0, 100 * 128, 102 * 128);
     wait_finish;
 
-    check128("T4 running-mean power", dut.u_peak_finder_wide.max_amplitude, 128'd10201);
+    check64("T4 running-mean power", dut.u_peak_finder_wide.max_amplitude, 64'd10201);
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T4 status reduce_sel", {29'd0, qtag_dt1_o[6:4]}, 32'd2);
@@ -651,7 +635,7 @@ module tb_adaptive_sweep;
     wait_finish;
 
     check32("T6 split freq", qtag_dt1_o, START_FREQ);
-    check128("T6 split power", dut.u_peak_finder_wide.max_amplitude, 128'd1250000);
+    check64("T6 split power", dut.u_peak_finder_wide.max_amplitude, 64'd1250000);
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T6 n_used", qtag_dt1_o, 32'd8);
@@ -675,7 +659,7 @@ module tb_adaptive_sweep;
     feed_point(64, 1000, 500);
     wait_finish;
 
-    check128("T6b drain power", dut.u_peak_finder_wide.max_amplitude, 128'd1250000);
+    check64("T6b drain power", dut.u_peak_finder_wide.max_amplitude, 64'd1250000);
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T6b n_used", qtag_dt1_o, 32'd8);
@@ -688,7 +672,7 @@ module tb_adaptive_sweep;
     feed_point(64, -1500, 250);
     wait_finish;
 
-    check128("T7 ckdiff power", dut.u_peak_finder_wide.max_amplitude, 128'd2312500);
+    check64("T7 ckdiff power", dut.u_peak_finder_wide.max_amplitude, 64'd2312500);
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T7 n_used", qtag_dt1_o, 32'd16);
@@ -704,7 +688,7 @@ module tb_adaptive_sweep;
     feed_point(64, 999, -999);
     wait_finish;
 
-    check128("T8 hsplit power", dut.u_peak_finder_wide.max_amplitude, 128'd1996002);
+    check64("T8 hsplit power", dut.u_peak_finder_wide.max_amplitude, 64'd1996002);
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T8 n_used", qtag_dt1_o, 32'd12);
@@ -723,7 +707,7 @@ module tb_adaptive_sweep;
     feed_alternating(100, 128000, 64000);
     wait_finish;
 
-    check128("T9 cap power", dut.u_peak_finder_wide.max_amplitude, 128'd9216000000);
+    check64("T9 cap power", dut.u_peak_finder_wide.max_amplitude, 64'd9216000000);
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T9 n_used", qtag_dt1_o, 32'd100);
@@ -745,7 +729,7 @@ module tb_adaptive_sweep;
     wait_finish;
 
     check32("TQ1 quarter freq", qtag_dt1_o, START_FREQ);
-    check128("TQ1 quarter power", dut.u_peak_finder_wide.max_amplitude, 128'd5000000);
+    check64("TQ1 quarter power", dut.u_peak_finder_wide.max_amplitude, 64'd5000000);
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ1 n_used", qtag_dt1_o, 32'd16);
@@ -764,7 +748,7 @@ module tb_adaptive_sweep;
     feed_point(64, -3000, 700);
     wait_finish;
 
-    check128("TQ2 m5 power", dut.u_peak_finder_wide.max_amplitude, 128'd9490000);
+    check64("TQ2 m5 power", dut.u_peak_finder_wide.max_amplitude, 64'd9490000);
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ2 n_used", qtag_dt1_o, 32'd20);
@@ -782,7 +766,7 @@ module tb_adaptive_sweep;
     feed_point(64, 511, -512);
     wait_finish;
 
-    check128("TQ3 m7 power", dut.u_peak_finder_wide.max_amplitude, 128'd523265);
+    check64("TQ3 m7 power", dut.u_peak_finder_wide.max_amplitude, 64'd523265);
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ3 n_used", qtag_dt1_o, 32'd28);
@@ -800,7 +784,7 @@ module tb_adaptive_sweep;
     feed_point(64, 100000, 100000);
     wait_finish;
 
-    check128("TQ4 m3 power", dut.u_peak_finder_wide.max_amplitude, 128'd20000000000);
+    check64("TQ4 m3 power", dut.u_peak_finder_wide.max_amplitude, 64'd20000000000);
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TQ4 n_used", qtag_dt1_o, 32'd24);

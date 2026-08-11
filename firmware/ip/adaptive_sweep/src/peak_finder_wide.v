@@ -11,7 +11,7 @@ module peak_finder_wide (
   input wire mode,
 
   input wire amp_valid,
-  input wire [127:0] amp_data,
+  input wire [63:0] amp_data,
   input wire [31:0] mean_i_i,
   input wire [31:0] mean_q_i,
 
@@ -19,7 +19,6 @@ module peak_finder_wide (
   (* mark_debug = "true" *) output reg freq_valid,
   (* mark_debug = "true" *) output reg finish,
 
-  (* mark_debug = "true" *) output reg [127:0] max_amplitude,
   (* mark_debug = "true" *) output reg [31:0] freq_at_max,
   output reg [31:0] best_mean_i,
   output reg [31:0] best_mean_q,
@@ -31,6 +30,8 @@ module peak_finder_wide (
   (* mark_debug = "true" *) reg [1:0] state;
   reg [1:0] next_state;
   (* mark_debug = "true" *) reg [31:0] cur_freq, cur_step, n_pts;
+
+  (* mark_debug = "true" *) reg [63:0] max_amplitude;
 
   (* mark_debug = "true" *) reg last_point_r;
   (* mark_debug = "true" *) reg mode_r;
@@ -69,7 +70,7 @@ module peak_finder_wide (
       freq_word <= 32'd0;
       freq_valid <= 1'b0;
       finish <= 1'b0;
-      max_amplitude <= {128{1'b0}};
+      max_amplitude <= {64{1'b0}};
       freq_at_max <= 32'd0;
       best_mean_i <= 32'd0;
       best_mean_q <= 32'd0;
@@ -92,7 +93,7 @@ module peak_finder_wide (
           point_idx <= 32'd0;
           last_point_r <= (32'd1 >= n_points);
           mode_r <= mode;
-          max_amplitude <= mode ? {128{1'b1}} : {128{1'b0}};
+          max_amplitude <= mode ? {64{1'b1}} : {64{1'b0}};
           freq_at_max <= 32'd0;
           best_mean_i <= 32'd0;
           best_mean_q <= 32'd0;

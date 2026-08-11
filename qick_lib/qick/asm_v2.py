@@ -370,24 +370,29 @@ _AS_OPS = {
                     Field("estop_sel", 2, 7),
                     Field("m", 4, 9),
                     Field("ckmon_en", 1, 13),
-                    Field("density", 2, 14),
-                    Field("confirm", 3, 16)),
+                    Field("nmul", 3, 14),
+                    Field("confirm", 3, 17)),
             "dt3": _word("n0"),
             "dt4": _word("n_min"),
         },
         doc="nsamp and the CTRL word: mode (0 peak/1 dip); reduce_sel "
-            "(0 raw 64-bit sum / 1 round-shift / 2 running mean / 3 exact "
-            "32-bit mean of raw shot sums, divided by the realized shot count "
-            "at retirement); estop_hold (0 immediate emit / 1 "
+            "(1 round-shift / 2 running mean / 3 exact 32-bit mean of raw "
+            "shot sums, divided by the realized shot count at retirement; "
+            "0 is reserved - the raw-sum reduction was removed with the "
+            "128-bit power bus); estop_hold (0 immediate emit / 1 "
             "freeze-and-drain); prescale_en (stage-1 round-shift by "
             "flog2(nsamp)); estop_en; estop_sel (0 mad threshold table / "
             "1 split family / 2 ckdiff / 3 reserved); m (split-family "
             "precision: pass iff |dI|+|dQ| <= (|SI|+|SQ|)>>m); ckmon_en (run "
             "the ckdiff test as a drift monitor beside the split stopper); "
-            "density (checkpoint grid for estop_sel=1: 0 octave 4,8,16,..., "
-            "1 half-octave +3*2^j, 2 quarter-octave {1,3,5,7}*2^j from 8); "
+            "nmul (how many odd multipliers the checkpoint grid uses, so "
+            "every checkpoint is N = m*2^k with m drawn from the first nmul "
+            "of {1,3,5,7}: 0 or 1 = powers of two only 4,8,16,... and the "
+            "retirement divide degenerates to a pure shift, 2 = {1,3} "
+            "half-octave, 4 = {1,3,5,7} quarter-octave from 8; 4 is the "
+            "maximum); "
             "confirm (consecutive passing checkpoints required to stop; the "
-            "presets send 2/3/5 for octave/half/quarter). dt3 = n0 "
+            "presets send 2/3/5 for nmul 0/2/4). dt3 = n0 "
             "(running-mean warmup), dt4 = n_min (mad: first tested epoch, 0 "
             "disables; split family: eligibility floor, any value, 0 makes "
             "every checkpoint eligible)",
@@ -557,33 +562,33 @@ ADAPTIVE_SWEEP = QP2Accel(
     # One shared datapath (src/amp_calc.v): a single 64-bit accumulator whose
     # post-processing is MUX-selected, with the early stop as an independent
     # enable.  A calc name is therefore a CTRL preset, not a hardware index.
-    calcs=("acc64", "shift", "welford", "madstop",
+    calcs=("shift", "welford", "madstop",
            "split", "ckdiff", "hsplit", "quarter"),
     calc_ctrl={
-        "acc64":   dict(reduce_sel=0, prescale_en=0, estop_en=0),
         "shift":   dict(reduce_sel=1, prescale_en=1, estop_en=0),
         "welford": dict(reduce_sel=2, prescale_en=1, estop_en=0),
         "madstop": dict(reduce_sel=1, prescale_en=1, estop_en=1),
         # repetition-axis early stops: raw 32-bit shot sums into the mean32
         # reduction (exact divide by the realized shot count at retirement).
-        # split, hsplit and quarter are the same decision module at three
-        # checkpoint densities (estop_sel=1 + density), with the confirm
-        # depth the calibration demands for each grid; ckdiff is its own
-        # module.  The precision m and the ckmon monitor bit are user
-        # parameters (plan.m / plan.ckmon), not preset values, so they are
-        # packed separately by _config.
+        # split, hsplit and quarter are the SAME decision module at three
+        # checkpoint grids (estop_sel=1 + nmul), with the confirm depth the
+        # calibration demands for each grid; they are named presets over
+        # nmul, and adaptive_sweep(nmul=...) reaches the same settings
+        # directly.  ckdiff is its own module and is always on the doubling
+        # grid, so it takes no nmul.  The precision m and the ckmon monitor
+        # bit are user parameters (plan.m / plan.ckmon), not preset values,
+        # so they are packed separately by _config.
         "split":   dict(reduce_sel=3, prescale_en=0, estop_en=1, estop_sel=1,
-                        density=0, confirm=2),
+                        nmul=0, confirm=2),
         "ckdiff":  dict(reduce_sel=3, prescale_en=0, estop_en=1, estop_sel=2,
-                        confirm=2),
+                        nmul=0, confirm=2),
         "hsplit":  dict(reduce_sel=3, prescale_en=0, estop_en=1, estop_sel=1,
-                        density=1, confirm=3),
+                        nmul=2, confirm=3),
         "quarter": dict(reduce_sel=3, prescale_en=0, estop_en=1, estop_sel=1,
-                        density=2, confirm=5),
+                        nmul=4, confirm=5),
     },
-    # the engine consumes search_data[63:0], sized for the mean32 calcs'
-    # 2^63 maximum power; only acc64 is excluded - its raw-sum power can
-    # exceed 64 bits, and result_router saturates it to a flat ceiling
+    # the whole result path is 64 bits wide now, sized for the mean32
+    # calcs' 2^63 maximum power, so every calc can drive the gd/kw engine
     gdkw_calcs=("shift", "welford", "madstop",
                 "split", "ckdiff", "hsplit", "quarter"),
     lut_depth=64,
@@ -592,6 +597,13 @@ ADAPTIVE_SWEEP = QP2Accel(
 
 
 ACCELS = {a.name: a for a in (FINE_TUNING_SWEEP, ADAPTIVE_SWEEP)}
+
+# Confirm depth is calibrated per checkpoint grid, not a free choice: 2 / 3 / 5
+# for nmul 0 / 2 / 4 all span exactly one doubling of N (4->8, 4->6->8,
+# 8->10->12->14->16).  A shallower streak on a finer grid stops too close to
+# the test boundary and the achieved error degrades (quarter at confirm 4:
+# err>2t 6.7% against the 3.5-4.5% baseline).
+_AS_NMUL_CONFIRM = {0: 2, 1: 2, 2: 3, 4: 5}
 
 
 def get_accel(name):
@@ -834,6 +846,8 @@ class SweepPlan:
     emit_mode: int = 0
     m: int = 0
     ckmon: int = 0
+    nmul: int = 0
+    confirm: int = 0
     avg_requested: int = 0
     avg_rounded: int = 0
     dump_log: int = 0
@@ -1017,7 +1031,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                avg=1, nsamp=None, mode="peak",
                trig_time=0.0, shot_period=None,
                n0=None, n_min=None, thr_table=None, emit_mode=None,
-               m=None, ckmon=False,
+               m=None, ckmon=False, nmul=None,
                x0=None, min_step=None, max_iter=None, patience=None,
                a_table=None, c_table=None,
                use_lut=None, lambda_=0, m_min=2, m_max=8,
@@ -1237,6 +1251,9 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         _require(m is None,
                  "m only applies to the split-family calcs; madstop's "
                  "precision lives in its threshold table")
+        _require(nmul is None,
+                 "nmul only applies to the split-family calcs; madstop tests "
+                 "at power-of-two epochs by construction")
         _require(not ckmon, "ckmon only applies to calc='split'")
     elif calc in ("split", "ckdiff", "hsplit", "quarter"):
         _require(thr_table is None, "thr_table only applies to calc='madstop'")
@@ -1286,7 +1303,34 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                  "ckmon=True runs the ckdiff test as a drift monitor beside "
                  "the split stopper, so it only applies to calc='split'")
         plan.ckmon = 1 if ckmon else 0
+        # nmul says how many odd multipliers the checkpoint grid uses, so
+        # every checkpoint is N = m*2^k with m from the first nmul of
+        # {1,3,5,7}.  0 or 1 keeps every checkpoint a power of two, which
+        # also makes the retirement divide a pure shift (no reciprocal
+        # multiply at all).  It is the same knob the split / hsplit /
+        # quarter preset names set, exposed directly so a test can sweep the
+        # grid without changing calc.
+        if nmul is None:
+            plan.nmul = plan.calc_fields.get("nmul", 0)
+        else:
+            _require(calc != "ckdiff",
+                     "nmul does not apply to calc='ckdiff': its test compares "
+                     "a sum against twice the previous checkpoint's sum, which "
+                     "is only meaningful on the doubling grid")
+            nmul = int(nmul)
+            _require(nmul in (0, 1, 2, 4),
+                     "nmul must be 0 or 1 (powers of two only), 2 ({1,3}) or "
+                     "4 ({1,3,5,7}); 4 is the maximum the checkpoint "
+                     "generator and the reciprocal ROM implement, got %s"
+                     % (nmul,))
+            plan.nmul = nmul
+            plan.calc_fields["nmul"] = nmul
+            plan.calc_fields["confirm"] = _AS_NMUL_CONFIRM[nmul]
+        plan.confirm = plan.calc_fields.get("confirm", 0)
     else:
+        _require(nmul is None,
+                 "nmul only applies to the split-family calcs (split, hsplit, "
+                 "quarter); it selects their checkpoint grid")
         _require(thr_table is None, "thr_table only applies to calc='madstop'")
         _require(n_min is None,
                  "n_min only applies to calc='madstop' and the "
@@ -2350,9 +2394,11 @@ class QpbPoll(Macro):
 class AdaptiveSweep(Macro):
     """A whole co-processor-accelerated sweep, as one macro.
 
-    ``expand()`` produces the entire sequence: configuration ops, any table
-    loads, the waveform-memory seed, the RUN op, the service loop that fires
-    shots, and the result read-back into data memory.
+    ``expand()`` produces the entire sequence: configuration ops, the
+    waveform-memory seed, the RUN op, the service loop that fires shots, and the
+    result read-back into data memory. It does NOT load the threshold or
+    schedule tables -- those reach the IP only over AXI-Lite, through the
+    ``Adaptive_Sweep`` driver's ``load_tables(plan)``.
 
     The child macros are built during ``preprocess()`` rather than ``expand()``
     because some of them are timed (``Pulse``, ``Trigger``, ``Delay``) and have
@@ -4579,7 +4625,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             ``"kw"`` (gradient-descent or Kiefer-Wolfowitz search, where each
             frequency arrives through a handshake).
         calc : str
-            Measurement scheme: ``"acc64"``, ``"shift"``, ``"welford"``,
+            Measurement scheme: ``"shift"``, ``"welford"``,
             ``"madstop"``, ``"split"``, ``"ckdiff"``, ``"hsplit"``, or
             ``"quarter"``.  Defaults to the accelerator's only option, or
             ``"shift"``.  On ``adaptive_sweep`` these are presets over one
@@ -4593,7 +4639,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             can be any value up to 2^20).  ``split``, ``hsplit`` and
             ``quarter`` are one test at three checkpoint densities - octave
             (4, 8, 16, ..., confirm 2), half-octave (+3*2^j, confirm 3) and
-            quarter-octave ({1,3,5,7}*2^j from 8, confirm 5); each step up
+            quarter-octave ({1,3,5,7}*2^j from 8, confirm 5) -- the same
+            three settings ``nmul`` reaches directly; each step up
             trades more looks against a deeper confirmation streak, worth
             roughly 1.2x shots for ``hsplit`` and a further 2-4% for
             ``quarter``.  The split test cannot detect slow drift (pair
@@ -4659,6 +4706,23 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             relative error is distributional (median ~0.55*2^-m, ~4% of
             points beyond 2*2^-m), so ask for one m higher than a hard
             requirement.
+        nmul : int
+            How many odd multipliers the split-family checkpoint grid uses,
+            so every checkpoint is ``N = m * 2^k`` with ``m`` drawn from the
+            first ``nmul`` of ``{1, 3, 5, 7}``.  ``0`` or ``1`` keeps every
+            checkpoint a power of two -- and with it the retirement divide
+            becomes a pure shift, no reciprocal multiply at all.  ``2``
+            adds ``3*2^k`` (half-octave), ``4`` adds ``5*2^k`` and ``7*2^k``
+            (quarter-octave); 4 is the maximum the checkpoint generator and
+            the reciprocal ROM implement.  Overrides whichever grid the calc
+            name implies, and moves ``confirm`` to that grid's calibrated
+            depth (2 / 3 / 5), so ``calc="split", nmul=4`` is
+            ``calc="quarter"``.  Leave unset to take the calc's own grid.
+            This is a runtime CTRL field: switching it needs no new
+            bitstream.  (The RTL also has a build-time
+            ``POW2_DIV_ONLY`` parameter that removes the reciprocal
+            multiplier entirely; that one does need a rebuild, and forces
+            nmul to 0.)
         ckmon : bool
             For ``calc="split"`` only: also evaluate the ckdiff test as a
             drift monitor.  A split stop whose checkpoint fails the monitor
