@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 #
 # Each accelerator therefore has an *opcode map*: for every operation, which
 # named fields live in which dt word and at which bit offset.  That map is pure
-# data, so it is kept as data -- adding an accelerator, or an operation on an
+# data, so it is kept as data, adding an accelerator, or an operation on an
 # existing one, means adding a table entry rather than writing code.
 #
 # The two entries below are transcribed from the RTL, not from documentation:
@@ -181,7 +181,7 @@ class QP2Accel:
     gdkw_calcs : tuple of str
         Subset of ``calcs`` usable with the GD/KW engine.  The engine consumes
         a 64-bit power (sized for the 32-bit-mean schemes); only a scheme
-        whose power can exceed that (the raw 64-bit sum) is excluded -- the
+        whose power can exceed that (the raw 64-bit sum) is excluded, the
         router saturates it rather than wrapping, but it is still wrong.
     lut_depth : int
         Depth of the a/c schedule LUTs (0 if absent).
@@ -284,7 +284,7 @@ def unpack_fields(fields, word):
 # ---------------------------------------------------------------------------
 # Transcribed from firmware/ip/fine_tuning_sweep/src/fine_tuning_sweep.v.
 # The whole opcode surface is three ops: the RTL decodes only op 0, 1 and 2
-# (lines 35, 58, 65).  There is NO status-read op -- the only response the IP
+# (lines 35, 58, 65).  There is NO status-read op, the only response the IP
 # ever produces is the end-of-sweep one (lines 91-94: on pf_finish, dt1_o gets
 # the peak/dip freq word, dt2_o is zero, vld_o rises).  A program therefore
 # learns the result by polling READY high, then bit_qpb_new, then reading
@@ -644,7 +644,7 @@ CTRL_CLR_ARITH = 0x1_0000
 #: s_core_r1 read would return nothing.  Always rewrite the full word.
 QPB_ACK = CTRL_CLR_QPB | CFG_SRC_QPB
 #: Clear the ARITH response *and* hand the source select back to the QP2
-#: peripheral, in one write -- for the same reason ``QPB_ACK`` keeps the select.
+#: peripheral, in one write, for the same reason ``QPB_ACK`` keeps the select.
 ARITH_ACK_TO_QPB = CTRL_CLR_ARITH | CFG_SRC_QPB
 
 #: The nine forms of ``(D +/- A) * B +/- C`` the ARITH unit implements, mapped
@@ -690,7 +690,7 @@ DONE_SENTINEL = 0x600D
 #: Largest data-memory address a *literal* ``DMEM_WR [&N]`` can reach.  The
 #: address field is 11 bits, encoded signed (tprocv2_assembler.py:1320 calls
 #: ``integer2bin(..., 11)`` with the default signed flag).  Register-addressed
-#: accesses -- which the staged table loop uses -- are not limited this way.
+#: accesses, which the staged table loop uses, are not limited this way.
 LITERAL_DMEM_MAX = 1023
 
 
@@ -904,13 +904,13 @@ class SweepPlan:
 
         The word is reduced modulo the generator's DDS width first, because
         that is what the generator itself does with it, and the generator's
-        digital-mixer offset is added back -- ``gen_freq_word`` subtracts it,
+        digital-mixer offset is added back, ``gen_freq_word`` subtracts it,
         so leaving it out here would report a frequency low by the mixer
         setting.
 
         Note that the accelerator walks its grid as ``start + k*step`` in
         register words, exactly as the tProcessor does, so the two never
-        disagree -- but the resulting grid is uniform in *words*, not exactly
+        disagree, but the resulting grid is uniform in *words*, not exactly
         uniform in MHz. Over a 2 GHz, 4000-point sweep the far end sits a few
         tens of kHz off the nominal frequency. This conversion reports where
         the tone actually was, so the answer itself carries no such error.
@@ -963,7 +963,7 @@ ARITH_B_BITS = 18
 #: (``wire [3:0] shift; assign shift = B_i[3:0];``,
 #: firmware/ip/qick_processor/src/_qproc_ips.sv:827-828).  That is a hardware
 #: truncation, so it applies to register operands too, not just to the
-#: assembler's literal check -- a shift of 19 silently becomes a shift of 3.
+#: assembler's literal check, a shift of 19 silently becomes a shift of 3.
 ALU_MAX_SHIFT = 15
 
 
@@ -984,7 +984,7 @@ def _ratio_scaling(ratio, max_delta):
     ``post`` is additionally constrained to ``[2, 15]``.  The upper bound is
     the ALU's 4-bit shift field.  The lower bound is because recombining the
     64-bit product needs the high word shifted left by ``32 - post``, which is
-    done as two shifts of at most 15 each -- so ``32 - post`` must not exceed
+    done as two shifts of at most 15 each, so ``32 - post`` must not exceed
     30.
 
     Returns
@@ -2152,7 +2152,7 @@ class Arith(Macro):
 
     The unit computes ``(D +/- A) * B +/- C`` and parks a 64-bit result inside
     the peripheral.  Reading it means pointing the peripheral source select at
-    ARITH and reading ``s_core_r1`` (low) and ``s_core_r2`` (high) -- the same
+    ARITH and reading ``s_core_r1`` (low) and ``s_core_r2`` (high), the same
     registers the custom peripheral uses, so the two cannot be in flight at
     once.
     """
@@ -2171,7 +2171,7 @@ class Arith(Macro):
 class LoopBack(Macro):
     """Test a counter and jump back to a label, incrementing on the way.
 
-    The tail of a counted loop, in two instructions -- the same form
+    The tail of a counted loop, in two instructions, the same form
     ``CloseLoop`` uses, but for a loop this library builds internally rather
     than one the user opened.
 
@@ -2397,12 +2397,12 @@ class AdaptiveSweep(Macro):
     ``expand()`` produces the entire sequence: configuration ops, the
     waveform-memory seed, the RUN op, the service loop that fires shots, and the
     result read-back into data memory. It does NOT load the threshold or
-    schedule tables -- those reach the IP only over AXI-Lite, through the
+    schedule tables, those reach the IP only over AXI-Lite, through the
     ``Adaptive_Sweep`` driver's ``load_tables(plan)``.
 
     The child macros are built during ``preprocess()`` rather than ``expand()``
     because some of them are timed (``Pulse``, ``Trigger``, ``Delay``) and have
-    their own preprocessing to do -- they need to walk the timeline in the same
+    their own preprocessing to do, they need to walk the timeline in the same
     pass as every other macro in the program.
     """
     # name, kwargs
@@ -2422,7 +2422,7 @@ class AdaptiveSweep(Macro):
     def expand(self, prog):
         return self.children
 
-    # -- shared pieces -----------------------------------------------------
+    #shared pieces -----------------------------------------------------
 
     def _label(self, prog, what):
         return prog._next_auto_label('%s_%s' % (self.name, what))
@@ -2489,7 +2489,7 @@ class AdaptiveSweep(Macro):
         asm.qpb_ack()
         accel = plan.accel
         # the answer is now safely in data memory, so release the peripheral's
-        # hold on it -- until this, every read is refused so that a poll the
+        # hold on it, until this, every read is refused so that a poll the
         # program had already issued could not overwrite the answer
         if accel.has_op('CLR_RESULT'):
             asm.qpb_send(accel, 'CLR_RESULT')
@@ -2524,7 +2524,7 @@ class AdaptiveSweep(Macro):
         # written last, so a host that sees it knows the rest is settled
         asm.write_dmem(addr=plan.result_addr + RESULT_DONE, src=DONE_SENTINEL)
 
-    # -- grid --------------------------------------------------------------
+    #grid --------------------------------------------------------------
 
     def _emit_grid(self, prog, asm, plan):
         accel = plan.accel
@@ -2562,7 +2562,7 @@ class AdaptiveSweep(Macro):
         asm.qpb_wait_new()
         self._store_result(prog, asm, plan, status_src=None)
 
-    # -- gd/kw handshake ---------------------------------------------------
+    #gd/kw handshake ---------------------------------------------------
 
     def _emit_handshake(self, prog, asm, plan):
         accel = plan.accel
@@ -2638,7 +2638,7 @@ class AdaptiveSweep(Macro):
             ro = ro_base + (((gen - gen_base) >> pre) * ratio) >> post
 
         The tProc ALU has no multiplier, so the product comes from the ARITH
-        unit -- a 27x18 DSP whose 46-bit result is read back sign-extended as a
+        unit, a 27x18 DSP whose 46-bit result is read back sign-extended as a
         low/high pair.  ``pre`` shrinks the drive delta into the 27-bit input
         and the host pre-scales ``ratio`` by ``2**(pre+post)`` to fit the
         18-bit one; :func:`_ratio_scaling` picks both as small
@@ -2660,7 +2660,7 @@ class AdaptiveSweep(Macro):
                                  tag='%s_arith' % (plan.name)))
         # (high << (32-post)) | (low >> post) is the low word of the 64-bit
         # product shifted right by post.  The ALU's shift amount is only four
-        # bits wide in hardware, so the left shift is split into two -- left
+        # bits wide in hardware, so the left shift is split into two left
         # shifts compose, and each half stays inside the field.
         hi_shift = 32 - plan.ro_post_shift
         first = min(ALU_MAX_SHIFT, hi_shift)
@@ -3251,7 +3251,7 @@ class AsmV2:
         arg2 : int or str or None
             Second operand: a literal (24-bit; wider values are staged through
             a scratch register) or a register name.
-            Note the assembler caps *literal* shift amounts at 15 -- pass a
+            Note the assembler caps *literal* shift amounts at 15, pass a
             register for larger shifts.
         """
         self.append_macro(AluReg(dst=dst, arg1=arg1, op=op, arg2=arg2))
@@ -4601,7 +4601,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         """Declare a sweep that runs on a QP2 co-processor.
 
         The accelerator owns the search: it decides which frequency to measure
-        next and where the optimum is.  The tProcessor owns the tone -- it
+        next and where the optimum is.  The tProcessor owns the tone, it
         writes waveform memory and fires shots.  This call validates the
         parameters, converts them from physical units to the register words the
         accelerator wants, and emits the whole program: configuration ops,
@@ -4639,7 +4639,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             can be any value up to 2^20).  ``split``, ``hsplit`` and
             ``quarter`` are one test at three checkpoint densities - octave
             (4, 8, 16, ..., confirm 2), half-octave (+3*2^j, confirm 3) and
-            quarter-octave ({1,3,5,7}*2^j from 8, confirm 5) -- the same
+            quarter-octave ({1,3,5,7}*2^j from 8, confirm 5), the same
             three settings ``nmul`` reaches directly; each step up
             trades more looks against a deeper confirmation streak, worth
             roughly 1.2x shots for ``hsplit`` and a further 2-4% for
@@ -4710,7 +4710,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             How many odd multipliers the split-family checkpoint grid uses,
             so every checkpoint is ``N = m * 2^k`` with ``m`` drawn from the
             first ``nmul`` of ``{1, 3, 5, 7}``.  ``0`` or ``1`` keeps every
-            checkpoint a power of two -- and with it the retirement divide
+            checkpoint a power of two, and with it the retirement divide
             becomes a pure shift, no reciprocal multiply at all.  ``2``
             adds ``3*2^k`` (half-octave), ``4`` adds ``5*2^k`` and ``7*2^k``
             (quarter-octave); 4 is the maximum the checkpoint generator and
@@ -4749,8 +4749,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             Iteration cap for gd/kw.
         patience : int
             Consecutive converged/tied iterations required to declare
-            convergence.  The default of 0 means *never converge* -- the RTL
-            gates the convergence flag on ``patience != 0`` -- so a gd/kw
+            convergence.  The default of 0 means *never converge*, the RTL
+            gates the convergence flag on ``patience != 0``, so a gd/kw
             search left at the default always runs to ``max_iter`` and reports
             itself capped.  Give it 1 or more to let the search stop early.
         a_table, c_table : list of float
