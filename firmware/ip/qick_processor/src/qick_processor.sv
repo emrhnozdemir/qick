@@ -38,8 +38,9 @@ module qick_processor # (
    input   wire            c_rst_ni       ,
    input   wire            ps_clk_i       ,
    input   wire            ps_rst_ni      ,
-// External Control  
-   input wire              ext_flag_i     , 
+// External Control
+   input wire              ext_flag_i     ,
+   input wire              interrupt_i    ,
    input  wire             proc_start_i   ,
    input  wire             proc_stop_i    ,
    input  wire             core_start_i   ,
@@ -133,6 +134,7 @@ reg  [31:0]    xreg_TPROC_STATUS, xreg_TPROC_DEBUG     ;
 reg  [31:0]    xreg_TPROC_W_DT [2];
 wire [ 7:0]    xreg_CORE_CFG;
 wire [ 7:0]    xreg_READ_SEL ;
+wire [31:0]    xreg_TPROC_IPC ;
 reg  [31:0]    xreg_TPROC_R_DT [2];
 
 // AXIS-INPUT
@@ -417,6 +419,7 @@ qproc_axi_reg QPROC_xREG (
    .TPROC_W_DT2      ( xreg_TPROC_W_DT [1] ) ,
    .CORE_CFG         ( xreg_CORE_CFG       ) ,
    .READ_SEL         ( xreg_READ_SEL       ) ,
+   .TPROC_IPC        ( xreg_TPROC_IPC      ) ,
    .MEM_DT_O         ( xreg_MEM_DT_O       ) ,
    .TPROC_R_DT1      ( xreg_TPROC_R_DT[0]  ) ,
    .TPROC_R_DT2      ( xreg_TPROC_R_DT[1]  ) ,
@@ -604,6 +607,8 @@ qproc_core # (
    .lfsr_o           ( core0_lfsr        ) ,    
    .port_dt_i        ( in_port_dt_r      ) , //ALL The port Values
    .flag_i           ( flag_c0           ) ,
+   .interrupt_i      ( interrupt_i       ) ,
+   .ipc_i            ( xreg_TPROC_IPC[PMEM_AW-1:0] ) ,
    .sreg_cfg_o       ( core0_cfg         ) ,
    .sreg_ctrl_o      ( core0_ctrl        ) ,
    .sreg_arith_i     ( arith_result[31:0] ) ,
@@ -663,8 +668,10 @@ generate
          .ps_clk_i         ( ps_clk_i          ) ,
          .ps_rst_ni        ( ps_rst_ni         ) ,
          .en_i             ( core_en           ) ,    
-         .restart_i        ( core_rst          ) ,    
-         .port_dt_i        ( in_port_dt_r      ) , 
+         .restart_i        ( core_rst          ) ,
+         .port_dt_i        ( in_port_dt_r      ) ,
+         .interrupt_i      ( 1'b0              ) ,
+         .ipc_i            ( '0                ) ,
          .sreg_arith_i     ( {arith_result[31:0],arith_result[63:32]}  ) ,
          .sreg_div_i       ( {div_quotient  ,div_remainder }  ) ,
          .sreg_status_i    ( sreg_status       ) ,

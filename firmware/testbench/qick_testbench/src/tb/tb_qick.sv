@@ -73,6 +73,8 @@ string TEST_OUT_CONNECTION = "TEST_OUT_LOOPBACK";     // Connect DAC/ADC in Loop
 // What feeds adaptive_sweep's s_axis (see the ADAPTIVE SWEEP section below)
 // string AS_STREAM_SRC       = "AS_SRC_AVGBUF";  // live readout -> avg_buffer m2
 string AS_STREAM_SRC       = "AS_SRC_IQFILE";  // replay <test>/iq_shots.mem
+integer run_us;
+initial if ($test$plusargs("AS_SRC_AVGBUF")) AS_STREAM_SRC = "AS_SRC_AVGBUF";
 //----------------------------------------------------
 
 // VIP Agents
@@ -281,6 +283,9 @@ wire [31:0] qp2_a_dt_o, qp2_b_dt_o, qp2_c_dt_o, qp2_d_dt_o;
 wire        qp2_rdy_i;
 wire        qp2_vld_i;
 
+// adaptive_sweep early-stop interrupt -> tProc IPC redirect
+wire        as_interrupt;
+
 
    // DAC-ADC connections
    logic                   axis_sg_dac_tready;
@@ -330,6 +335,7 @@ wire        qp2_vld_i;
    parameter REG_AXI_W_DT2       = 6  * 4 ;
    parameter REG_CORE_CFG        = 7  * 4 ;
    parameter REG_AXI_DT_SRC      = 8  * 4 ;
+   parameter REG_TPROC_IPC       = 9  * 4 ;
    parameter REG_MEM_DT_O        = 10  * 4 ;
    parameter REG_AXI_R_DT1       = 11  * 4 ;
    parameter REG_AXI_R_DT2       = 12  * 4 ;
@@ -393,6 +399,7 @@ wire        qp2_vld_i;
       .ps_resetn           ( s_ps_dma_aresetn   ) ,
       // External Control
       .ext_flag_i          ( ext_flag_i         ) ,
+      .interrupt_i         ( as_interrupt       ) ,
       .proc_start_i        ( proc_start_i       ) ,
       .proc_stop_i         ( proc_stop_i        ) ,
       .core_start_i        ( core_start_i       ) ,
@@ -1462,6 +1469,8 @@ wire        qp2_vld_i;
       .qtag_dt2_o    (qp2_dt_i[1]      ),
       .qtag_vld_o    (qp2_vld_i        ),
 
+      .interrupt_o   (as_interrupt     ),
+
       .s_axis_tvalid (as_s_axis_tvalid ),
       .s_axis_tready (/*unused*/       ),
       .s_axis_tdata  (as_s_axis_tdata  ),
@@ -1494,13 +1503,51 @@ wire        qp2_vld_i;
       if (u_adaptive_sweep.grid_valid) begin
          $display("*** %t - adaptive_sweep point %0d: freq_word=0x%08x power=%0d (iq cursor %0d)",
                   $realtime(), u_adaptive_sweep.pf_point_idx,
-                  u_adaptive_sweep.pf_freq_word, u_adaptive_sweep.grid_data[35:0],
+                  u_adaptive_sweep.pf_freq_word, u_adaptive_sweep.grid_data[63:0],
                   iqf_cursor);
       end
       if (u_adaptive_sweep.pf_finish) begin
          $display("*** %t - adaptive_sweep FINISH: best freq_word=0x%08x at point %0d",
                   $realtime(), u_adaptive_sweep.pf_freq_word, u_adaptive_sweep.pf_point_idx);
       end
+   end
+
+   // Early-stop interrupt protocol trace: every message of the handshake, plus
+   // the counts that show the tProc and the IP stayed in step.
+   integer as_trig_cnt = 0;   // readout windows the tProc actually asked for
+   integer as_word_cnt = 0;   // m2 words those windows produced
+   integer as_fold_cnt = 0;   // words the IP folded into a point
+   integer as_int_cnt  = 0;
+   reg     as_trig_d   = 1'b0;
+
+   always_ff @(posedge c_clk) begin
+      as_trig_d <= trigger_0;
+      if (trigger_0 & ~as_trig_d) as_trig_cnt <= as_trig_cnt + 1;
+      if (m2_c_tvalid) begin
+         as_word_cnt <= as_word_cnt + 1;
+         if ($test$plusargs("TRACE_M2"))
+            $display("*** %t - m2[%0d] I=%0d Q=%0d", $realtime(), as_word_cnt,
+                     $signed(m2_c_tdata[31:0]), $signed(m2_c_tdata[63:32]));
+      end
+      if (u_adaptive_sweep.u_amp_calc.u_shot_sequencer.count_en)
+         as_fold_cnt <= as_fold_cnt + 1;
+      if (u_adaptive_sweep.interrupt_o) begin
+         as_int_cnt <= as_int_cnt + 1;
+         $display("*** %t - INTERRUPT #%0d at point %0d shot %0d (trig %0d, words %0d, folded %0d)",
+                  $realtime(), as_int_cnt + 1, u_adaptive_sweep.pf_point_idx,
+                  u_adaptive_sweep.u_amp_calc.u_shot_sequencer.shot_cnt,
+                  as_trig_cnt, as_word_cnt, as_fold_cnt);
+      end
+      if (AXIS_QPROC.QPROC.CORE_0.CORE_CPU.int_take)
+         $display("*** %t - REDIRECT taken: PC <- %0d",
+                  $realtime(), AXIS_QPROC.QPROC.CORE_0.CORE_CPU.ipc_i);
+      if (u_adaptive_sweep.rearm_now)
+         $display("*** %t - REARM (op14): draining=%0b arm_pend=%0b dropped=%0d",
+                  $realtime(), u_adaptive_sweep.draining,
+                  u_adaptive_sweep.arm_pend, u_adaptive_sweep.drain_drop_cnt);
+      if (u_adaptive_sweep.point_arm)
+         $display("*** %t - point armed (idx %0d)", $realtime(),
+                  u_adaptive_sweep.pf_point_idx);
    end
 
 //--------------------------------------
@@ -1515,6 +1562,7 @@ logic tb_test_read_done;
 integer ro_length;
 integer ro_decimated_length;
 integer ro_average_length;
+integer tproc_ipc;
 
 initial begin
 
@@ -1635,7 +1683,11 @@ initial begin
    WRITE_AXI( REG_CORE_CFG , 2);
    #100ns;
 
-
+   // Interrupt vector: pmem address of the compiled program's landing block.
+   // 0 (the default) disarms the redirect, so programs without one are unchanged.
+   if (!$value$plusargs("IPC=%d", tproc_ipc)) tproc_ipc = 0;
+   WRITE_AXI( REG_TPROC_IPC , tproc_ipc);
+   $display("*** tProc IPC = %0d ***", tproc_ipc);
    #100ns;
 
    repeat (REPEAT_EXEC) begin
@@ -1675,6 +1727,11 @@ initial begin
    
    #1us;
 
+   $display("*** SUMMARY interrupts=%0d triggers=%0d m2_words=%0d folded=%0d dropped=%0d dmem[0]=0x%08x dmem[1]=0x%08x",
+            as_int_cnt, as_trig_cnt, as_word_cnt, as_fold_cnt,
+            u_adaptive_sweep.drain_drop_cnt,
+            AXIS_QPROC.QPROC.CORE_0.CORE_MEM.D_MEM.RAM[0],
+            AXIS_QPROC.QPROC.CORE_0.CORE_MEM.D_MEM.RAM[1]);
    $display("*** End Test ***");
    $finish();
 end
@@ -1726,7 +1783,8 @@ initial begin
       // there. With AS_SRC_AVGBUF the tProc paces the shots instead (976 shots
       // at shot_period; ~1ms for this window, ~64ms for the 4001-point grid) and
       // this has to be raised to match.
-      TEST_RUN_TIME        = 100us;
+      if ($value$plusargs("RUN_US=%d", run_us)) TEST_RUN_TIME = run_us * 1us;
+      else                                      TEST_RUN_TIME = 100us;
       TEST_READ_TIME       = 10us;
       REPEAT_EXEC          = 1;
 

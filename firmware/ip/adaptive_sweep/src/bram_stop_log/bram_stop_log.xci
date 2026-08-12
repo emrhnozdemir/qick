@@ -2,6 +2,7 @@
   "schema": "xilinx.com:schema:json_instance:1.0",
   "ip_inst": {
     "xci_name": "bram_stop_log",
+    "cell_name": "u_stop_log/u_mem",
     "component_reference": "xilinx.com:ip:blk_mem_gen:8.4",
     "ip_revision": "6",
     "gen_directory": "../../../../../../../../../users/emirh/desktop/qick/firmware/projects/qick_tprocv2_4x2_standard/top/top.tmp/adaptive_sweep_v1_0_project/adaptive_sweep_v1_0_project.gen/sources_1/ip/bram_stop_log",

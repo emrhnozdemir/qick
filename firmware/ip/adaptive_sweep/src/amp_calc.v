@@ -35,6 +35,7 @@ module amp_calc #(
 
   output wire warmup_done_o,
   output wire early_stop_o,
+  output wire early_pulse_o,
   output wire [31:0] n_used_o,
   output wire [45:0] dev_acc_o,
 
@@ -188,6 +189,8 @@ module amp_calc #(
     .early_o           (early_stop_o),
     .n_used_o          (n_used_o)
   );
+
+  assign early_pulse_o = (stop_now | stop_np_now) & ~estop_hold_i;
 
   wire signed [63:0] acc_i_d = {{31{xs_i_r[32]}}, xs_i_r};
   wire signed [63:0] acc_q_d = {{31{xs_q_r[32]}}, xs_q_r};

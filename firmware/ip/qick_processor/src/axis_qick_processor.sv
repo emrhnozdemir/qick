@@ -52,6 +52,7 @@ module axis_qick_processor # (
    input  wire                ps_resetn      ,
 // External Control
    input  wire                ext_flag_i     ,
+   input  wire                interrupt_i    ,
    input  wire                proc_start_i   ,
    input  wire                proc_stop_i    ,
    input  wire                core_start_i   ,
@@ -418,6 +419,7 @@ qick_processor# (
    .ps_rst_ni           ( ps_resetn             ) ,
 // CTRL 
    .ext_flag_i          ( ext_flag_i            ) ,
+   .interrupt_i         ( interrupt_i           ) ,
    .proc_start_i        ( proc_start_t01        ) ,
    .proc_stop_i         ( proc_stop_t01         ) ,
    .core_start_i        ( core_start_i          ) ,

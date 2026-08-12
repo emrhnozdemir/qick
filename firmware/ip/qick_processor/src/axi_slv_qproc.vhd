@@ -52,6 +52,7 @@ entity axi_slv_qproc is
         TPROC_W_DT2      : out std_logic_vector (31 downto 0) ;
         CORE_CFG         : out std_logic_vector (7 downto 0) ;
         READ_SEL         : out std_logic_vector (7 downto 0) ;
+        TPROC_IPC        : out std_logic_vector (31 downto 0) ;
         MEM_DT_O         : in  std_logic_vector (31 downto 0) ;
         TPROC_R_DT1      : in  std_logic_vector (31 downto 0) ;
         TPROC_R_DT2      : in  std_logic_vector (31 downto 0) ;
@@ -460,7 +461,7 @@ begin
 	-- 4 : TAVG_LOW_REG	(r).
 	-- 5 : TAVG_HIGH_REG(r).
 
-	process (slv_reg0, slv_reg1, slv_reg2, slv_reg3, slv_reg4, slv_reg5, slv_reg6, slv_reg7, slv_reg8, MEM_DT_O, TPROC_R_DT1, TPROC_R_DT2, TIME_USR, TPROC_STATUS, TPROC_DEBUG, axi_araddr, aresetn, slv_reg_rden)
+	process (slv_reg0, slv_reg1, slv_reg2, slv_reg3, slv_reg4, slv_reg5, slv_reg6, slv_reg7, slv_reg8, slv_reg9, MEM_DT_O, TPROC_R_DT1, TPROC_R_DT2, TIME_USR, TPROC_STATUS, TPROC_DEBUG, axi_araddr, aresetn, slv_reg_rden)
 	variable loc_addr :std_logic_vector(OPT_MEM_ADDR_BITS downto 0);
 	begin
 	    -- Address decoding for reading registers
@@ -485,7 +486,7 @@ begin
 	      when b"1000" =>
 	        reg_data_out <= slv_reg8;
 	      when b"1001" =>
-	        reg_data_out <= "00000000000000000000000000001001";
+	        reg_data_out <= slv_reg9;
 	      when b"1010" =>
 	        reg_data_out <= MEM_DT_O;
 	      when b"1011" =>
@@ -531,6 +532,7 @@ TPROC_W_DT1       <= slv_reg5(31 downto 0);
 TPROC_W_DT2       <= slv_reg6(31 downto 0);
 CORE_CFG          <= slv_reg7(7 downto 0);
 READ_SEL          <= slv_reg8(7 downto 0);
+TPROC_IPC         <= slv_reg9(31 downto 0);
 
 
 end rtl;

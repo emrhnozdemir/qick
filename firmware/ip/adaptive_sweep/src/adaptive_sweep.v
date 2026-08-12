@@ -17,6 +17,8 @@ module adaptive_sweep #(
   (* mark_debug = "true" *) output reg [31:0] qtag_dt2_o,
   (* mark_debug = "true" *) output reg qtag_vld_o,
 
+  (* mark_debug = "true" *) output wire interrupt_o,
+
   input wire s_axis_tvalid,
   output wire s_axis_tready,
   input wire [63:0] s_axis_tdata,
@@ -69,6 +71,7 @@ module adaptive_sweep #(
   wire getmean_rd = en_rise & (qtag_op_i == 5'd11);
   wire getlog_rd = en_rise & (qtag_op_i == 5'd12);
   wire cfg_capdiv = en_rise & (qtag_op_i == 5'd13);
+  wire rearm_now = en_rise & (qtag_op_i == 5'd14);
 
   reg [53:0] cap_mag_r;
   reg [5:0] cap_kp1_r;
@@ -402,7 +405,71 @@ module adaptive_sweep #(
       qtag_rdy_o <= qtag_rdy_o;
   end
 
-  wire point_arm = start_now | pf_freq_valid | eng_probe_arm;
+  (* mark_debug = "true" *) reg int_en;
+  (* mark_debug = "true" *) reg draining;
+  (* mark_debug = "true" *) reg arm_pend;
+  (* mark_debug = "true" *) reg [31:0] drain_drop_cnt;
+
+  wire ac_early_pulse;
+  wire drain_set = ac_early_pulse & int_en;
+  wire drain_now = (draining & ~rearm_now) | drain_set;
+  wire arm_req = pf_freq_valid | eng_probe_arm;
+
+  assign interrupt_o = drain_set;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      int_en <= 1'b0;
+    end else if (cfg_meas) begin
+      int_en <= 1'b0;
+    end else if (rearm_now) begin
+      int_en <= 1'b1;
+    end else begin
+      int_en <= int_en;
+    end
+  end
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      draining <= 1'b0;
+    end else if (start_now | run_gdkw) begin
+      draining <= 1'b0;
+    end else if (drain_set) begin
+      draining <= 1'b1;
+    end else if (rearm_now) begin
+      draining <= 1'b0;
+    end else begin
+      draining <= draining;
+    end
+  end
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      arm_pend <= 1'b0;
+    end else if (start_now | run_gdkw) begin
+      arm_pend <= 1'b0;
+    end else if (rearm_now) begin
+      arm_pend <= 1'b0;
+    end else if (arm_req & drain_now) begin
+      arm_pend <= 1'b1;
+    end else begin
+      arm_pend <= arm_pend;
+    end
+  end
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      drain_drop_cnt <= 32'd0;
+    end else if (start_now | run_gdkw) begin
+      drain_drop_cnt <= 32'd0;
+    end else if (drain_now & s_axis_tvalid) begin
+      drain_drop_cnt <= drain_drop_cnt + 32'd1;
+    end else begin
+      drain_drop_cnt <= drain_drop_cnt;
+    end
+  end
+
+  wire point_arm = start_now | (arm_req & ~drain_now) | (rearm_now & arm_pend);
 
   amp_calc #(.POW2_DIV_ONLY(POW2_DIV_ONLY)) u_amp_calc (
     .clk               (clk),
@@ -432,6 +499,7 @@ module adaptive_sweep #(
     .thr_wr_data_i     (thr_wr_data),
     .warmup_done_o     (ac_warmup_done),
     .early_stop_o      (ac_early_stop),
+    .early_pulse_o     (ac_early_pulse),
     .n_used_o          (ac_n_used),
     .dev_acc_o         (ac_dev_acc),
     .mean_i_o          (ac_mean_i),

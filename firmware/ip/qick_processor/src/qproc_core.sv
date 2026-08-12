@@ -35,6 +35,9 @@ module qproc_core # (
 // AXI Registers
    input  wire [63:0]      port_dt_i   [ IN_PORT_QTY ] ,
    input wire              flag_i       ,
+// Interrupt
+   input wire              interrupt_i  ,
+   input wire [PMEM_AW-1:0] ipc_i       ,
 // Special Function Registers
    output wire [7 :0]     sreg_cfg_o           ,
    output wire [7 :0]     sreg_ctrl_o           ,
@@ -96,6 +99,8 @@ qcore_cpu # (
    .lfsr_cfg_i          ( lfsr_cfg_i               ) , 
    .lfsr_o              ( lfsr_o                   ) , 
    .flag_i              ( flag_i                   ) , // External Condition
+   .interrupt_i         ( interrupt_i              ) ,
+   .ipc_i               ( ipc_i                    ) ,
    .sreg_cfg_o          ( sreg_cfg_o               ) ,
    .sreg_ctrl_o         ( sreg_ctrl_o              ) ,
    .sreg_arith_i        ( sreg_arith_i             ) , // Arith Input

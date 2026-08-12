@@ -375,6 +375,7 @@ class Axis_QICK_Proc(SocIP):
             'axi_w_dt2'   :6,
             'core_cfg'      :7,
             'read_sel'      :8,
+            'tproc_ipc'     :9,
             'mem_dt_o'      :10,
             'axi_r_dt1'   :11 ,
             'axi_r_dt2'   :12 ,
@@ -759,6 +760,8 @@ class Axis_QICK_Proc(SocIP):
         """
         self.binprog = binprog
         self.load_mem('pmem', self.binprog['pmem'])
+        # interrupt vector, 0 for programs that don't use the early-stop redirect
+        self.tproc_ipc = self.binprog.get('ipc', 0)
         if load_mem: self.reload_mem()
 
     def print_axi_regs(self):

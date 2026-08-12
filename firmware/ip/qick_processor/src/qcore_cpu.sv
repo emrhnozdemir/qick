@@ -28,8 +28,11 @@ module qcore_cpu # (
    output  wire [31:0]           lfsr_o   ,
 // DEBUG       
    output  wire [31:0]           core_do        , // Core Signal Debug
-// CONDITIONS       
+// CONDITIONS
    input   wire                  flag_i     , // External Condition
+// INTERRUPT
+   input   wire                  interrupt_i    , // External Redirect Request
+   input   wire [PMEM_AW-1:0]    ipc_i          , // Interrupt Program Counter (0 = disarmed)
 // DATA INPUT
    output wire [7:0]       sreg_cfg_o           ,
    output wire [7:0]       sreg_ctrl_o           ,
@@ -314,14 +317,33 @@ always_comb begin
 end
 
 
+// INTERRUPT REDIRECT
+/////////////////////////////////////////////////
+// A request is held until the core is actually fetching, so a redirect is
+// never dropped on a stall and never flushes a pipeline that cannot advance.
+reg  int_pend ;
+wire int_armed, int_take ;
+
+assign int_armed = |ipc_i ;
+assign int_take  = (interrupt_i | int_pend) & int_armed & fetch_en ;
+
+always_ff @ (posedge clk_i) begin
+   if      (!rst_ni)     int_pend <= 1'b0 ;
+   else if (restart_i)   int_pend <= 1'b0 ;
+   else if (int_take)    int_pend <= 1'b0 ;
+   else if (interrupt_i) int_pend <= 1'b1 ;
+   else                  int_pend <= int_pend ;
+end
+
 // PC_ADDR CALCULATION
 /////////////////////////////////////////////////
-always_comb begin 
-   cfg_pc_nxt  =  2'b00;                             // Move to Next Address
-   if ( id_ret )              cfg_pc_nxt  = 2'b11;   // Return from CALL RET is NOT conditional 
-   else if (id_branch_cond_ok)        
+always_comb begin
+   cfg_pc_nxt  =  3'b000;                            // Move to Next Address
+   if ( int_take )            cfg_pc_nxt  = 3'b100;  // Jump to IPC, overrides any branch
+   else if ( id_ret )         cfg_pc_nxt  = 2'b11;   // Return from CALL RET is NOT conditional
+   else if (id_branch_cond_ok)
       if (id_AI)              cfg_pc_nxt  = 2'b01 ;  // Jump to IMM Address
-      else                    cfg_pc_nxt  = 2'b10;   // Jump to REG Address 
+      else                    cfg_pc_nxt  = 2'b10;   // Jump to REG Address
 end
 
 wire  id_jmp_reg_used;
@@ -332,10 +354,11 @@ assign id_pc_change = |cfg_pc_nxt;
 always_comb begin
    PC_nxt = PC_curr + 1   ;
    unique case (cfg_pc_nxt )
-      2'b00: PC_nxt   = PC_curr + 1   ;
-      2'b01: PC_nxt   = id_imm_addr   ;
-      2'b10: PC_nxt   = reg_addr      ;
-      2'b11: PC_nxt   = pc_stack      ;
+      3'b000: PC_nxt   = PC_curr + 1   ;
+      3'b001: PC_nxt   = id_imm_addr   ;
+      3'b010: PC_nxt   = reg_addr      ;
+      3'b011: PC_nxt   = pc_stack      ;
+      3'b100: PC_nxt   = ipc_i         ;
       default:;
    endcase
 end

@@ -516,6 +516,16 @@ _AS_OPS = {
             "reciprocal ROM and ignore this; it is consumed only when a "
             "point runs to the averager cap",
     ),
+    "REARM": QP2Op(
+        number=14, mnemonic="REARM",
+        doc="early-stop interrupt handshake. Sent once before START it enables "
+            "the protocol: from then on an early stop raises interrupt_o and "
+            "parks the IP, dropping every arrival, instead of arming the next "
+            "point straight away. Sent again from the program's landing block, "
+            "after the quiet window that lets the last committed shot drain, it "
+            "releases the park and arms the point the sweep had already moved "
+            "on to. Fire-and-forget: no response, no ack",
+    ),
 }
 
 # GET_DIAG dt2 for the split-family early stops (CTRL estop_sel != 0)
@@ -887,6 +897,11 @@ class SweepPlan:
     writes_diag: bool = False
     count_shots: bool = False
 
+    # early-stop interrupt
+    interrupt: int = 0
+    #: Set by the code generator: label of the landing block the IPC points at
+    landing_label: Optional[str] = None
+
     @property
     def handshake(self):
         """True if the tProc gets each frequency through the QP2 handshake."""
@@ -1037,7 +1052,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                use_lut=None, lambda_=0, m_min=2, m_max=8,
                f_lo=None, f_hi=None,
                result_addr=0, debug=False, count_shots=False,
-               dump_log=None, log_addr=None):
+               dump_log=None, log_addr=None, interrupt=False):
     """Validate a sweep declaration and convert it to machine units.
 
     See :meth:`qick.asm_v2.QickProgramV2.adaptive_sweep` for the parameter
@@ -1132,7 +1147,18 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         trig_time=trig_time, shot_period=shot_period,
         result_addr=int(result_addr), debug=bool(debug),
         count_shots=bool(count_shots),
+        interrupt=1 if interrupt else 0,
     )
+
+    if interrupt:
+        _require(accel.has_op('REARM'),
+                 "accelerator '%s' has no REARM op, so it cannot be told when "
+                 "the readout pipe has drained; interrupt=True needs one"
+                 % (accel.name,))
+        _require(calc not in (None, "shift"),
+                 "interrupt=True only does something for an early-stopping "
+                 "calc: with calc=%r every point runs to avg shots and there "
+                 "is nothing to abort" % (calc,))
 
     def gw(f):
         return to_s32(gen_freq_word(prog, f, gen_ch, ro_ch))
@@ -1235,16 +1261,21 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                  "n_min=%d exceeds avg=%d, so the early stop could never fire"
                  % (plan.n_min, avg))
         if emit_mode is None:
-            emit_mode = "drain" if algorithm == "grid" else "immediate"
+            if algorithm == "grid" and not interrupt:
+                emit_mode = "drain"
+            else:
+                emit_mode = "immediate"
         _require(emit_mode in ("immediate", "drain"),
                  "emit_mode must be 'immediate' or 'drain', got %r" % (emit_mode,))
-        if algorithm == "grid" and emit_mode == "immediate":
+        if algorithm == "grid" and emit_mode == "immediate" and not interrupt:
             raise ValueError(
                 "emit_mode='immediate' breaks the grid lockstep: the IP would "
                 "advance to the next point as soon as a point converges, while "
                 "the tProc keeps firing its fixed avg shots per point, and the "
                 "two desynchronise. Use emit_mode='drain' under "
-                "algorithm='grid'; if you want the IP to advance early, drive "
+                "algorithm='grid', or interrupt=True, which aborts the tProc's "
+                "shot loop when the point converges so the two stay in step; "
+                "if you want the IP to advance early, drive "
                 "it from the OP3 status (point_idx / early_stop) with "
                 "algorithm='gd' or 'kw' instead.")
         plan.emit_mode = 1 if emit_mode == "drain" else 0
@@ -1286,18 +1317,22 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                  "n_min=%s exceeds avg=%d, so the early stop could never fire "
                  "and every point would run to the cap" % (n_min, avg))
         if emit_mode is None:
-            emit_mode = "drain" if algorithm == "grid" else "immediate"
+            if algorithm == "grid" and not interrupt:
+                emit_mode = "drain"
+            else:
+                emit_mode = "immediate"
         _require(emit_mode in ("immediate", "drain"),
                  "emit_mode must be 'immediate' or 'drain', got %r" % (emit_mode,))
-        if algorithm == "grid" and emit_mode == "immediate":
+        if algorithm == "grid" and emit_mode == "immediate" and not interrupt:
             raise ValueError(
                 "emit_mode='immediate' breaks the grid lockstep: the IP would "
                 "advance to the next point as soon as a point converges, while "
                 "the tProc keeps firing its fixed avg shots per point, and the "
                 "two desynchronise. Use emit_mode='drain' under "
                 "algorithm='grid' - the stop is still logged and the mean is "
-                "exact either way - or serve each frequency through "
-                "algorithm='gd'/'kw'.")
+                "exact either way - or interrupt=True, which aborts the "
+                "tProc's shot loop when the point converges - or serve each "
+                "frequency through algorithm='gd'/'kw'.")
         plan.emit_mode = 1 if emit_mode == "drain" else 0
         _require(not ckmon or calc == "split",
                  "ckmon=True runs the ckdiff test as a drift monitor beside "
@@ -2442,6 +2477,10 @@ class AdaptiveSweep(Macro):
             asm.qpb_send(accel, 'CAP_DIV',
                          mag_lo=mag & 0xFFFFFFFF, mag_hi=mag >> 32,
                          kp1=kp1, sft=sft)
+        if plan.interrupt:
+            # arms the IP's side of the protocol: from here an early stop parks
+            # it instead of walking straight on to the next point
+            asm.qpb_send(accel, 'REARM')
 
     def _seed_wave(self, asm, wave, word):
         """Overwrite a waveform's frequency field with an absolute word."""
@@ -2454,6 +2493,57 @@ class AdaptiveSweep(Macro):
         asm.read_wmem(wave)
         asm.inc_reg(dst='w_freq', src=to_s32(delta))
         asm.write_wmem(wave)
+
+    def _landing_block(self, prog, asm, plan, resume_label):
+        """Where the IPC redirect lands when a point stops early.
+
+        The tProc gets here mid-shot-loop, having abandoned the rest of the
+        point.  Whatever it had already committed is still in flight: at most
+        one shot's trigger sits in the dispatcher queue or its readout window is
+        already open, and the IP is parked dropping everything that arrives.
+        This block restores the trigger line, waits out that last shot, tells
+        the IP the pipe is clean, and rejoins the loop one level up.
+
+        The wait is a deadline on the tProc's own timer, not a handshake:
+        ``shot_period`` past the end of a window that opens ``trig_time`` after
+        the reference and runs for the readout length.  Every term is a
+        scheduled quantity the program itself chose; the only unscheduled one,
+        the m2 path's fabric tail, is a few hundred nanoseconds against a
+        microsecond of slack.
+
+        Note the reference is one shot period ahead of the shot whose result
+        caused the stop, because the interrupt cannot arrive before that shot's
+        window has closed, i.e. after its iteration's ``delay``.  A shot the
+        program committed but has not measured therefore always started at the
+        *current* reference, which is what makes the deadline a constant.
+        """
+        ro_len_us = (prog.ro_chs[plan.ro_ch]['length']
+                     / prog.soccfg['readouts'][plan.ro_ch]['f_output'])
+        quiet = plan.trig_time + ro_len_us + plan.shot_period
+
+        end_label = self._label(prog, 'nolanding')
+        landing_label = self._label(prog, 'landing')
+        plan.landing_label = landing_label
+
+        # the normal path steps over the block; nothing but the redirect enters it
+        asm.jump(end_label)
+        asm.label(landing_label)
+        rocfg = prog.soccfg['readouts'][plan.ro_ch]
+        if rocfg['trigger_type'] == 'dport':
+            asm.asm_inst({'CMD': 'DPORT_WR', 'DST': str(rocfg['trigger_port']),
+                          'SRC': 'imm', 'DATA': '0', 'TIME': '@0'})
+        else:
+            asm.asm_inst({'CMD': 'TRIG', 'SRC': 'clr',
+                          'DST': str(rocfg['trigger_port']), 'TIME': '@0'})
+        asm.wait(quiet)
+        # the bus select survives: the interrupt can only fire from inside the
+        # shot loop, which never touches it
+        asm.qpb_send(plan.accel, 'REARM')
+        # the waits above left the reference in the past; put it back ahead of
+        # real time so the next shot's pulse and trigger keep their spacing
+        asm.resync(plan.shot_period)
+        asm.jump(resume_label)
+        asm.label(end_label)
 
     def _shot_loop(self, prog, asm, plan, reg_shot):
         """Fire exactly ``avg`` shots at whatever the waveform memory holds."""
@@ -2549,9 +2639,12 @@ class AdaptiveSweep(Macro):
         asm.qpb_wait_ready(invert=True)
 
         point_label = self._label(prog, 'point')
+        resume_label = self._label(prog, 'nextpoint')
         asm.write_reg(dst=reg_point, src=0)
         asm.label(point_label)
         self._shot_loop(prog, asm, plan, reg_shot)
+        # an aborted point rejoins here, with the point counter untouched
+        asm.label(resume_label)
         # step to the next point; the IP walks its own copy of the same grid
         self._step_wave(asm, plan.gen_wave, plan.gen_step)
         self._step_wave(asm, plan.ro_wave, plan.ro_step)
@@ -2561,6 +2654,8 @@ class AdaptiveSweep(Macro):
         asm.qpb_wait_ready()
         asm.qpb_wait_new()
         self._store_result(prog, asm, plan, status_src=None)
+        if plan.interrupt:
+            self._landing_block(prog, asm, plan, resume_label)
 
     #gd/kw handshake ---------------------------------------------------
 
@@ -2597,6 +2692,7 @@ class AdaptiveSweep(Macro):
 
         service = self._label(prog, 'service')
         done = self._label(prog, 'done')
+        resume = self._label(prog, 'nextprobe')
         asm.label(service)
         # READY high means the job is over.  Test it before touching the
         # peripheral: any read would overwrite the final result registers.
@@ -2622,11 +2718,15 @@ class AdaptiveSweep(Macro):
         asm.write_wmem(plan.ro_wave)
 
         self._shot_loop(prog, asm, plan, reg_shot)
+        # an aborted probe rejoins here and asks the engine for the next one
+        asm.label(resume)
         asm.jump(service)
 
         asm.label(done)
         asm.qpb_wait_new()
         self._store_result(prog, asm, plan, status_src='s_core_r2')
+        if plan.interrupt:
+            self._landing_block(prog, asm, plan, resume)
 
     def _emit_ro_track(self, prog, asm, plan, reg_gen, reg_ro, reg_genbase,
                        reg_robase, reg_ratio):
@@ -4306,6 +4406,26 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         d_mem = np.zeros(size, dtype=np.int32)
         return d_mem
 
+    def _compile_ipc(self):
+        """The interrupt vector: pmem address of the sweep's landing block.
+
+        0 means "no redirect", which is what the tProc's IPC register holds
+        unless a program asks for one, so a program without an accelerated
+        sweep - or with one that does not stop early - runs exactly as before.
+        """
+        landing = [plan.landing_label for plan in self._sweep_plans.values()
+                   if plan.landing_label is not None]
+        if not landing:
+            return 0
+        if len(landing) > 1:
+            raise RuntimeError(
+                "the tProc has one interrupt vector but this program declares "
+                "%d sweeps with interrupt=True (%s); only one sweep in a "
+                "program can use the early-stop interrupt"
+                % (len(landing), ', '.join(landing)))
+        addr = self.labels[landing[0]]
+        return int(addr.lstrip('&'))
+
     def compile(self):
         self._make_asm()
         self._make_binprog()
@@ -4316,6 +4436,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         self.binprog['pmem'] = self._compile_prog()
         self.binprog['wmem'] = self._compile_waves()
         self.binprog['dmem'] = self.compile_datamem()
+        self.binprog['ipc'] = self._compile_ipc()
         if self.binprog['dmem'] is not None:
             self.dmem_image = [int(w) for w in self.binprog['dmem']]
         # check that the program will fit
@@ -4785,6 +4906,19 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             ``acquire()`` and ``run_rounds()`` poll against ``reps``: with it
             on, those would return after the sweep's first shot.  Read the
             result with :meth:`wait_for_sweep` instead.
+        interrupt : bool
+            Let a point that stops early abort the tProc's shot loop, instead
+            of firing the remaining shots into an accelerator that has already
+            moved on.  This is what turns an early stop into actual saved time
+            under ``algorithm='grid'``: without it the only safe emit mode is
+            ``'drain'``, where the stop is logged but every point still runs to
+            ``avg``.  Needs an accelerator with a ``REARM`` op and a calc that
+            can stop early.
+
+            The program grows a landing block at its tail; its address is the
+            interrupt vector, carried in ``binprog['ipc']`` and written to the
+            tProc by ``load_bin_program()``.  Only one sweep per program can
+            use it, because the tProc has one vector.
         Raises
         ------
         ValueError
