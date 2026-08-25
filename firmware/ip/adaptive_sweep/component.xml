@@ -425,7 +425,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>c04f9621</spirit:value>
+            <spirit:value>ac0f9263</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -444,7 +444,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>c04f9621</spirit:value>
+            <spirit:value>ac0f9263</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -459,7 +459,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>46e47e68</spirit:value>
+            <spirit:value>2803e6da</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -1089,7 +1089,7 @@
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/sign_step.v</spirit:name>
+        <spirit:name>src/signed_step.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
@@ -1097,91 +1097,67 @@
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/match_counter.v</spirit:name>
+        <spirit:name>src/register_bank.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/conv_patience.v</spirit:name>
+        <spirit:name>src/shot_counter.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/probe_diff.v</spirit:name>
+        <spirit:name>src/magnitude_calculator.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/kw_probe_gen.v</spirit:name>
+        <spirit:name>src/threshold_compare.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/log2_floor.v</spirit:name>
+        <spirit:name>src/accumulator.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/round_shift.v</spirit:name>
+        <spirit:name>src/diff_accumulator.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/power_macc.v</spirit:name>
+        <spirit:name>src/event_counter.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/running_mean.v</spirit:name>
+        <spirit:name>src/convergence_patience.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/shot_sequencer.v</spirit:name>
+        <spirit:name>src/probe_difference.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/early_stop_mad.v</spirit:name>
+        <spirit:name>src/probe_generator.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/ckpt_gen.v</spirit:name>
+        <spirit:name>src/square_summer.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/signed_diff_accumulator.v</spirit:name>
+        <spirit:name>src/squarer.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/mag_class.v</spirit:name>
+        <spirit:name>src/early_stop_checker.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/gm_divider.v</spirit:name>
+        <spirit:name>src/amplitude_calculator.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/estop_split.v</spirit:name>
+        <spirit:name>src/gradient_engine.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/estop_ckdiff.v</spirit:name>
-        <spirit:fileType>verilogSource</spirit:fileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/stop_log.v</spirit:name>
-        <spirit:fileType>verilogSource</spirit:fileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/amp_calc.v</spirit:name>
-        <spirit:fileType>verilogSource</spirit:fileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/result_router.v</spirit:name>
-        <spirit:fileType>verilogSource</spirit:fileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/ctrl_status_reg.v</spirit:name>
-        <spirit:fileType>verilogSource</spirit:fileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/gd_kw_engine.v</spirit:name>
-        <spirit:fileType>verilogSource</spirit:fileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/peak_finder_wide.v</spirit:name>
+        <spirit:name>src/peak_finder.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
@@ -1195,19 +1171,9 @@
         <spirit:userFileType>CHECKSUM_4a2569e9</spirit:userFileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/bram_stop_log/bram_stop_log.xci</spirit:name>
-        <spirit:userFileType>xci</spirit:userFileType>
-        <spirit:userFileType>CELL_NAME_u_stop_log/u_mem</spirit:userFileType>
-      </spirit:file>
-      <spirit:file>
         <spirit:name>src/bram_sched_lut/bram_sched_lut.xci</spirit:name>
         <spirit:userFileType>xci</spirit:userFileType>
-        <spirit:userFileType>CELL_NAME_u_gd_kw_engine/u_a_lut</spirit:userFileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/bram_thr_table/bram_thr_table.xci</spirit:name>
-        <spirit:userFileType>xci</spirit:userFileType>
-        <spirit:userFileType>CELL_NAME_u_amp_calc/u_early_stop_mad/u_thr_table</spirit:userFileType>
+        <spirit:userFileType>CELL_NAME_u_gradient_engine/step_schedule</spirit:userFileType>
       </spirit:file>
     </spirit:fileSet>
     <spirit:fileSet>
@@ -1235,7 +1201,7 @@
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/sign_step.v</spirit:name>
+        <spirit:name>src/signed_step.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
@@ -1243,91 +1209,67 @@
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/match_counter.v</spirit:name>
+        <spirit:name>src/register_bank.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/conv_patience.v</spirit:name>
+        <spirit:name>src/shot_counter.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/probe_diff.v</spirit:name>
+        <spirit:name>src/magnitude_calculator.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/kw_probe_gen.v</spirit:name>
+        <spirit:name>src/threshold_compare.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/log2_floor.v</spirit:name>
+        <spirit:name>src/accumulator.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/round_shift.v</spirit:name>
+        <spirit:name>src/diff_accumulator.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/power_macc.v</spirit:name>
+        <spirit:name>src/event_counter.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/running_mean.v</spirit:name>
+        <spirit:name>src/convergence_patience.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/shot_sequencer.v</spirit:name>
+        <spirit:name>src/probe_difference.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/early_stop_mad.v</spirit:name>
+        <spirit:name>src/probe_generator.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/ckpt_gen.v</spirit:name>
+        <spirit:name>src/square_summer.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/signed_diff_accumulator.v</spirit:name>
+        <spirit:name>src/squarer.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/mag_class.v</spirit:name>
+        <spirit:name>src/early_stop_checker.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/gm_divider.v</spirit:name>
+        <spirit:name>src/amplitude_calculator.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/estop_split.v</spirit:name>
+        <spirit:name>src/gradient_engine.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/estop_ckdiff.v</spirit:name>
-        <spirit:fileType>verilogSource</spirit:fileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/stop_log.v</spirit:name>
-        <spirit:fileType>verilogSource</spirit:fileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/amp_calc.v</spirit:name>
-        <spirit:fileType>verilogSource</spirit:fileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/result_router.v</spirit:name>
-        <spirit:fileType>verilogSource</spirit:fileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/ctrl_status_reg.v</spirit:name>
-        <spirit:fileType>verilogSource</spirit:fileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/gd_kw_engine.v</spirit:name>
-        <spirit:fileType>verilogSource</spirit:fileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/peak_finder_wide.v</spirit:name>
+        <spirit:name>src/peak_finder.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
@@ -1339,19 +1281,9 @@
         <spirit:fileType>verilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>src/bram_stop_log/bram_stop_log.xci</spirit:name>
-        <spirit:userFileType>xci</spirit:userFileType>
-        <spirit:userFileType>CELL_NAME_u_stop_log/u_mem</spirit:userFileType>
-      </spirit:file>
-      <spirit:file>
         <spirit:name>src/bram_sched_lut/bram_sched_lut.xci</spirit:name>
         <spirit:userFileType>xci</spirit:userFileType>
-        <spirit:userFileType>CELL_NAME_u_gd_kw_engine/u_a_lut</spirit:userFileType>
-      </spirit:file>
-      <spirit:file>
-        <spirit:name>src/bram_thr_table/bram_thr_table.xci</spirit:name>
-        <spirit:userFileType>xci</spirit:userFileType>
-        <spirit:userFileType>CELL_NAME_u_amp_calc/u_early_stop_mad/u_thr_table</spirit:userFileType>
+        <spirit:userFileType>CELL_NAME_u_gradient_engine/step_schedule</spirit:userFileType>
       </spirit:file>
     </spirit:fileSet>
     <spirit:fileSet>
@@ -1410,17 +1342,17 @@
       <xilinx:xpmLibraries>
         <xilinx:xpmLibrary>XPM_MEMORY</xilinx:xpmLibrary>
       </xilinx:xpmLibraries>
-      <xilinx:coreRevision>18</xilinx:coreRevision>
+      <xilinx:coreRevision>27</xilinx:coreRevision>
       <xilinx:upgrades>
         <xilinx:canUpgradeFrom>xilinx.com:user:adaptive_sweep:1.0</xilinx:canUpgradeFrom>
       </xilinx:upgrades>
-      <xilinx:coreCreationDateTime>2026-08-12T21:20:48Z</xilinx:coreCreationDateTime>
+      <xilinx:coreCreationDateTime>2026-08-25T11:29:59Z</xilinx:coreCreationDateTime>
     </xilinx:coreExtensions>
     <xilinx:packagingInfo>
       <xilinx:xilinxVersion>2023.1</xilinx:xilinxVersion>
       <xilinx:checksum xilinx:scope="busInterfaces" xilinx:value="3c60e00d"/>
       <xilinx:checksum xilinx:scope="memoryMaps" xilinx:value="c930e363"/>
-      <xilinx:checksum xilinx:scope="fileGroups" xilinx:value="b12c4aae"/>
+      <xilinx:checksum xilinx:scope="fileGroups" xilinx:value="3553e642"/>
       <xilinx:checksum xilinx:scope="ports" xilinx:value="b002e5b8"/>
       <xilinx:checksum xilinx:scope="parameters" xilinx:value="cb881b10"/>
     </xilinx:packagingInfo>

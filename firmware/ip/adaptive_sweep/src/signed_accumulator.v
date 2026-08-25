@@ -3,14 +3,14 @@
 module signed_accumulator #(
   parameter W = 64
 ) (
-  input wire clk,
-  input wire rst_n,
-  input wire clr,
-  input wire en,
-  input wire signed [W-1:0] d_i,
+  input clk,
+  input rst_n,
+  input clr,
+  input en,
+  input signed [W-1:0] d_i,
 
   output reg signed [W-1:0] q_o,
-  output wire signed [W-1:0] q_nxt_o
+  output signed [W-1:0] q_nxt_o
 );
 
   wire signed [W-1:0] q_sum = q_o + d_i;
@@ -24,8 +24,6 @@ module signed_accumulator #(
       q_o <= {W{1'b0}};
     else if (en)
       q_o <= q_sum;
-    else
-      q_o <= q_o;
   end
 
 endmodule

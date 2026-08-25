@@ -55,6 +55,7 @@
     <Option Name="IPCachePermission" Val="write"/>
     <Option Name="EnableCoreContainer" Val="FALSE"/>
     <Option Name="EnableResourceEstimation" Val="FALSE"/>
+    <Option Name="SimCompileState" Val="TRUE"/>
     <Option Name="CreateRefXciForCoreContainers" Val="FALSE"/>
     <Option Name="IPUserFilesDir" Val="$PIPUSERFILESDIR"/>
     <Option Name="IPStaticSourceDir" Val="$PIPUSERFILESDIR/ipstatic"/>
@@ -537,27 +538,6 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/fine_tuning_sweep/src/fine_tuning_sweep.v">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/fine_tuning_sweep/src/peak_finder.v">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/fine_tuning_sweep/src/amplitude_calculator.v">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
       <File Path="$PPRDIR/src/tb/iq_feeder.sv">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
@@ -565,14 +545,14 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/kw_probe_gen.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/probe_generator.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/sign_step.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/signed_step.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
@@ -593,14 +573,14 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/match_counter.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/event_counter.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/gd_kw_engine.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/gradient_engine.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
@@ -621,14 +601,7 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/peak_finder_wide.v">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/probe_diff.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/probe_difference.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
@@ -642,119 +615,84 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/conv_patience.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/convergence_patience.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/ctrl_status_reg.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/amplitude_calculator.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/stop_log.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/accumulator.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/amp_calc.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/diff_accumulator.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/result_router.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/early_stop_checker.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/shot_sequencer.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/register_bank.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/log2_floor.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/shot_counter.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/round_shift.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/magnitude_calculator.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/running_mean.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/threshold_compare.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/early_stop_mad.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/square_summer.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/estop_split.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/squarer.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/estop_ckdiff.v">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/signed_diff_accumulator.v">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/power_macc.v">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/gm_divider.v">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/mag_class.v">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/ckpt_gen.v">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/peak_finder.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
@@ -762,20 +700,6 @@
         </FileInfo>
       </File>
       <File Path="$PPRDIR/../../ip/adaptive_sweep/src/bram_sched_lut/bram_sched_lut.xci">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/bram_stop_log/bram_stop_log.xci">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/bram_thr_table/bram_thr_table.xci">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
@@ -804,6 +728,16 @@
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/tb/tb_amplitude_calculator.sv">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/tb/tb_adaptive_sweep.sv">
+        <FileInfo>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
@@ -921,8 +855,8 @@
         <Option Name="PamPseudoTop" Val="pseudo_tb"/>
         <Option Name="SrcSet" Val="sources_1"/>
         <Option Name="XSimWcfgFile" Val="$PPRDIR/src/tb/tb_qick_behav.wcfg"/>
-        <Option Name="xsim.simulate.log_all_signals" Val="true"/>
         <Option Name="xsim.simulate.runtime" Val="all"/>
+        <Option Name="xsim.simulate.log_all_signals" Val="true"/>
       </Config>
     </FileSet>
     <FileSet Name="utils_1" Type="Utils" RelSrcDir="$PSRCDIR/utils_1" RelGenDir="$PGENDIR/utils_1">

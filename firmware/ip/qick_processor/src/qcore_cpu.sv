@@ -347,7 +347,7 @@ always_comb begin
 end
 
 wire  id_jmp_reg_used;
-assign id_jmp_reg_used = (cfg_pc_nxt  == 2'b10) ;
+assign id_jmp_reg_used = id_branch_cond_ok & ~id_AI & ~id_ret ; // NOT from cfg_pc_nxt: int_take would close a comb loop through stall
 
 assign id_pc_change = |cfg_pc_nxt;
 

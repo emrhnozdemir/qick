@@ -77,6 +77,18 @@ integer run_us;
 initial if ($test$plusargs("AS_SRC_AVGBUF")) AS_STREAM_SRC = "AS_SRC_AVGBUF";
 //----------------------------------------------------
 
+// adaptive_sweep's early-stop threshold.  The split test passes a checkpoint
+// iff (|dI|+|dQ|)*AS_ESTOP_D <= |SI|+|SQ|, so this is the reciprocal of the
+// noise/signal ratio a point must reach.  It is NOT in the tProc program: it
+// lives in the IP's AXI register (REG0 target 2), so this testbench writes it
+// before the program runs, exactly as the Adaptive_Sweep driver does on the
+// board.  The IP resets to 64; the early-stop tests need the looser 8 to stop
+// inside their short shot budget.  Keep this equal to round(1/estop_thr) in
+// personal_files/adaptive_sweep/sim/interrupt_test/build_progs.py.
+integer AS_ESTOP_D = 8;
+initial if (!$value$plusargs("AS_ESTOP_D=%d", AS_ESTOP_D)) AS_ESTOP_D = 8;
+//----------------------------------------------------
+
 // VIP Agents
 axi_mst_0_mst_t     axi_mst_tproc_agent;
 axi_mst_0_mst_t     axi_mst_sg_agent;
@@ -1394,8 +1406,9 @@ wire        as_interrupt;
 // The BD's axis_cc_ft is an axis_clock_converter taking m2 from the avg_buffer
 // m_axis domain (s_ps_dma_aclk here) into c_clk. m2 carries one beat per
 // trigger, so the toggle handshake below reproduces it without a full async
-// FIFO. s_axi is left idle: the AXI-Lite side only loads the GD/KW and MAD
-// tables, which this test does not use.
+// FIFO. s_axi is driven: the AXI-Lite side carries the GD/KW schedule LUTs
+// (unused here) and the early-stop threshold register, which the split test
+// does need - see as_write_estop_d below.
 
    // --- axis_cc_ft model: s_ps_dma_aclk -> c_clk ---
    reg  [63:0] m2_cdc_data  = 64'd0;
@@ -1454,6 +1467,45 @@ wire        as_interrupt;
       end
    end
 
+   // --- AXI-Lite write path (early-stop threshold register) ---
+   logic [7:0]  as_axi_awaddr  = 8'd0;
+   logic        as_axi_awvalid = 1'b0;
+   logic [31:0] as_axi_wdata   = 32'd0;
+   logic [3:0]  as_axi_wstrb   = 4'd0;
+   logic        as_axi_wvalid  = 1'b0;
+   wire         as_axi_awready;
+   wire         as_axi_wready;
+
+   task automatic as_axi_write(input [7:0] addr, input [31:0] data);
+      begin
+         @(posedge c_clk);
+         as_axi_awaddr  <= addr;
+         as_axi_wdata   <= data;
+         as_axi_wstrb   <= 4'hF;
+         as_axi_awvalid <= 1'b1;
+         as_axi_wvalid  <= 1'b1;
+         do
+            @(posedge c_clk);
+         while (!(as_axi_awready && as_axi_wready));
+         as_axi_awvalid <= 1'b0;
+         as_axi_wvalid  <= 1'b0;
+         repeat (4) @(posedge c_clk);
+      end
+   endtask
+
+   // REG0 is {[31] toggle, [9:8] target, [5:0] addr}; the toggle EDGE, not
+   // the level, commits one write, so REG0 is written twice.
+   task automatic as_write_estop_d(input [15:0] d);
+      begin
+         as_axi_write(8'h04, {16'd0, d});
+         as_axi_write(8'h00, {1'b0, 21'd0, 2'd2, 2'd0, 6'd0});
+         as_axi_write(8'h00, {1'b1, 21'd0, 2'd2, 2'd0, 6'd0});
+         repeat (20) @(posedge c_clk);
+         $display("*** %t - adaptive_sweep early-stop threshold set: D=%0d (thr=1/%0d)",
+                  $realtime(), d, d);
+      end
+   endtask
+
    adaptive_sweep u_adaptive_sweep (
       .clk           (c_clk            ),
       .rst_n         (rst_ni           ),
@@ -1477,14 +1529,14 @@ wire        as_interrupt;
 
       .s_axi_aclk    (c_clk            ),
       .s_axi_aresetn (rst_ni           ),
-      .s_axi_awaddr  (8'd0             ),
+      .s_axi_awaddr  (as_axi_awaddr    ),
       .s_axi_awprot  (3'd0             ),
-      .s_axi_awvalid (1'b0             ),
-      .s_axi_awready (/*unused*/       ),
-      .s_axi_wdata   (32'd0            ),
-      .s_axi_wstrb   (4'd0             ),
-      .s_axi_wvalid  (1'b0             ),
-      .s_axi_wready  (/*unused*/       ),
+      .s_axi_awvalid (as_axi_awvalid   ),
+      .s_axi_awready (as_axi_awready   ),
+      .s_axi_wdata   (as_axi_wdata     ),
+      .s_axi_wstrb   (as_axi_wstrb     ),
+      .s_axi_wvalid  (as_axi_wvalid    ),
+      .s_axi_wready  (as_axi_wready    ),
       .s_axi_bresp   (/*unused*/       ),
       .s_axi_bvalid  (/*unused*/       ),
       .s_axi_bready  (1'b1             ),
@@ -1519,9 +1571,13 @@ wire        as_interrupt;
    integer as_fold_cnt = 0;   // words the IP folded into a point
    integer as_int_cnt  = 0;
    reg     as_trig_d   = 1'b0;
+   // interrupt_o is registered, so by the time it is seen the sequencer has
+   // already cleared shot_cnt; report the count as it stood at the decision.
+   reg [31:0] as_shot_d = 32'd0;
 
    always_ff @(posedge c_clk) begin
       as_trig_d <= trigger_0;
+      as_shot_d <= u_adaptive_sweep.u_amp_calc.u_shot_sequencer.shot_cnt;
       if (trigger_0 & ~as_trig_d) as_trig_cnt <= as_trig_cnt + 1;
       if (m2_c_tvalid) begin
          as_word_cnt <= as_word_cnt + 1;
@@ -1535,7 +1591,7 @@ wire        as_interrupt;
          as_int_cnt <= as_int_cnt + 1;
          $display("*** %t - INTERRUPT #%0d at point %0d shot %0d (trig %0d, words %0d, folded %0d)",
                   $realtime(), as_int_cnt + 1, u_adaptive_sweep.pf_point_idx,
-                  u_adaptive_sweep.u_amp_calc.u_shot_sequencer.shot_cnt,
+                  as_shot_d,
                   as_trig_cnt, as_word_cnt, as_fold_cnt);
       end
       if (AXIS_QPROC.QPROC.CORE_0.CORE_CPU.int_take)
@@ -1668,6 +1724,11 @@ initial begin
    rst_ni = 1'b1;
 
    #1us;
+
+   // adaptive_sweep's early-stop threshold is an AXI register, not part of the
+   // tProc program, so it has to be written before the program runs - the same
+   // thing Adaptive_Sweep.set_estop_thr() does on the board.
+   as_write_estop_d(AS_ESTOP_D[15:0]);
 
    // Load Signal Generator Envelope Table Memory.
    sg_load_mem(TEST_NAME);

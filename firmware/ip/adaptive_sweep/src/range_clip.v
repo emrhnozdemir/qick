@@ -3,12 +3,12 @@
 module range_clip #(
   parameter W = 34
 ) (
-  input wire [W-1:0] a_i,
-  input wire [W-1:0] lo_i,
-  input wire [W-1:0] hi_i,
-  input wire is_signed_i,
+  input [W-1:0] a_i,
+  input [W-1:0] lo_i,
+  input [W-1:0] hi_i,
+  input is_signed_i,
 
-  output wire [W-1:0] y_o
+  output [W-1:0] y_o
 );
 
   wire a_gt_lo;

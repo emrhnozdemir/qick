@@ -3,13 +3,13 @@
 module value_comparator #(
   parameter W = 32
 ) (
-  input wire [W-1:0] a_i,
-  input wire [W-1:0] b_i,
-  input wire is_signed_i,
+  input [W-1:0] a_i,
+  input [W-1:0] b_i,
+  input is_signed_i,
 
-  output wire gt_o,
-  output wire ge_o,
-  output wire eq_o
+  output gt_o,
+  output ge_o,
+  output eq_o
 );
 
   wire sgt = $signed(a_i) > $signed(b_i);
