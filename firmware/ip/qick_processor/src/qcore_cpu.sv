@@ -330,7 +330,8 @@ assign int_take  = (interrupt_i | int_pend) & int_armed & fetch_en ;
 always_ff @ (posedge clk_i) begin
    if      (!rst_ni)     int_pend <= 1'b0 ;
    else if (restart_i)   int_pend <= 1'b0 ;
-   else if (int_take)    int_pend <= 1'b0 ;
+   else if (!int_armed)  int_pend <= 1'b0 ;                    // disarm flushes, never queues
+   else if (int_take)    int_pend <= int_pend & interrupt_i ;  // keep a request arriving as one is taken
    else if (interrupt_i) int_pend <= 1'b1 ;
    else                  int_pend <= int_pend ;
 end
@@ -565,8 +566,8 @@ LIFO  # (
    .clk_i   ( clk_i    ) ,
    .rst_ni  ( rst_ni   ) ,
    .data_i  ( PC_prev  ) ,
-   .push    ( id_call & fetch_en  ) ,
-   .pop     ( id_ret & fetch_en  ) ,
+   .push    ( id_call & fetch_en & ~int_take ) , // int_take overrides the PC: the CALL never happened
+   .pop     ( id_ret & fetch_en & ~int_take ) ,  // ... and the RET must not discard its return address
    .data_o  ( pc_stack ) ,
    .full_o  ( pc_stack_full ) );
 

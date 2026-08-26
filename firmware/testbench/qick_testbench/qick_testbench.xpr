@@ -43,7 +43,7 @@
     <Option Name="SimulatorGccVersionVCS" Val="9.2.0"/>
     <Option Name="SimulatorGccVersionRiviera" Val="9.3.0"/>
     <Option Name="SimulatorGccVersionActiveHdl" Val="9.3.0"/>
-    <Option Name="BoardPart" Val="realdigital.org:rfsoc4x2:part0:1.0"/>
+    <Option Name="BoardPart" Val=""/>
     <Option Name="SourceMgmtMode" Val="DisplayOnly"/>
     <Option Name="ActiveSimSet" Val="sim_1"/>
     <Option Name="DefaultLib" Val="xil_defaultlib"/>
@@ -55,14 +55,13 @@
     <Option Name="IPCachePermission" Val="write"/>
     <Option Name="EnableCoreContainer" Val="FALSE"/>
     <Option Name="EnableResourceEstimation" Val="FALSE"/>
-    <Option Name="SimCompileState" Val="TRUE"/>
     <Option Name="CreateRefXciForCoreContainers" Val="FALSE"/>
     <Option Name="IPUserFilesDir" Val="$PIPUSERFILESDIR"/>
     <Option Name="IPStaticSourceDir" Val="$PIPUSERFILESDIR/ipstatic"/>
     <Option Name="UseIPStaticLibs" Val="0"/>
     <Option Name="EnableBDX" Val="FALSE"/>
     <Option Name="DSABoardId" Val="zcu216"/>
-    <Option Name="WTXSimLaunchSim" Val="926"/>
+    <Option Name="WTXSimLaunchSim" Val="928"/>
     <Option Name="WTModelSimLaunchSim" Val="0"/>
     <Option Name="WTQuestaLaunchSim" Val="0"/>
     <Option Name="WTIesLaunchSim" Val="0"/>
@@ -724,55 +723,8 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/src/tb/tb_qick.sv">
+      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/dds/dds_0/dds_0.xci">
         <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/tb/tb_amplitude_calculator.sv">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/tb/tb_adaptive_sweep.sv">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/src/tb/tb_qick_behav.wcfg">
-        <FileInfo>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/axis_kidsim_v3.sv">
-        <FileInfo>
-          <Attr Name="Library" Val="lib_axis_kidsim_v3"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/kidsim.sv">
-        <FileInfo>
-          <Attr Name="Library" Val="lib_axis_kidsim_v3"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/punct.sv">
-        <FileInfo>
-          <Attr Name="Library" Val="lib_axis_kidsim_v3"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/kidsim_top.sv">
-        <FileInfo>
-          <Attr Name="Library" Val="lib_axis_kidsim_v3"/>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
@@ -786,7 +738,17 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/prod.sv">
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/bram_sched_lut/simulation/blk_mem_gen_v8_4.v">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/bram_sched_lut/sim/bram_sched_lut.v">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/dds/dds_ctrl.v">
         <FileInfo>
           <Attr Name="Library" Val="lib_axis_kidsim_v3"/>
           <Attr Name="UsedIn" Val="synthesis"/>
@@ -794,8 +756,17 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/dds/dds_0/dds_0.xci">
+      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/dds/dds_top.v">
         <FileInfo>
+          <Attr Name="Library" Val="lib_axis_kidsim_v3"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/axis_kidsim_v3.sv">
+        <FileInfo>
+          <Attr Name="Library" Val="lib_axis_kidsim_v3"/>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
@@ -817,7 +788,7 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/dds/dds_ctrl.v">
+      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/kidsim.sv">
         <FileInfo>
           <Attr Name="Library" Val="lib_axis_kidsim_v3"/>
           <Attr Name="UsedIn" Val="synthesis"/>
@@ -825,7 +796,7 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
-      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/dds/dds_top.v">
+      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/kidsim_top.sv">
         <FileInfo>
           <Attr Name="Library" Val="lib_axis_kidsim_v3"/>
           <Attr Name="UsedIn" Val="synthesis"/>
@@ -838,6 +809,44 @@
           <Attr Name="Library" Val="lib_axis_kidsim_v3"/>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/prod.sv">
+        <FileInfo>
+          <Attr Name="Library" Val="lib_axis_kidsim_v3"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PPRDIR/../../ip/axis_kidsim_v3/src/punct.sv">
+        <FileInfo>
+          <Attr Name="Library" Val="lib_axis_kidsim_v3"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PPRDIR/src/tb/tb_qick.sv">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/tb/tb_amplitude_calculator.sv">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PPRDIR/../../ip/adaptive_sweep/src/tb/tb_adaptive_sweep.sv">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PPRDIR/src/tb/tb_qick_behav.wcfg">
+        <FileInfo>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
@@ -912,9 +921,7 @@
       <RQSFiles/>
     </Run>
   </Runs>
-  <Board>
-    <Jumpers/>
-  </Board>
+  <Board/>
   <DashboardSummary Version="1" Minor="0">
     <Dashboards>
       <Dashboard Name="default_dashboard">

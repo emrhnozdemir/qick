@@ -1436,7 +1436,7 @@ wire        as_interrupt;
    // Paced by the IP's own point arming, so one armed point consumes exactly
    // averager_value recorded shots and the file stays aligned with the sweep.
    wire        as_point_arm = u_adaptive_sweep.point_arm;
-   wire [31:0] as_avg_value = u_adaptive_sweep.cfg_avg;
+   wire [31:0] as_avg_value = 32'd1 << u_adaptive_sweep.cfg_avg_shift;
 
    wire        iqf_tvalid;
    wire [63:0] iqf_tdata;
@@ -1555,12 +1555,12 @@ wire        as_interrupt;
       if (u_adaptive_sweep.grid_valid) begin
          $display("*** %t - adaptive_sweep point %0d: freq_word=0x%08x power=%0d (iq cursor %0d)",
                   $realtime(), u_adaptive_sweep.pf_point_idx,
-                  u_adaptive_sweep.pf_freq_word, u_adaptive_sweep.grid_data[63:0],
+                  u_adaptive_sweep.u_peak_finder.frequency, u_adaptive_sweep.ac_power[63:0],
                   iqf_cursor);
       end
       if (u_adaptive_sweep.pf_finish) begin
          $display("*** %t - adaptive_sweep FINISH: best freq_word=0x%08x at point %0d",
-                  $realtime(), u_adaptive_sweep.pf_freq_word, u_adaptive_sweep.pf_point_idx);
+                  $realtime(), u_adaptive_sweep.best_freq, u_adaptive_sweep.pf_point_idx);
       end
    end
 
@@ -1577,7 +1577,7 @@ wire        as_interrupt;
 
    always_ff @(posedge c_clk) begin
       as_trig_d <= trigger_0;
-      as_shot_d <= u_adaptive_sweep.u_amp_calc.u_shot_sequencer.shot_cnt;
+      as_shot_d <= u_adaptive_sweep.u_amplitude_calculator.stop_check.counter.shot_count;
       if (trigger_0 & ~as_trig_d) as_trig_cnt <= as_trig_cnt + 1;
       if (m2_c_tvalid) begin
          as_word_cnt <= as_word_cnt + 1;
@@ -1585,7 +1585,7 @@ wire        as_interrupt;
             $display("*** %t - m2[%0d] I=%0d Q=%0d", $realtime(), as_word_cnt,
                      $signed(m2_c_tdata[31:0]), $signed(m2_c_tdata[63:32]));
       end
-      if (u_adaptive_sweep.u_amp_calc.u_shot_sequencer.count_en)
+      if (u_adaptive_sweep.u_amplitude_calculator.stop_check.counter.counting)
          as_fold_cnt <= as_fold_cnt + 1;
       if (u_adaptive_sweep.interrupt_o) begin
          as_int_cnt <= as_int_cnt + 1;
