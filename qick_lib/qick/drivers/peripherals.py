@@ -914,53 +914,74 @@ class QICK_XTalk_Compensation(SocIP):
 
 class Adaptive_Sweep(SocIP):
     """
-    Adaptive_Sweep table-load port.
+    Adaptive_Sweep host-side write port.
 
-    The adaptive_sweep IP's AXI-Lite slave is a host-side write port for its
-    three host-computed tables: the madstop per-epoch thresholds and the gd/kw
-    a_k (step) and c_k (probe-width) schedules.  The generated tProc program
-    does not load these tables; call :meth:`load_tables` with the sweep's plan
-    (or the individual loaders) before starting a program that needs them.
+    The adaptive_sweep IP's AXI-Lite slave carries the settings the generated
+    tProc program does NOT itself send: the early-stop threshold and the gd/kw
+    a_k (step) and c_k (probe-width) schedules.  Call :meth:`load_tables` with
+    the sweep's plan (or the individual setters) before starting a program
+    that needs them.
 
-    Protocol: REG0 is ``{[31] toggle, [9:8] target, [5:0] addr}`` with target
-    0 = a-LUT, 1 = c-LUT, 2 = threshold table.  Data goes in REG1 (plus
-    REG2[13:0] for the threshold high bits) and the LUT length in REG3, all
-    written before REG0[31] is FLIPPED - the toggle edge, synchronized into
-    the fabric clock, commits exactly one table write.
+    The early-stop threshold lives here rather than in the program image so a
+    threshold sweep needs no rebuild - :meth:`set_estop_thr` retargets a
+    loaded program between runs.  It is a scalar, not a table: the IP holds
+    the integer reciprocal ``D = round(1/thr)`` in one 16-bit register and
+    tests ``(|dI|+|dQ|)*D <= |SI|+|SQ|`` at each checkpoint.  The register
+    comes out of reset at ``D=64``, so an unwritten register behaves as
+    ``thr=1/64`` rather than disabling the early stop.
+
+    Protocol: REG0 carries the whole control word and the commit; REG1..REG7
+    are seven payload words, so one commit writes up to seven LUT entries.
+
+    ``REG0 = {[31] toggle, [30:24] len, [23:21] count-1, [20:16] target,
+    [15:8] addr, [7:0] reserved}``, with target 0 = a-LUT, 1 = c-LUT,
+    2 = early-stop threshold, 3 = CTRL.
+
+    Payload registers are written first, then REG0 twice: once with the
+    control fields and the toggle UNCHANGED, once with REG0[31] FLIPPED.  The
+    toggle edge is synchronized into the fabric clock and commits exactly one
+    burst; writing the control fields a transaction earlier keeps them settled
+    before that edge crosses.  A 64-entry LUT costs 84 AXI writes this way
+    against 193 for the old one-entry-per-commit protocol.
     """
     bindto = ['emrhnozdemir:QICK:adaptive_sweep:1.0']
 
+    # REG1..REG7 are payload, so seven LUT entries commit per toggle flip
+    BURST = 7
+
     def _init_config(self, description):
         self.REGISTERS = {
-            'tbl_sel': 0,
-            'tbl_data_lo': 1,
-            'tbl_data_hi': 2,
-            'tbl_len': 3,
+            'tbl_ctrl': 0,
+            'tbl_d0': 1, 'tbl_d1': 2, 'tbl_d2': 3, 'tbl_d3': 4,
+            'tbl_d4': 5, 'tbl_d5': 6, 'tbl_d6': 7,
         }
 
     def _init_firmware(self):
         # REG0[31] is a toggle, not a strobe: learn its current state instead
         # of writing it, so re-initializing the driver cannot commit a stray
         # table write.
-        self._toggle = (self.tbl_sel >> 31) & 1
+        self._toggle = (self.tbl_ctrl >> 31) & 1
 
-    def _tbl_commit(self, target, addr):
-        word = ((target & 0x3) << 8) | (addr & 0x3F)
-        # address and target first, with the toggle unchanged...
-        self.tbl_sel = (self._toggle << 31) | word
-        # ...then the flip commits
+    def _tbl_commit(self, target, addr=0, count=1, length=0):
+        word = (((length & 0x7F) << 24) | (((count - 1) & 0x7) << 21)
+                | ((target & 0x1F) << 16) | ((addr & 0xFF) << 8))
+        # control fields first, with the toggle unchanged...
+        self.tbl_ctrl = (self._toggle << 31) | word
+        # ...then the flip commits the whole burst
         self._toggle ^= 1
-        self.tbl_sel = (self._toggle << 31) | word
+        self.tbl_ctrl = (self._toggle << 31) | word
 
     def _load_lut(self, target, values, what):
         values = [int(v) & 0xFFFFFFFF for v in values]
         if not 1 <= len(values) <= 64:
             raise ValueError("%s must have 1..64 entries, got %d"
                              % (what, len(values)))
-        self.tbl_len = len(values)
-        for i, v in enumerate(values):
-            self.tbl_data_lo = v
-            self._tbl_commit(target, i)
+        n = len(values)
+        for base in range(0, n, self.BURST):
+            chunk = values[base:base + self.BURST]
+            for k, v in enumerate(chunk):
+                setattr(self, 'tbl_d%d' % (k,), v)
+            self._tbl_commit(target, addr=base, count=len(chunk), length=n)
 
     def load_alut(self, values):
         """Load the gd/kw a_k step-size schedule (frequency words)."""
@@ -970,26 +991,56 @@ class Adaptive_Sweep(SocIP):
         """Load the gd/kw c_k probe-width schedule (frequency words)."""
         self._load_lut(1, values, 'c_table')
 
-    def load_thresholds(self, values):
-        """Load the madstop threshold table (46-bit values, entry j for 2**j shots)."""
-        values = [int(v) for v in values]
-        if not 1 <= len(values) <= 32:
-            raise ValueError("thr_table must have 1..32 entries, got %d"
-                             % (len(values),))
-        for i, t in enumerate(values):
-            if not 0 <= t < (1 << 46):
-                raise ValueError("thr_table[%d]=%d does not fit in 46 bits"
-                                 % (i, t))
-        self.tbl_len = 0
-        for i, t in enumerate(values):
-            self.tbl_data_lo = t & 0xFFFFFFFF
-            self.tbl_data_hi = (t >> 32) & 0x3FFF
-            self._tbl_commit(2, i)
+    def set_estop_d(self, d):
+        """Write the raw early-stop reciprocal D (16-bit, 1..65535).
+
+        The split test passes a checkpoint iff
+        ``(|dI|+|dQ|) * D <= |SI|+|SQ|``, so D is the signal-to-noise ratio
+        the point must reach.  Prefer :meth:`set_estop_thr` unless you want
+        the register value itself.
+        """
+        d = int(d)
+        if not 1 <= d <= 0xFFFF:
+            raise ValueError("early-stop D must be in [1, 65535], got %d"
+                             % (d,))
+        self.tbl_d0 = d
+        self._tbl_commit(2)
+
+    def set_estop_thr(self, thr):
+        """Set the early-stop threshold as a noise/signal ratio in (0, 1].
+
+        Returns the realized threshold ``1/round(1/thr)``, which differs from
+        the requested one only where an integer reciprocal cannot express it
+        (coarse near 1, exact for any ``thr = 1/D``).
+        """
+        thr = float(thr)
+        if not 0.0 < thr <= 1.0:
+            raise ValueError("estop_thr is a noise/signal ratio and must be "
+                             "in (0, 1], got %r" % (thr,))
+        d = int(round(1.0 / thr))
+        if d > 0xFFFF:
+            raise ValueError("estop_thr=%g needs D=%d, past the 16-bit "
+                             "register's 65535; the finest threshold it can "
+                             "express is %g" % (thr, d, 1.0 / 0xFFFF))
+        self.set_estop_d(d)
+        return 1.0 / d
+
+    def set_ctrl(self, word):
+        """Write the CTRL register directly (target 3).
+
+        CTRL drives ``search_mode`` (bit 0, 0 peak / 1 dip), ``estop_hold``
+        (bit 4), ``estop_en`` (bit 6) and ``confirm`` (bits 19:17).  The
+        generated program sets it at init over QP2 OP2; writing it here
+        afterwards retargets a LOADED program, so those four can be swept
+        without a rebuild, exactly as the threshold can.
+        """
+        self.tbl_d0 = int(word) & 0xFFFFFFFF
+        self._tbl_commit(3)
 
     def load_tables(self, plan):
-        """Load every table a SweepPlan carries (thresholds, a-LUT, c-LUT)."""
-        if plan.thr_table:
-            self.load_thresholds(plan.thr_table)
+        """Load everything a SweepPlan carries (threshold, a-LUT, c-LUT)."""
+        if plan.estop_d:
+            self.set_estop_d(plan.estop_d)
         if plan.a_words:
             self.load_alut(plan.a_words)
         if plan.c_words:

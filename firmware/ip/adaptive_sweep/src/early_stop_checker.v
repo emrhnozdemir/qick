@@ -31,8 +31,7 @@ module early_stop_checker(
 
   output [15:0] log_entry_o,
   (* MARK_DEBUG = "TRUE" *) output reg signed [31:0] point_i_o,
-  (* MARK_DEBUG = "TRUE" *) output reg signed [31:0] point_q_o,
-  (* MARK_DEBUG = "TRUE" *) output reg point_valid_o
+  (* MARK_DEBUG = "TRUE" *) output reg signed [31:0] point_q_o
 );
 
   wire check;
@@ -137,9 +136,7 @@ module early_stop_checker(
     if (!rst_n) begin
       point_i_o <= 0;
       point_q_o <= 0;
-      point_valid_o <= 0;
     end else begin
-      point_valid_o <= retire_valid;
       if (retire_valid) begin
         point_i_o <= retire_num_i[retire_window +: 32];
         point_q_o <= retire_num_q[retire_window +: 32];

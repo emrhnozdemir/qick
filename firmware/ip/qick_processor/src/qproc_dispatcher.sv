@@ -15,6 +15,7 @@ module qproc_dispatcher # (
    //Port
    input  wire          core_en        ,
    input  wire          core_rst       ,
+   input  wire          trig_flush_i   , // discard queued triggers (interrupt abort)
    input  wire          time_en        ,
    input  wire          time_rst       ,
    input  wire  [47:0]  c_time_ref_dt  ,
@@ -214,7 +215,7 @@ generate
          .wr_en_i    ( 1'b1     ) ,
          .push_i     ( c_fifo_trig_push_s[ind_tfifo] ) ,
          .data_i     ( {c_fifo_data_in_r[0],c_fifo_time_in_r}  ) ,
-         .flush_i    ( core_rst     ),
+         .flush_i    ( core_rst | trig_flush_i     ),
          .rd_clk_i   ( t_clk_i      ) ,
          .rd_rst_ni  ( t_rst_ni     ) ,
          .rd_en_i    ( time_en_r    ) ,

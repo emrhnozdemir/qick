@@ -1497,9 +1497,11 @@ wire        as_interrupt;
    // the level, commits one write, so REG0 is written twice.
    task automatic as_write_estop_d(input [15:0] d);
       begin
+         // REG0 = {[31] toggle, [30:24] len, [23:21] count-1, [20:16] target,
+         //         [15:8] addr, [7:0] reserved}; REG1 = payload word 0
          as_axi_write(8'h04, {16'd0, d});
-         as_axi_write(8'h00, {1'b0, 21'd0, 2'd2, 2'd0, 6'd0});
-         as_axi_write(8'h00, {1'b1, 21'd0, 2'd2, 2'd0, 6'd0});
+         as_axi_write(8'h00, {1'b0, 7'd0, 3'd0, 5'd2, 8'd0, 8'd0});
+         as_axi_write(8'h00, {1'b1, 7'd0, 3'd0, 5'd2, 8'd0, 8'd0});
          repeat (20) @(posedge c_clk);
          $display("*** %t - adaptive_sweep early-stop threshold set: D=%0d (thr=1/%0d)",
                   $realtime(), d, d);
@@ -1793,6 +1795,15 @@ initial begin
             u_adaptive_sweep.drain_drop_cnt,
             AXIS_QPROC.QPROC.CORE_0.CORE_MEM.D_MEM.RAM[0],
             AXIS_QPROC.QPROC.CORE_0.CORE_MEM.D_MEM.RAM[1]);
+   // The stop log is not a buffer in the IP any more: the interrupt handler
+   // writes OP4's verdict word to dmem[log_addr + point] as it stops, with
+   // log_addr = result_addr + RESULT_BLOCK = 4.  One word per grid point,
+   // {nconv_count[15:0], 5'd0, 0, sat, converged, k[4:0], type[2:0]};
+   // a point that ran to the cap never interrupts, so its word stays 0.
+   $display("*** STOPLOG dmem[4]=0x%08x dmem[5]=0x%08x dmem[6]=0x%08x",
+            AXIS_QPROC.QPROC.CORE_0.CORE_MEM.D_MEM.RAM[4],
+            AXIS_QPROC.QPROC.CORE_0.CORE_MEM.D_MEM.RAM[5],
+            AXIS_QPROC.QPROC.CORE_0.CORE_MEM.D_MEM.RAM[6]);
    $display("*** End Test ***");
    $finish();
 end

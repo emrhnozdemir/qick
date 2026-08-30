@@ -184,7 +184,6 @@ module gradient_engine (
 
   wire signed [72:0] signed_sum;
   wire signed [72:0] signed_sum_next;
-  wire signed [72:0] magnitude_sum;
   wire signed [72:0] magnitude_sum_next;
 
   signed_accumulator #(.W(73)) signed_race(
@@ -203,7 +202,7 @@ module gradient_engine (
     .clr(race_clear),
     .en(race_enable),
     .d_i({8'd0, held_magnitude}),
-    .q_o(magnitude_sum),
+    .q_o(),
     .q_nxt_o(magnitude_sum_next)
   );
 

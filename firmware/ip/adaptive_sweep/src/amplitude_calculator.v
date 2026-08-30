@@ -81,7 +81,6 @@ module amplitude_calculator(
 
   (* MARK_DEBUG = "TRUE" *) wire signed [31:0] point_i;
   (* MARK_DEBUG = "TRUE" *) wire signed [31:0] point_q;
-  (* MARK_DEBUG = "TRUE" *) wire point_valid;
 
   accumulator acc(
     .clk(clk),
@@ -132,8 +131,7 @@ module amplitude_calculator(
     .shots_used_o(n_used_o),
     .log_entry_o(log_entry_o),
     .point_i_o(point_i),
-    .point_q_o(point_q),
-    .point_valid_o(point_valid)
+    .point_q_o(point_q)
   );
 
   assign mean_i_o = point_i;

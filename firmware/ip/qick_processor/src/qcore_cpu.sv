@@ -33,6 +33,7 @@ module qcore_cpu # (
 // INTERRUPT
    input   wire                  interrupt_i    , // External Redirect Request
    input   wire [PMEM_AW-1:0]    ipc_i          , // Interrupt Program Counter (0 = disarmed)
+   output  wire                  int_take_o     , // redirect taken (flushes the trigger queue)
 // DATA INPUT
    output wire [7:0]       sreg_cfg_o           ,
    output wire [7:0]       sreg_ctrl_o           ,
@@ -326,6 +327,7 @@ wire int_armed, int_take ;
 
 assign int_armed = |ipc_i ;
 assign int_take  = (interrupt_i | int_pend) & int_armed & fetch_en ;
+assign int_take_o = int_take ;
 
 always_ff @ (posedge clk_i) begin
    if      (!rst_ni)     int_pend <= 1'b0 ;

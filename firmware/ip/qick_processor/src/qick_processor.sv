@@ -146,6 +146,15 @@ wire [31:0]    core_usr_a_dt, core_usr_b_dt, core_usr_c_dt, core_usr_d_dt ;
 wire [ 4:0]    core_usr_operation ; // 4 bits for internal 5 bits for external
 
 // Control
+wire           int_take; // redirect taken -> discard queued triggers
+// REGISTERED. A combinational path from int_take to the trigger FIFO flush closes
+// a loop: flush_i -> async_full_o (_qproc_ips.sv) -> some_fifo_full -> core_en ->
+// fetch_en -> int_take. The flush only needs one cycle; clr_fifo_req latches it.
+reg            int_take_r;
+always_ff @(posedge c_clk_i, negedge c_rst_ni) begin
+   if (!c_rst_ni) int_take_r <= 1'b0;
+   else           int_take_r <= int_take;
+end
 reg            t_core_rst_prev_net; // NET Request to RESET the Processor and go to previous state
 
 ///// DUAL CORE
@@ -609,6 +618,7 @@ qproc_core # (
    .flag_i           ( flag_c0           ) ,
    .interrupt_i      ( interrupt_i       ) ,
    .ipc_i            ( xreg_TPROC_IPC[PMEM_AW-1:0] ) ,
+   .int_take_o       ( int_take          ) ,
    .sreg_cfg_o       ( core0_cfg         ) ,
    .sreg_ctrl_o      ( core0_ctrl        ) ,
    .sreg_arith_i     ( arith_result[31:0] ) ,
@@ -672,6 +682,7 @@ generate
          .port_dt_i        ( in_port_dt_r      ) ,
          .interrupt_i      ( 1'b0              ) ,
          .ipc_i            ( '0                ) ,
+         .int_take_o       (                   ) ,
          .sreg_arith_i     ( {arith_result[31:0],arith_result[63:32]}  ) ,
          .sreg_div_i       ( {div_quotient  ,div_remainder }  ) ,
          .sreg_status_i    ( sreg_status       ) ,
@@ -723,6 +734,7 @@ qproc_dispatcher # (
    //Port
    .core_en        ( core_en       ) ,  
    .core_rst       ( core_rst      ) ,  
+   .trig_flush_i   ( int_take_r    ) ,
    .time_en        ( time_en       ) ,  
    .time_rst       ( time_rst      ) ,   
    .c_time_ref_dt  ( c_time_ref_dt ) ,

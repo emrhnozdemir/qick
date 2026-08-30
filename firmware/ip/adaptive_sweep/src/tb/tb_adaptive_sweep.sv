@@ -158,21 +158,36 @@ module tb_adaptive_sweep;
 
   reg axi_tog;
 
-  task automatic axi_tbl_write(input [1:0] target, input [5:0] addr, input [31:0] data, input [13:0] hi, input [6:0] len);
+  // REG0 = {[31] toggle, [30:24] len, [23:21] count-1, [20:16] target,
+  //         [15:8] addr, [7:0] reserved}; REG1..REG7 = seven payload words.
+  task automatic axi_tbl_write(input [4:0] target, input [7:0] addr, input [31:0] data, input [6:0] len);
     begin
       axi_write(8'h04, data);
-      axi_write(8'h08, {18'd0, hi});
-      axi_write(8'h0C, {25'd0, len});
-      axi_write(8'h00, {axi_tog, 21'd0, target, 2'd0, addr});
+      axi_write(8'h00, {axi_tog, len, 3'd0, target, addr, 8'd0});
       axi_tog = ~axi_tog;
-      axi_write(8'h00, {axi_tog, 21'd0, target, 2'd0, addr});
+      axi_write(8'h00, {axi_tog, len, 3'd0, target, addr, 8'd0});
+      repeat (10) @(posedge clk);
+    end
+  endtask
+
+  task automatic axi_lut_burst4(input [4:0] target, input [7:0] addr,
+                                input [31:0] d0, input [31:0] d1,
+                                input [31:0] d2, input [31:0] d3, input [6:0] len);
+    begin
+      axi_write(8'h04, d0);
+      axi_write(8'h08, d1);
+      axi_write(8'h0C, d2);
+      axi_write(8'h10, d3);
+      axi_write(8'h00, {axi_tog, len, 3'd3, target, addr, 8'd0});
+      axi_tog = ~axi_tog;
+      axi_write(8'h00, {axi_tog, len, 3'd3, target, addr, 8'd0});
       repeat (10) @(posedge clk);
     end
   endtask
 
   task automatic axi_estop_thr(input [15:0] d);
     begin
-      axi_tbl_write(2'd2, 6'd0, {16'd0, d}, 14'd0, 7'd0);
+      axi_tbl_write(5'd2, 8'd0, {16'd0, d}, 7'd0);
       repeat (40) @(posedge clk);
     end
   endtask
@@ -408,11 +423,11 @@ module tb_adaptive_sweep;
     n_used_t1 = qtag_dt1_o;
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     status_t1 = qtag_dt1_o;
-    check32("T1 n_used (reset default log thr 96)", n_used_t1, 32'd8);
-    check32("T1 early_stop (reset default log thr 96)", {31'd0, status_t1[8]}, 32'd1);
+    check32("T1 n_used (reset default D=64)", n_used_t1, 32'd8);
+    check32("T1 early_stop (reset default D=64)", {31'd0, status_t1[8]}, 32'd1);
     check32("T1 estop_en", {31'd0, status_t1[10]}, 32'd1);
 
-    axi_estop_thr(16'd104);
+    axi_estop_thr(16'd101);
 
     qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
     qp2_op(5'd0, START_FREQ, STEP, 32'd1, AVG_THR_SH);
@@ -427,12 +442,19 @@ module tb_adaptive_sweep;
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     status_t2 = qtag_dt1_o;
     check32("T2 n_used (D=101, boundary pass)", n_used_t2, 32'd8);
-    check32("T2 early_stop (log thr 104)", {31'd0, status_t2[8]}, 32'd1);
+    check32("T2 early_stop (D=101, boundary pass)", {31'd0, status_t2[8]}, 32'd1);
     qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T2 mean I at stop", qtag_dt1_o, 32'd12928);
     check32("T2 mean Q at stop", qtag_dt2_o, 32'd0);
 
-    axi_estop_thr(16'd106);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T2 diag converged", {31'd0, qtag_dt2_o[8]}, 32'd1);
+    check32("T2 diag k (stop at 2^3)", {27'd0, qtag_dt2_o[7:3]}, 32'd3);
+    check32("T2 diag type (0 = converged)", {29'd0, qtag_dt2_o[2:0]}, 32'd0);
+    check32("T2 diag nconv_count", {16'd0, qtag_dt2_o[31:16]}, 32'd0);
+
+    axi_estop_thr(16'd102);
 
     qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
     qp2_op(5'd0, START_FREQ, STEP, 32'd1, AVG_THR_SH);
@@ -443,9 +465,37 @@ module tb_adaptive_sweep;
 
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
-    check32("T2b n_used (log thr 106, boundary fail)", qtag_dt1_o, AVG_THR);
+    check32("T2b n_used (D=102, boundary fail)", qtag_dt1_o, AVG_THR);
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
-    check32("T2b early_stop (log thr 106)", {31'd0, qtag_dt1_o[8]}, 32'd0);
+    check32("T2b early_stop (D=102, boundary fail)", {31'd0, qtag_dt1_o[8]}, 32'd0);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T2b diag converged (capped, so 0)", {31'd0, qtag_dt2_o[8]}, 32'd0);
+    check32("T2b diag type (4 = ran to the cap)", {29'd0, qtag_dt2_o[2:0]}, 32'd4);
+    check32("T2b diag nconv_count", {16'd0, qtag_dt2_o[31:16]}, 32'd1);
+
+    axi_estop_thr(16'd102);
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd2, AVG_THR_SH);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+
+    feed_alternating(AVG_THR, 100 * 128, 102 * 128);
+    feed_point(AVG_THR, 1000, 500);
+    wait_finish;
+
+    // The IP keeps no per-point history: OP4 always describes the point that
+    // retired last, and the interrupt handler is what files it under a grid
+    // index.  Point 0 here runs to the cap, point 1 converges at 8, so the
+    // verdict is point 1's and nconv_count has counted point 0.
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("TDIAG n_used of the last point", qtag_dt1_o, 32'd8);
+    check32("TDIAG last point converged", {31'd0, qtag_dt2_o[8]}, 32'd1);
+    check32("TDIAG last point k (stop at 2^3)", {27'd0, qtag_dt2_o[7:3]}, 32'd3);
+    check32("TDIAG last point type (0 = converged)", {29'd0, qtag_dt2_o[2:0]}, 32'd0);
+    check32("TDIAG nconv_count (point 0 ran to the cap)", {16'd0, qtag_dt2_o[31:16]}, 32'd1);
 
     axi_estop_thr(16'd96);
 
@@ -532,14 +582,10 @@ module tb_adaptive_sweep;
     check32("T9 mean I", qtag_dt1_o, 32'd96000);
     check32("T9 mean Q", qtag_dt2_o, 32'd0);
 
-    axi_tbl_write(2'd0, 6'd0, 32'd64, 14'd0, 7'd4);
-    axi_tbl_write(2'd0, 6'd1, 32'd32, 14'd0, 7'd4);
-    axi_tbl_write(2'd0, 6'd2, 32'd8, 14'd0, 7'd4);
-    axi_tbl_write(2'd0, 6'd3, 32'd2, 14'd0, 7'd4);
-    axi_tbl_write(2'd1, 6'd0, 32'd100, 14'd0, 7'd4);
-    axi_tbl_write(2'd1, 6'd1, 32'd50, 14'd0, 7'd4);
-    axi_tbl_write(2'd1, 6'd2, 32'd20, 14'd0, 7'd4);
-    axi_tbl_write(2'd1, 6'd3, 32'd10, 14'd0, 7'd4);
+    // one commit each, four entries per burst - the TL1 probe checks below
+    // are what verifies the burst engine wrote them to the right addresses
+    axi_lut_burst4(5'd0, 8'd0, 32'd64, 32'd32, 32'd8, 32'd2, 7'd4);
+    axi_lut_burst4(5'd1, 8'd0, 32'd100, 32'd50, 32'd20, 32'd10, 7'd4);
 
     qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
     qp2_op(5'd0, START_FREQ, STEP, N_POINTS, 32'd1);

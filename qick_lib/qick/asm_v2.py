@@ -175,9 +175,15 @@ class QP2Accel:
         one shared datapath implements all of them (see ``calc_ctrl``).
     calc_ctrl : dict
         Calc name -> the CTRL field values that select it.  ``adaptive_sweep``
-        has one accumulator and MUX-selected post-processing, so a calc name
-        is a combination of ``reduce_sel`` / ``prescale_en`` / ``estop_en``
-        rather than an index.
+        has ONE datapath, so a calc name is a CTRL preset, not an index.
+        Since 2026-08-24 the RTL IGNORES ``reduce_sel`` (CTRL[3:1]) and
+        ``prescale_en`` (CTRL[5]): the only field that changes behaviour is
+        ``estop_en``, plus ``confirm``.  So "shift" and "welford" are the
+        same hardware configuration -- the Welford running-mean pipeline was
+        deleted -- and "split" differs from them by one bit.  The names are
+        kept because programs and notebooks use them, and because
+        ``reduce_sel == 3`` is still what gates ``dump_log`` and ``CAP_DIV``.
+        See MODULE_GUIDE.txt section 7.3.
     gdkw_calcs : tuple of str
         Subset of ``calcs`` usable with the GD/KW engine.  The engine consumes
         a 64-bit power (sized for the 32-bit-mean schemes); only a scheme
@@ -185,8 +191,6 @@ class QP2Accel:
         router saturates it rather than wrapping, but it is still wrong.
     lut_depth : int
         Depth of the a/c schedule LUTs (0 if absent).
-    thr_depth : int
-        Depth of the madstop threshold table (0 if absent).
     """
 
     name: str
@@ -199,7 +203,6 @@ class QP2Accel:
     calc_ctrl: Dict[str, Dict[str, int]] = field(default_factory=dict)
     gdkw_calcs: Tuple[str, ...] = ()
     lut_depth: int = 0
-    thr_depth: int = 0
 
     def op(self, mnemonic):
         """Look up an op by mnemonic, with a helpful error."""
@@ -329,7 +332,6 @@ FINE_TUNING_SWEEP = QP2Accel(
     calc_ctrl={"shift": {}},
     gdkw_calcs=(),
     lut_depth=0,
-    thr_depth=0,
 )
 
 
@@ -347,16 +349,20 @@ _AS_OPS = {
             "dt1": _word("start_freq", signed=True),
             "dt2": _word("step", signed=True),
             "dt3": _word("n_points"),
-            "dt4": _word("averager_value"),
+            "dt4": (Field("avg_shift", 5, 0),),
         },
         doc="grid window; 'step' doubles as the GD forward-probe spacing and "
-            "the racing-mode fixed step (fstep_i), and 'averager_value' is the "
-            "shot count every amp_calc variant folds per armed point",
+            "the racing-mode fixed step (fstep_i), and 'avg_shift' is the "
+            "log2 of the shot count folded per armed point. It is an EXPONENT, "
+            "not a count: shot_counter watches bit avg_shift of the shot "
+            "number, so the cap is exactly 1 << avg_shift (register_bank.v "
+            "avg_shift_o <= dt4_i[4:0]). Sending a raw count aliases - 32 "
+            "would land as dt4[4:0]=0, a one-shot cap.",
     ),
     "START": QP2Op(
         number=1, mnemonic="START", blocking=True, responds=True,
         resp={"dt1": _word("freq_at_best", signed=True), "dt2": _word("zero")},
-        doc="start the grid sweep (peak_finder_wide walks the grid)",
+        doc="start the grid sweep (peak_finder walks the grid)",
     ),
     "CFG_ACQ": QP2Op(
         number=2, mnemonic="CFG_ACQ",
@@ -367,35 +373,26 @@ _AS_OPS = {
                     Field("estop_hold", 1, 4),
                     Field("prescale_en", 1, 5),
                     Field("estop_en", 1, 6),
-                    Field("estop_sel", 2, 7),
-                    Field("m", 4, 9),
-                    Field("ckmon_en", 1, 13),
-                    Field("nmul", 3, 14),
                     Field("confirm", 3, 17)),
             "dt3": _word("n0"),
             "dt4": _word("n_min"),
         },
         doc="nsamp and the CTRL word: mode (0 peak/1 dip); reduce_sel "
-            "(1 round-shift / 2 running mean / 3 exact 32-bit mean of raw "
-            "shot sums, divided by the realized shot count at retirement; "
-            "0 is reserved - the raw-sum reduction was removed with the "
-            "128-bit power bus); estop_hold (0 immediate emit / 1 "
-            "freeze-and-drain); prescale_en (stage-1 round-shift by "
-            "flog2(nsamp)); estop_en; estop_sel (0 mad threshold table / "
-            "1 split family / 2 ckdiff / 3 reserved); m (split-family "
-            "precision: pass iff |dI|+|dQ| <= (|SI|+|SQ|)>>m); ckmon_en (run "
-            "the ckdiff test as a drift monitor beside the split stopper); "
-            "nmul (how many odd multipliers the checkpoint grid uses, so "
-            "every checkpoint is N = m*2^k with m drawn from the first nmul "
-            "of {1,3,5,7}: 0 or 1 = powers of two only 4,8,16,... and the "
-            "retirement divide degenerates to a pure shift, 2 = {1,3} "
-            "half-octave, 4 = {1,3,5,7} quarter-octave from 8; 4 is the "
-            "maximum); "
+            "(IGNORED BY THE RTL since 2026-08-24 - there is one datapath; "
+            "still set because reduce_sel==3 gates dump_log and CAP_DIV on "
+            "the Python side); estop_hold (0 immediate emit / 1 "
+            "freeze-and-drain); prescale_en (IGNORED since 2026-08-24 - the "
+            "raw 32-bit shot sum goes straight into the 58-bit "
+            "accumulators); estop_en (the split test is the only stopper; "
+            "its threshold is not in this word - it lives in the IP's AXI "
+            "register, written by the Adaptive_Sweep driver); "
             "confirm (consecutive passing checkpoints required to stop; the "
-            "presets send 2/3/5 for nmul 0/2/4). dt3 = n0 "
-            "(running-mean warmup), dt4 = n_min (mad: first tested epoch, 0 "
-            "disables; split family: eligibility floor, any value, 0 makes "
-            "every checkpoint eligible)",
+            "preset sends 2). The checkpoint grid is the doubling grid "
+            "4, 8, 16, ... and is not configurable - CTRL[16:14] held an "
+            "`nmul` field for the {1,3}/{1,3,5,7} grids until 2026-08-23 and "
+            "is now reserved. dt3 = n0 "
+            "(running-mean warmup), dt4 = n_min (eligibility floor, any "
+            "value, 0 makes every checkpoint eligible)",
     ),
     "GET_STATUS": QP2Op(
         number=3, mnemonic="GET_STATUS", responds=True,
@@ -404,12 +401,10 @@ _AS_OPS = {
     ),
     "GET_DIAG": QP2Op(
         number=4, mnemonic="GET_DIAG", responds=True,
-        resp={"dt1": _word("n_used"), "dt2": _word("dev_acc_hi")},
+        resp={"dt1": _word("n_used"), "dt2": _word("diag")},
         doc="diag read -> dt1 = n_used (shots folded into the last emitted "
-            "point); dt2 depends on CTRL estop_sel: mad gives dev_acc[45:14] "
-            "(live MAD accumulator, top 32 bits), the split family gives "
-            "{nconv_count[15:0], 5'd0, drift, sat, conv, k[4:0], type[2:0]} "
-            "- decode with AS_DIAG_FIELDS",
+            "point); dt2 = {nconv_count[15:0], 6'd0, sat, conv, k[4:0], "
+            "type[2:0]} - decode with AS_DIAG_FIELDS",
     ),
     "RUN_GD": QP2Op(
         number=5, mnemonic="RUN_GD", blocking=True, responds=True,
@@ -483,23 +478,6 @@ _AS_OPS = {
             "the last job was a grid sweep, the last probe's for gd/kw; "
             "meaningful for the mean32 (reduce_sel=3) calcs",
     ),
-    "GET_LOG": QP2Op(
-        number=12, mnemonic="GET_LOG", responds=True,
-        args={"dt1": (Field("index", 12, 0),)},
-        resp={"dt1": (Field("log_type", 3, 0),
-                      Field("log_k", 5, 3),
-                      Field("log_converged", 1, 8),
-                      Field("log_saturated", 1, 9),
-                      Field("log_drift", 1, 10),
-                      Field("log_valid", 1, 31)),
-              "dt2": (Field("log_count", 16, 0),)},
-        doc="per-measurement stop log read (response arrives one cycle after "
-            "the op - the log RAM read is synchronous): the stop shot count "
-            "is N = m*2^k with m = (1, 3, 5, 7) for type = (0, 1, 2, 3); "
-            "type 4 = ran to the cap (N is then the averager value, k = 0); "
-            "valid=0 past the current job's count; the log holds the first "
-            "4096 measurements of a job",
-    ),
     "CAP_DIV": QP2Op(
         number=13, mnemonic="CAP_DIV",
         args={
@@ -508,7 +486,13 @@ _AS_OPS = {
                     Field("kp1", 6, 22)),
             "dt3": (Field("sft", 5, 0),),
         },
-        doc="cap-retirement reciprocal: the Granlund-Montgomery magic for the "
+        doc="*** NOT DECODED BY THE RTL SINCE 2026-08-24. *** gm_divider.v "
+            "was deleted; the averager cap is a power of two and retirement "
+            "is a plain truncating shift, so there is no reciprocal to load. "
+            "Still emitted for split plans, where it is one dead instruction "
+            "(the op expects no response, so it cannot hang). "
+            "Historic meaning: "
+            "cap-retirement reciprocal: the Granlund-Montgomery magic for the "
             "averager value, computed by gm_magic() at program build and sent "
             "once before the job. mag = {mag_hi, mag_lo} (54 bits), kp1 = "
             "ctz(avg)+1 (up to 32, so caps to 2^31), sft = p-52. "
@@ -528,22 +512,22 @@ _AS_OPS = {
     ),
 }
 
-# GET_DIAG dt2 for the split-family early stops (CTRL estop_sel != 0)
+# GET_DIAG dt2 for the split early stop
 AS_DIAG_FIELDS = (
     Field("type", 3, 0),
     Field("k", 5, 3),
     Field("converged", 1, 8),
     Field("saturated", 1, 9),
-    Field("drift_suspect", 1, 10),
     Field("nconv_count", 16, 16),
 )
 
 # status_word, built by src/ctrl_status_reg.v:
 #   {point_idx[15:0], eng_freq_valid, eng_busy, eng_converged, eng_capped,
 #    dest, estop_en, prescale_en, early_stop, warmup_done, reduce_sel, mode,
-#    busy, finish_seen, drift_suspect}
+#    busy, finish_seen, reserved}
+# bit 0 was drift_suspect and is now hardwired 0: the drift monitor was the
+# ckdiff test running beside the split stopper, and ckdiff is gone.
 _AS_STATUS = (
-    Field("drift_suspect", 1, 0),
     Field("finish_seen", 1, 1),
     Field("busy", 1, 2),
     Field("mode", 1, 3),
@@ -569,51 +553,32 @@ ADAPTIVE_SWEEP = QP2Accel(
     ops=_AS_OPS,
     status_bits=_AS_STATUS,
     algorithms=("grid", "gd", "kw"),
-    # One shared datapath (src/amp_calc.v): a single 64-bit accumulator whose
-    # post-processing is MUX-selected, with the early stop as an independent
-    # enable.  A calc name is therefore a CTRL preset, not a hardware index.
-    calcs=("shift", "welford", "madstop",
-           "split", "ckdiff", "hsplit", "quarter"),
+    # One shared datapath (src/amplitude_calculator.v): 58-bit S and D
+    # accumulators, one early_stop_checker, one square_summer.  A calc name is
+    # a CTRL preset, not a hardware index -- and since the 2026-08-24 rebuild
+    # only estop_en/confirm survive as live fields (see calc_ctrl above).
+    calcs=("shift", "welford", "split"),
     calc_ctrl={
         "shift":   dict(reduce_sel=1, prescale_en=1, estop_en=0),
         "welford": dict(reduce_sel=2, prescale_en=1, estop_en=0),
-        "madstop": dict(reduce_sel=1, prescale_en=1, estop_en=1),
-        # repetition-axis early stops: raw 32-bit shot sums into the mean32
+        # repetition-axis early stop: raw 32-bit shot sums into the mean32
         # reduction (exact divide by the realized shot count at retirement).
-        # split, hsplit and quarter are the SAME decision module at three
-        # checkpoint grids (estop_sel=1 + nmul), with the confirm depth the
-        # calibration demands for each grid; they are named presets over
-        # nmul, and adaptive_sweep(nmul=...) reaches the same settings
-        # directly.  ckdiff is its own module and is always on the doubling
-        # grid, so it takes no nmul.  The precision m and the ckmon monitor
-        # bit are user parameters (plan.m / plan.ckmon), not preset values,
-        # so they are packed separately by _config.
-        "split":   dict(reduce_sel=3, prescale_en=0, estop_en=1, estop_sel=1,
-                        nmul=0, confirm=2),
-        "ckdiff":  dict(reduce_sel=3, prescale_en=0, estop_en=1, estop_sel=2,
-                        nmul=0, confirm=2),
-        "hsplit":  dict(reduce_sel=3, prescale_en=0, estop_en=1, estop_sel=1,
-                        nmul=2, confirm=3),
-        "quarter": dict(reduce_sel=3, prescale_en=0, estop_en=1, estop_sel=1,
-                        nmul=4, confirm=5),
+        # The threshold is NOT in the CTRL word - it is an AXI register the
+        # Adaptive_Sweep driver writes, so a threshold sweep needs no program
+        # rebuild.  2026-08-23: the "hsplit" and "quarter" presets (the
+        # half- and quarter-octave checkpoint grids) were REMOVED with the
+        # m = 3, 5, 7 reciprocal lookup they retired through.  The grid is
+        # the doubling grid, confirm 2, and there is nothing to select.
+        "split":   dict(reduce_sel=3, prescale_en=0, estop_en=1, confirm=2),
     },
     # the whole result path is 64 bits wide now, sized for the mean32
     # calcs' 2^63 maximum power, so every calc can drive the gd/kw engine
-    gdkw_calcs=("shift", "welford", "madstop",
-                "split", "ckdiff", "hsplit", "quarter"),
+    gdkw_calcs=("shift", "welford", "split"),
     lut_depth=64,
-    thr_depth=32,
 )
 
 
 ACCELS = {a.name: a for a in (FINE_TUNING_SWEEP, ADAPTIVE_SWEEP)}
-
-# Confirm depth is calibrated per checkpoint grid, not a free choice: 2 / 3 / 5
-# for nmul 0 / 2 / 4 all span exactly one doubling of N (4->8, 4->6->8,
-# 8->10->12->14->16).  A shallower streak on a finer grid stops too close to
-# the test boundary and the achieved error degrades (quarter at confirm 4:
-# err>2t 6.7% against the 3.5-4.5% baseline).
-_AS_NMUL_CONFIRM = {0: 2, 1: 2, 2: 3, 4: 5}
 
 
 def get_accel(name):
@@ -845,6 +810,7 @@ class SweepPlan:
     ro_step: int = 0
 
     avg: int = 1
+    avg_shift: int = 0
     nsamp: int = 1
     mode: int = 0
     trig_time: float = 0.0
@@ -854,15 +820,14 @@ class SweepPlan:
     n0: int = 0
     n_min: int = 0
     emit_mode: int = 0
-    m: int = 0
-    ckmon: int = 0
-    nmul: int = 0
+    estop_thr_requested: float = 0.0
+    estop_thr: float = 0.0
+    estop_d: int = 0
     confirm: int = 0
     avg_requested: int = 0
     avg_rounded: int = 0
     dump_log: int = 0
     log_addr: int = 0
-    thr_table: List[int] = field(default_factory=list)
 
     # gd/kw
     x0_mhz: Optional[float] = None
@@ -1045,8 +1010,8 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                start=None, stop=None, step=None, n_points=None,
                avg=1, nsamp=None, mode="peak",
                trig_time=0.0, shot_period=None,
-               n0=None, n_min=None, thr_table=None, emit_mode=None,
-               m=None, ckmon=False, nmul=None,
+               n0=None, n_min=None, emit_mode=None,
+               estop_thr=None,
                x0=None, min_step=None, max_iter=None, patience=None,
                a_table=None, c_table=None,
                use_lut=None, lambda_=0, m_min=2, m_max=8,
@@ -1222,6 +1187,31 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                  "frequency the tone never played. Narrow the band."
                  % (min(ends), max(ends), b_dds))
 
+    # The accelerator's cap is a power of two by construction: shot_counter
+    # tests bit avg_shift of the shot number, so the cap IS 1 << avg_shift and
+    # CFG_WINDOW carries the exponent.  This holds for every calc, not just the
+    # early-stopping one, because the cap comes from the same counter.  A
+    # request that is not a power of two is rounded UP, never down - the caller
+    # asked for at least that many shots - and plan.avg is retargeted with it so
+    # the tProcessor's shot loop and the IP's cap stay the same number.
+    plan.avg_requested = avg
+    if avg & (avg - 1):
+        rounded = 1 << avg.bit_length()
+        warnings.warn(
+            "avg=%d is not a power of two; the accelerator's shot cap is "
+            "1 << avg_shift, so it was rounded UP to %d (+%d shots per "
+            "point). plan.avg_requested keeps what you asked for, and "
+            "plan.avg_rounded flags that this happened."
+            % (avg, rounded, rounded - avg), stacklevel=3)
+        avg = rounded
+        plan.avg = rounded
+        plan.avg_rounded = 1
+    plan.avg_shift = avg.bit_length() - 1
+    _require(plan.avg_shift <= 26,
+             "avg=%d needs avg_shift=%d, above the 26 that shot_counter "
+             "clamps to (its cap tops out at 2**26 = %d shots)"
+             % (avg, plan.avg_shift, 1 << 26))
+
     # --- calc-specific -----------------------------------------------------
     if calc == "welford":
         _require(n0 is not None,
@@ -1232,86 +1222,41 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     elif n0 is not None:
         raise ValueError("n0 only applies to calc='welford'")
 
-    if calc == "madstop":
-        _require(thr_table is not None,
-                 "calc='madstop' needs thr_table=: the per-epoch deviation "
-                 "thresholds, in LSB units, indexed by log2(shot count)")
-        thr = [int(t) for t in thr_table]
-        _require(len(thr) <= accel.thr_depth,
-                 "thr_table has %d entries but the threshold table is only %d "
-                 "deep" % (len(thr), accel.thr_depth))
-        for i, t in enumerate(thr):
-            _require(0 <= t < (1 << 46),
-                     "thr_table[%d]=%d does not fit in the 46-bit threshold "
-                     "register" % (i, t))
-        # the table is indexed by log2(shot count), and the last epoch tested
-        # is the one at or below avg, so it has to reach that far
-        need = int(avg).bit_length() - 1 if avg else 0
-        _require(len(thr) > need,
-                 "thr_table has %d entries but avg=%d reaches epoch %d, so it "
-                 "needs at least %d; an unwritten entry reads as 0 and would "
-                 "silently disable the early stop at that epoch"
-                 % (len(thr), avg, need, need + 1))
-        plan.thr_table = thr
-        plan.n_min = 0 if n_min is None else int(n_min)
-        _require(plan.n_min == 0 or (plan.n_min & (plan.n_min - 1)) == 0,
-                 "n_min must be a power of two (it is an epoch boundary) or 0 "
-                 "to disable early stopping, got %s" % (n_min,))
-        _require(plan.n_min <= avg,
-                 "n_min=%d exceeds avg=%d, so the early stop could never fire"
-                 % (plan.n_min, avg))
-        if emit_mode is None:
-            if algorithm == "grid" and not interrupt:
-                emit_mode = "drain"
-            else:
-                emit_mode = "immediate"
-        _require(emit_mode in ("immediate", "drain"),
-                 "emit_mode must be 'immediate' or 'drain', got %r" % (emit_mode,))
-        if algorithm == "grid" and emit_mode == "immediate" and not interrupt:
-            raise ValueError(
-                "emit_mode='immediate' breaks the grid lockstep: the IP would "
-                "advance to the next point as soon as a point converges, while "
-                "the tProc keeps firing its fixed avg shots per point, and the "
-                "two desynchronise. Use emit_mode='drain' under "
-                "algorithm='grid', or interrupt=True, which aborts the tProc's "
-                "shot loop when the point converges so the two stay in step; "
-                "if you want the IP to advance early, drive "
-                "it from the OP3 status (point_idx / early_stop) with "
-                "algorithm='gd' or 'kw' instead.")
-        plan.emit_mode = 1 if emit_mode == "drain" else 0
-        _require(m is None,
-                 "m only applies to the split-family calcs; madstop's "
-                 "precision lives in its threshold table")
-        _require(nmul is None,
-                 "nmul only applies to the split-family calcs; madstop tests "
-                 "at power-of-two epochs by construction")
-        _require(not ckmon, "ckmon only applies to calc='split'")
-    elif calc in ("split", "ckdiff", "hsplit", "quarter"):
-        _require(thr_table is None, "thr_table only applies to calc='madstop'")
+    if calc == "split":
         _require(avg <= 1 << 31,
                  "avg=%d exceeds 2^31, the most the tProc's 32-bit shot "
                  "loop can count" % (avg,))
-        plan.avg_requested = avg
-        rounded = gm_safe_cap(avg)
-        if rounded != avg:
+        # The stop test is |dI|+|dQ| <= estop_thr * (|SI|+|SQ|).  The IP does
+        # not hold the ratio, it holds the integer reciprocal
+        # D = round(1/estop_thr) in a 16-bit AXI register, and compares
+        # (|dI|+|dQ|)*D against |SI|+|SQ| - so any ratio is reachable, not
+        # just the powers of two the old CTRL shift could express, and the
+        # value that actually decides is 1/D.  It lives in a register rather
+        # than the program image so a threshold sweep needs no rebuild: write
+        # it with Adaptive_Sweep.set_estop_thr() (or load_tables(plan)).
+        req = 1.0 / 64 if estop_thr is None else float(estop_thr)
+        _require(0.0 < req <= 1.0,
+                 "estop_thr is a noise/signal ratio and must be in (0, 1], "
+                 "got %s" % (estop_thr,))
+        d = int(round(1.0 / req))
+        _require(d <= 0xFFFF,
+                 "estop_thr=%g needs D=round(1/thr)=%d, past the 16-bit "
+                 "threshold register's 65535; the finest threshold the "
+                 "register can express is %g" % (req, d, 1.0 / 0xFFFF))
+        plan.estop_thr_requested = req
+        plan.estop_d = d
+        plan.estop_thr = 1.0 / d
+        if abs(plan.estop_thr - req) > 0.01 * req:
             warnings.warn(
-                "avg=%d has odd part %d, above the cap divider's 699050 "
-                "exactness bound; rounded UP to the nearest exactly "
-                "divisible cap, %d (+%d shots per capped point). Points "
-                "that ran to the cap are flagged converged=0 / capped in "
-                "the stop log." % (avg,
-                                   avg >> ((avg & -avg).bit_length() - 1),
-                                   rounded, rounded - avg), stacklevel=3)
-            avg = rounded
-            plan.avg = rounded
-            plan.avg_rounded = 1
-        plan.m = 6 if m is None else int(m)
-        _require(0 <= plan.m <= 15,
-                 "m must be in [0, 15] (the CTRL[12:9] precision exponent), "
-                 "got %s" % (m,))
-        # unlike madstop, n_min is an eligibility floor, not an epoch index:
-        # any value is legal, and the first checkpoint at or above it is the
-        # first that may stop. 0 makes every checkpoint eligible.
+                "estop_thr=%g is not representable: D must be an integer, so "
+                "the realized threshold is 1/%d = %g, %.1f%% away from what "
+                "you asked for. Steps are coarse near thr=1 and fine below "
+                "thr=0.01; a threshold of the form 1/D is always exact."
+                % (req, d, plan.estop_thr,
+                   100.0 * abs(plan.estop_thr - req) / req), stacklevel=3)
+        # n_min is an eligibility floor, not an epoch index: any value is
+        # legal, and the first checkpoint at or above it is the first that
+        # may stop. 0 makes every checkpoint eligible.
         plan.n_min = 0 if n_min is None else int(n_min)
         _require(0 <= plan.n_min <= avg,
                  "n_min=%s exceeds avg=%d, so the early stop could never fire "
@@ -1334,47 +1279,11 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                 "tProc's shot loop when the point converges - or serve each "
                 "frequency through algorithm='gd'/'kw'.")
         plan.emit_mode = 1 if emit_mode == "drain" else 0
-        _require(not ckmon or calc == "split",
-                 "ckmon=True runs the ckdiff test as a drift monitor beside "
-                 "the split stopper, so it only applies to calc='split'")
-        plan.ckmon = 1 if ckmon else 0
-        # nmul says how many odd multipliers the checkpoint grid uses, so
-        # every checkpoint is N = m*2^k with m from the first nmul of
-        # {1,3,5,7}.  0 or 1 keeps every checkpoint a power of two, which
-        # also makes the retirement divide a pure shift (no reciprocal
-        # multiply at all).  It is the same knob the split / hsplit /
-        # quarter preset names set, exposed directly so a test can sweep the
-        # grid without changing calc.
-        if nmul is None:
-            plan.nmul = plan.calc_fields.get("nmul", 0)
-        else:
-            _require(calc != "ckdiff",
-                     "nmul does not apply to calc='ckdiff': its test compares "
-                     "a sum against twice the previous checkpoint's sum, which "
-                     "is only meaningful on the doubling grid")
-            nmul = int(nmul)
-            _require(nmul in (0, 1, 2, 4),
-                     "nmul must be 0 or 1 (powers of two only), 2 ({1,3}) or "
-                     "4 ({1,3,5,7}); 4 is the maximum the checkpoint "
-                     "generator and the reciprocal ROM implement, got %s"
-                     % (nmul,))
-            plan.nmul = nmul
-            plan.calc_fields["nmul"] = nmul
-            plan.calc_fields["confirm"] = _AS_NMUL_CONFIRM[nmul]
         plan.confirm = plan.calc_fields.get("confirm", 0)
     else:
-        _require(nmul is None,
-                 "nmul only applies to the split-family calcs (split, hsplit, "
-                 "quarter); it selects their checkpoint grid")
-        _require(thr_table is None, "thr_table only applies to calc='madstop'")
-        _require(n_min is None,
-                 "n_min only applies to calc='madstop' and the "
-                 "split-family calcs")
-        _require(emit_mode is None,
-                 "emit_mode only applies to calc='madstop' and the "
-                 "split-family calcs")
-        _require(m is None, "m only applies to the split-family calcs")
-        _require(not ckmon, "ckmon only applies to calc='split'")
+        _require(n_min is None, "n_min only applies to calc='split'")
+        _require(emit_mode is None, "emit_mode only applies to calc='split'")
+        _require(estop_thr is None, "estop_thr only applies to calc='split'")
 
     # --- gd/kw -------------------------------------------------------------
     if plan.handshake:
@@ -1483,20 +1392,25 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     if dump_log is None:
         dump_log = (algorithm == "grid"
                     and calc_fields.get("reduce_sel") == 3
-                    and accel.has_op("GET_LOG"))
+                    and bool(plan.interrupt)
+                    and accel.has_op("GET_DIAG"))
     plan.dump_log = 1 if dump_log else 0
     if plan.dump_log:
         _require(algorithm == "grid",
-                 "dump_log applies to grid sweeps; a gd/kw run reads its "
-                 "probe log with OP12 directly")
+                 "dump_log applies to grid sweeps; a gd/kw run revisits "
+                 "frequencies, so it has no grid index to file a stop under")
         _require(calc_fields.get("reduce_sel") == 3
-                 and accel.has_op("GET_LOG"),
-                 "dump_log needs a mean32 calc (split/ckdiff/hsplit/"
-                 "quarter): only their retirements write the stop log")
-        _require(plan.n_points <= 4096,
-                 "the stop log holds 4096 measurements but this sweep has "
-                 "%d points, so the log would wrap; disable dump_log or "
-                 "split the sweep" % (plan.n_points,))
+                 and accel.has_op("GET_DIAG"),
+                 "dump_log needs a mean32 calc (split): only its points stop "
+                 "early, and only an early stop raises the interrupt that "
+                 "records one")
+        _require(plan.interrupt,
+                 "dump_log needs interrupt=True. The log is not a buffer "
+                 "inside the accelerator any more - it is written by the "
+                 "tProcessor's interrupt handler, one word at "
+                 "dmem[log_addr + point]. In drain mode the tProcessor is "
+                 "never told that a point stopped, so there is nothing to "
+                 "record.")
         base = log_addr
         if base is None:
             base = plan.result_addr + RESULT_BLOCK
@@ -2469,8 +2383,7 @@ class AdaptiveSweep(Macro):
         cfg = dict(nsamp=plan.nsamp, mode=plan.mode)
         if 'reduce_sel' in accel.op('CFG_ACQ').field_names():
             cfg.update(plan.calc_fields)
-            cfg.update(estop_hold=plan.emit_mode, n0=plan.n0, n_min=plan.n_min,
-                       m=plan.m, ckmon_en=plan.ckmon)
+            cfg.update(estop_hold=plan.emit_mode, n0=plan.n0, n_min=plan.n_min)
         asm.qpb_send(accel, 'CFG_ACQ', **cfg)
         if plan.calc_fields.get('reduce_sel') == 3 and accel.has_op('CAP_DIV'):
             mag, kp1, sft = gm_magic(plan.avg)
@@ -2494,7 +2407,7 @@ class AdaptiveSweep(Macro):
         asm.inc_reg(dst='w_freq', src=to_s32(delta))
         asm.write_wmem(wave)
 
-    def _landing_block(self, prog, asm, plan, resume_label):
+    def _landing_block(self, prog, asm, plan, resume_label, reg_point=None):
         """Where the IPC redirect lands when a point stops early.
 
         The tProc gets here mid-shot-loop, having abandoned the rest of the
@@ -2535,13 +2448,62 @@ class AdaptiveSweep(Macro):
         else:
             asm.asm_inst({'CMD': 'TRIG', 'SRC': 'clr',
                           'DST': str(rocfg['trigger_port']), 'TIME': '@0'})
+        # Take the verdict BEFORE spending the drain time, not after.  The IP
+        # is parked from the moment the interrupt fires - `draining` is set,
+        # no new point can be armed until REARM, and the stop registers hold
+        # until the next arm - so it is readable anywhere in this block.  It
+        # is read here because that is the earliest moment it is valid, and
+        # because a capture should not be sitting behind a wait it does not
+        # depend on.  OP4's dt2 carries the whole verdict - {nconv_count,
+        # saturated, converged, k, type} - and the shot count is 1 << k, so
+        # one word per point is the entire log.  It is filed under the grid
+        # index the tProcessor is already holding, which is why no frequency
+        # has to be sent back.
+        if plan.dump_log and reg_point is not None:
+            reg_a = prog.add_reg('%s_log_a' % (plan.name), allow_reuse=True)
+            asm.qpb_send(plan.accel, 'GET_DIAG')
+            asm.qpb_wait_new()
+            asm.append_macro(AluReg(dst=reg_a, arg1=reg_point, op='+',
+                                    arg2=plan.log_addr))
+            asm.write_dmem(addr=reg_a, src='s_core_r2')
+            asm.qpb_ack()
+        # The committed shot's TRIGGER was cancelled in hardware: int_take
+        # flushes the dispatcher's TRIGGER FIFO (qick_processor.sv ->
+        # qproc_dispatcher.sv), so that shot never opens a readout window and
+        # the averager never produces an m2 word for it.  Only the trigger
+        # queue is flushed - the PULSE still plays, which keeps the resonator's
+        # drive history identical to an ordinary shot.
+        #
+        # That cancellation only lands if the trigger had not already fired.
+        # s11 (s_usr_time = absolute - reference) is SIGNED, and while it is
+        # negative the reference is still ahead of real time, so nothing
+        # scheduled at it has gone out: not the pulse at t=0, and certainly not
+        # the trigger at t=trig_time.  Testing its sign is therefore a
+        # schedule-exact question, not a fabric-latency one, and it is
+        # conservative in the safe direction - if it fails we simply take the
+        # old deadline.  The failure mode is slower, never wrong.
+        skip_drain = self._label(prog, 'nodrain')
+        rearmed = self._label(prog, 'rearmed')
+        asm.append_macro(CondJump(label=skip_drain, arg1='s_usr_time',
+                                  op=None, arg2=None, test='S'))
+        # slow path: a window is already open, so wait for its word to land
         asm.wait(quiet)
         # the bus select survives: the interrupt can only fire from inside the
         # shot loop, which never touches it
         asm.qpb_send(plan.accel, 'REARM')
-        # the waits above left the reference in the past; put it back ahead of
-        # real time so the next shot's pulse and trigger keep their spacing
+        # the wait left the reference in the past; put it back ahead of real
+        # time so the next shot's pulse and trigger keep their spacing
         asm.resync(plan.shot_period)
+        asm.jump(rearmed)
+        # fast path: nothing was ever measured, so there is nothing to drain.
+        # delay(), not resync(): the reference is still sitting on the cancelled
+        # shot's pulse, and advancing it by one shot_period puts the next pulse
+        # exactly one period after the one that played.  resync() would rebase
+        # on real time and close that gap.
+        asm.label(skip_drain)
+        asm.qpb_send(plan.accel, 'REARM')
+        asm.delay(plan.shot_period)
+        asm.label(rearmed)
         asm.jump(resume_label)
         asm.label(end_label)
 
@@ -2598,19 +2560,26 @@ class AdaptiveSweep(Macro):
             asm.qpb_ack()
             plan.writes_diag = True
         if plan.dump_log:
-            reg_i = prog.add_reg('%s_log_i' % (plan.name))
-            reg_a = prog.add_reg('%s_log_a' % (plan.name))
-            label = self._label(prog, 'logdump')
-            asm.write_reg(dst=reg_i, src=0)
-            asm.label(label)
-            asm.pb(accel.op('GET_LOG').number, r1=reg_i)
+            # The last grid point is the one the interrupt handler cannot
+            # record.  Its stop and the sweep's own completion land within a
+            # few tens of nanoseconds of each other, and pf_finish latches the
+            # result registers and refuses every read until CLR_RESULT - so
+            # the handler's read is turned away and it stores the frozen word
+            # instead.  The verdict is not lost, though: the IP keeps it until
+            # the next START.  Read it once here, after CLR_RESULT has
+            # released the hold, and overwrite that one slot.
+            asm.qpb_send(accel, 'GET_DIAG')
             asm.qpb_wait_new()
-            asm.append_macro(AluReg(dst=reg_a, arg1=reg_i, op='+',
-                                    arg2=plan.log_addr))
-            asm.write_dmem(addr=reg_a, src='s_core_r1')
+            # REGISTER-ADDRESSED, not literal.  result_addr is capped at
+            # LITERAL_DMEM_MAX by plan_sweep, but log_addr is not - it is only
+            # checked against dmem_size, because a 4001-point log has to live
+            # past the 11-bit literal range.  log_addr + n_points - 1 = 4004
+            # for the notebook sweep, which a literal DMEM_WR cannot encode.
+            reg_a = prog.add_reg('%s_log_a' % (plan.name), allow_reuse=True)
+            asm.write_reg(dst=reg_a,
+                          src=to_s32(plan.log_addr + plan.n_points - 1))
+            asm.write_dmem(addr=reg_a, src='s_core_r2')
             asm.qpb_ack()
-            asm.append_macro(LoopBack(label=label, reg=reg_i,
-                                      last=plan.n_points - 1))
         # written last, so a host that sees it knows the rest is settled
         asm.write_dmem(addr=plan.result_addr + RESULT_DONE, src=DONE_SENTINEL)
 
@@ -2624,7 +2593,7 @@ class AdaptiveSweep(Macro):
         self._config(prog, asm, plan)
         asm.qpb_send(accel, 'CFG_WINDOW', start_freq=plan.gen_start,
                      step=plan.gen_step, n_points=plan.n_points,
-                     averager_value=plan.avg)
+                     avg_shift=plan.avg_shift)
 
         # seed both waveforms at the first point before the IP starts, so the
         # very first shot already measures the frequency the IP believes it is
@@ -2655,7 +2624,8 @@ class AdaptiveSweep(Macro):
         asm.qpb_wait_new()
         self._store_result(prog, asm, plan, status_src=None)
         if plan.interrupt:
-            self._landing_block(prog, asm, plan, resume_label)
+            self._landing_block(prog, asm, plan, resume_label,
+                                reg_point=reg_point)
 
     #gd/kw handshake ---------------------------------------------------
 
@@ -2672,7 +2642,7 @@ class AdaptiveSweep(Macro):
         self._config(prog, asm, plan)
         asm.qpb_send(accel, 'CFG_WINDOW', start_freq=plan.gen_start,
                      step=plan.gen_step, n_points=0,
-                     averager_value=plan.avg)
+                     avg_shift=plan.avg_shift)
         asm.qpb_send(accel, 'CFG_GDKW', f_lo=plan.f_lo, f_hi=plan.f_hi,
                      m_min=plan.m_min, m_max=plan.m_max)
 
@@ -4746,27 +4716,25 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             ``"kw"`` (gradient-descent or Kiefer-Wolfowitz search, where each
             frequency arrives through a handshake).
         calc : str
-            Measurement scheme: ``"shift"``, ``"welford"``,
-            ``"madstop"``, ``"split"``, ``"ckdiff"``, ``"hsplit"``, or
-            ``"quarter"``.  Defaults to the accelerator's only option, or
-            ``"shift"``.  On ``adaptive_sweep`` these are presets over one
-            shared datapath (a 64-bit accumulator, MUX-selected reduction,
-            and an independently enabled early stop), not separate
-            pipelines.  The last four are the repetition-axis early stops:
-            each point accumulates raw shot sums, a decision system tests
-            convergence at geometric checkpoints, and the point retires as
-            an exact 32-bit mean divided by the shot count it really used
-            (a Granlund-Montgomery reciprocal multiply; the averager cap
-            can be any value up to 2^20).  ``split``, ``hsplit`` and
-            ``quarter`` are one test at three checkpoint densities - octave
-            (4, 8, 16, ..., confirm 2), half-octave (+3*2^j, confirm 3) and
-            quarter-octave ({1,3,5,7}*2^j from 8, confirm 5), the same
-            three settings ``nmul`` reaches directly; each step up
-            trades more looks against a deeper confirmation streak, worth
-            roughly 1.2x shots for ``hsplit`` and a further 2-4% for
-            ``quarter``.  The split test cannot detect slow drift (pair
-            ``split`` with ``ckmon=True``); ``ckdiff`` detects drift and
-            refuses to certify a drifting point.
+            Measurement scheme: ``"shift"``, ``"welford"``, or ``"split"``.
+            Defaults to the accelerator's only option, or ``"shift"``.  On
+            ``adaptive_sweep`` these are presets over one shared datapath (a
+            64-bit accumulator, MUX-selected reduction, and an independently
+            enabled early stop), not separate pipelines.  ``split`` is the
+            repetition-axis early stop: each point accumulates raw shot
+            sums, the split test checks convergence at power-of-two
+            checkpoints (4, 8, 16, ...) with a confirm depth of 2, and the
+            point retires as an exact 32-bit mean divided by the shot count
+            it really used.  Note the split test is blind to
+            slow drift by construction: it stops at the same shot count a
+            drifting point would as a clean one, and the mean it certifies
+            is then wrong.
+
+            The ``"hsplit"`` and ``"quarter"`` presets - the same test on
+            half- and quarter-octave checkpoint grids, worth roughly 1.2x
+            shots and a further 2-4% - were removed on 2026-08-23 along with
+            the m = 3, 5, 7 reciprocal lookup they retired through.  The
+            checkpoint grid is now fixed at 4, 8, 16, ...
         gen_ch : int
             Generator channel carrying the drive, already declared.
         ro_ch : int
@@ -4785,12 +4753,19 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         n_points : int
             Number of grid points.
         avg : int
-            Shots averaged per point, up to 2^31.  For the split-family
-            calcs the cap is what a non-converging point divides by, so it
-            must be exactly divisible by the retirement divider: a cap
-            whose odd part exceeds 699050 is rounded UP to the nearest
-            divisible value (below 1.5e-6 relative) with a warning, and the
-            plan records ``avg_requested`` / ``avg_rounded``.
+            Shots averaged per point, up to 2**26.  The cap is a power of
+            two: ``shot_counter`` does not compare against a limit, it
+            watches bit ``avg_shift`` of the shot number, so the cap is
+            exactly ``1 << avg_shift`` and OP0 dt4 carries the EXPONENT.
+            A request that is not a power of two is rounded UP to the next
+            one with a warning -- 1000 becomes 1024 -- and the plan records
+            ``avg_requested`` / ``avg_rounded``.  ``plan.avg`` becomes the
+            rounded count, because the tProcessor's shot loop has to fire
+            exactly as many shots as the IP will fold; ``plan.avg_shift`` is
+            what goes on the wire.  The exponent is capped at 26 because
+            that is where ``shot_counter`` clamps and where the 58-bit
+            accumulators run out (2**26 * 2**31 = 2**57).  See
+            MODULE_GUIDE.txt section 3.5.
         nsamp : int
             Raw ADC samples folded per shot.  Defaults to the declared readout
             window length, which is what the averaging buffer itself uses.
@@ -4804,61 +4779,56 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         n0 : int
             Warmup shots, for ``calc="welford"``.
         n_min : int
-            For ``calc="madstop"``: first epoch that may stop early, a power
-            of two, or 0 to disable early stopping.  For the split-family
-            calcs: the eligibility floor - any value, and the first
-            checkpoint at or above it is the first that may stop (0 makes
-            every checkpoint eligible; it does NOT disable the stop).
-        thr_table : list of int
-            Per-epoch deviation thresholds in LSB units, for
-            ``calc="madstop"``; entry *j* applies at 2**j shots.  The
-            generated program does NOT write the table: load it from the
-            host over AXI-Lite with the ``Adaptive_Sweep`` driver
-            (``soc.adaptive_sweep_0.load_tables(plan)``) before starting
-            the program, or every point runs to the averager cap.
+            Eligibility floor for the split-family calcs - any value, and
+            the first checkpoint at or above it is the first that may stop
+            (0 makes every checkpoint eligible; it does NOT disable the
+            stop).
         emit_mode : str
             ``"drain"`` or ``"immediate"``, for the early-stopping calcs.
             Grid sweeps must use ``"drain"``: an early emission would advance
             the accelerator while the tProcessor keeps its fixed schedule.
-        m : int
-            Precision exponent for the split-family tests: a
-            checkpoint passes iff ``|dI|+|dQ| <= (|SI|+|SQ|) >> m``.
-            Default 6.  Each +1 costs roughly 4x the shots; the achieved
-            relative error is distributional (median ~0.55*2^-m, ~4% of
-            points beyond 2*2^-m), so ask for one m higher than a hard
-            requirement.
-        nmul : int
-            How many odd multipliers the split-family checkpoint grid uses,
-            so every checkpoint is ``N = m * 2^k`` with ``m`` drawn from the
-            first ``nmul`` of ``{1, 3, 5, 7}``.  ``0`` or ``1`` keeps every
-            checkpoint a power of two, and with it the retirement divide
-            becomes a pure shift, no reciprocal multiply at all.  ``2``
-            adds ``3*2^k`` (half-octave), ``4`` adds ``5*2^k`` and ``7*2^k``
-            (quarter-octave); 4 is the maximum the checkpoint generator and
-            the reciprocal ROM implement.  Overrides whichever grid the calc
-            name implies, and moves ``confirm`` to that grid's calibrated
-            depth (2 / 3 / 5), so ``calc="split", nmul=4`` is
-            ``calc="quarter"``.  Leave unset to take the calc's own grid.
-            This is a runtime CTRL field: switching it needs no new
-            bitstream.  (The RTL also has a build-time
-            ``POW2_DIV_ONLY`` parameter that removes the reciprocal
-            multiplier entirely; that one does need a rebuild, and forces
-            nmul to 0.)
-        ckmon : bool
-            For ``calc="split"`` only: also evaluate the ckdiff test as a
-            drift monitor.  A split stop whose checkpoint fails the monitor
-            raises ``drift_suspect`` in the status word, the diag word, and
-            the stop log.
+        estop_thr : float
+            Early-stop threshold for the split-family calcs: the noise /
+            signal ratio a checkpoint must reach to pass, so a checkpoint
+            passes iff ``|dI|+|dQ| <= estop_thr * (|SI|+|SQ|)``.  In
+            ``(0, 1]``, default ``1/64``.  Halving it costs roughly 4x the
+            shots; the achieved relative error is distributional (median
+            ~0.55*thr, ~4% of points beyond 2*thr), so ask for half of a
+            hard requirement.
+
+            The IP stores the integer reciprocal ``D = round(1/estop_thr)``
+            in a 16-bit register and tests ``(|dI|+|dQ|)*D <= |SI|+|SQ|``,
+            so the realized threshold is ``1/D`` (exact whenever
+            ``estop_thr`` has that form, and coarse only near 1); the plan
+            reports it as ``plan.estop_thr`` beside
+            ``plan.estop_thr_requested``, and warns when they differ by
+            more than 1%.  The finest value the register reaches is
+            ``1/65535``.
+
+            The threshold is NOT part of the generated program - it lives
+            in an AXI register.  Write it with the ``Adaptive_Sweep``
+            driver (``soc.adaptive_sweep_0.load_tables(plan)``, or
+            ``set_estop_thr(thr)`` to retarget it), which means a
+            threshold sweep needs no program rebuild.  The register comes
+            out of reset at ``D=64``, so an unwritten register behaves as
+            ``estop_thr=1/64`` rather than disabling the stop.
         dump_log : bool
-            After a grid sweep with a split-family calc, have the generated
-            program copy every point's stop-log entry into data memory (one
-            word per point, via OP12).  Defaults to True exactly in that
-            case.  ``get_sweep_result`` / ``wait_for_sweep`` then return a
-            ``stop_log`` dict of per-frequency arrays: ``n_used`` (the shot
-            count each point actually stopped at), ``converged``,
-            ``capped`` (the ran-to-cap flag), ``saturated``,
-            ``drift_suspect``, and ``freq_mhz``.  Needs ``n_points`` <=
-            4096 (the log depth).
+            Record, per grid point, the shot count at which that point
+            stopped early.  Needs ``calc='split'`` and ``interrupt=True``,
+            and defaults to True when both hold.  There is no log buffer in
+            the accelerator: the interrupt handler reads OP4's verdict word
+            and stores it at ``dmem[log_addr + point]`` while it is already
+            parked doing the rearm handshake, so it costs four instructions
+            on a path that is already waiting microseconds for the last shot
+            to drain, and the depth limit is data memory rather than a fixed
+            4096.  A point that ran to the cap never interrupts and so
+            leaves its word at zero, which decodes as the cap.  The last
+            point is filled in once after the sweep instead of from the
+            handler, because the sweep's completion latches the result
+            registers and refuses the handler's read.
+            ``get_sweep_result`` / ``wait_for_sweep`` return a ``stop_log``
+            dict of per-frequency arrays: ``n_used``, ``converged``,
+            ``capped``, ``saturated`` and ``freq_mhz``.
         log_addr : int
             Data-memory address of the dumped log.  Defaults to just past
             the result block.
@@ -4876,9 +4846,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             itself capped.  Give it 1 or more to let the search stop early.
         a_table, c_table : list of float
             Step and probe-width schedules (MHz), for gd/kw in LUT mode.
-            Like ``thr_table``, these load over AXI-Lite through the
-            ``Adaptive_Sweep`` driver's ``load_tables(plan)``, not from
-            the generated program.
+            These load over AXI-Lite through the ``Adaptive_Sweep``
+            driver's ``load_tables(plan)``, not from the generated
+            program.
         use_lut : bool
             True for the scheduled a/c tables, False for racing mode (repeat
             the fixed-step pair until the accumulated difference beats its own
@@ -4992,12 +4962,16 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         return out
 
     def decode_stop_log(self, words, name=None):
-        """Turn dumped stop-log words into per-point arrays.
+        """Turn the dumped stop words into per-point arrays.
 
-        Each word is one point's OP12 response (dt1_o): the log entry in the
-        low bits and the valid flag at bit 31.  The generated grid program
-        dumps them to data memory in point order when the plan has
-        ``dump_log``, so entry *i* belongs to grid point *i*.
+        Each word is one point's GET_DIAG dt2, written by the interrupt
+        handler at ``dmem[log_addr + point]`` at the moment that point
+        stopped early - so the grid index is the address, not part of the
+        payload, and the frequency is recovered from it.  A point that ran
+        to the averager cap never interrupts, so its word is still the zero
+        the program image left there; zero is therefore the cap verdict, and
+        it cannot collide with a real stop because every real stop sets
+        ``converged``.
 
         Parameters
         ----------
@@ -5009,30 +4983,24 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         Returns
         -------
         dict of numpy arrays, one entry per grid point
-            ``n_used`` (shots actually averaged: the stop checkpoint
-            m * 2^k, or the averager cap), ``converged`` (the early stop
-            fired), ``capped`` (ran to the cap without converging - the
-            per-frequency flag), ``saturated``, ``drift_suspect``,
-            ``valid``, and ``freq_mhz`` (the grid frequency of each entry).
+            ``n_used`` (shots actually averaged: the stop checkpoint 2**k,
+            or the averager cap), ``converged`` (the early stop fired),
+            ``capped`` (ran to the cap without converging), ``saturated``,
+            and ``freq_mhz`` (the grid frequency of each entry).
         """
         name = self._sweep_name(name)
         plan = self.get_sweep_plan(name)
-        f = {x.name: x for x in plan.accel.op('GET_LOG').resp['dt1']}
-        m_of_type = (1, 3, 5, 7)
-        n_used, conv, capped, sat, drift, valid = [], [], [], [], [], []
+        f = {x.name: x for x in AS_DIAG_FIELDS}
+        n_used, conv, capped, sat = [], [], [], []
         for w in words:
-            typ = f['log_type'].unpack(w)
-            k = f['log_k'].unpack(w)
-            is_cap = (typ >= 4)
+            w = int(w) & 0xFFFFFFFF
+            is_cap = (w == 0) or (f['type'].unpack(w) >= 4)
             capped.append(is_cap)
-            n_used.append(plan.avg if is_cap else m_of_type[typ] << k)
-            conv.append(bool(f['log_converged'].unpack(w)))
-            sat.append(bool(f['log_saturated'].unpack(w)))
-            drift.append(bool(f['log_drift'].unpack(w)))
-            valid.append(bool(f['log_valid'].unpack(w)))
+            n_used.append(plan.avg if is_cap else 1 << f['k'].unpack(w))
+            conv.append(False if w == 0 else bool(f['converged'].unpack(w)))
+            sat.append(False if w == 0 else bool(f['saturated'].unpack(w)))
         out = {'n_used': np.array(n_used), 'converged': np.array(conv),
-               'capped': np.array(capped), 'saturated': np.array(sat),
-               'drift_suspect': np.array(drift), 'valid': np.array(valid)}
+               'capped': np.array(capped), 'saturated': np.array(sat)}
         if not plan.handshake:
             out['freq_mhz'] = (plan.start_mhz
                                + plan.step_mhz * np.arange(len(words)))

@@ -38,6 +38,7 @@ module qproc_core # (
 // Interrupt
    input wire              interrupt_i  ,
    input wire [PMEM_AW-1:0] ipc_i       ,
+   output wire             int_take_o   ,
 // Special Function Registers
    output wire [7 :0]     sreg_cfg_o           ,
    output wire [7 :0]     sreg_ctrl_o           ,
@@ -101,6 +102,7 @@ qcore_cpu # (
    .flag_i              ( flag_i                   ) , // External Condition
    .interrupt_i         ( interrupt_i              ) ,
    .ipc_i               ( ipc_i                    ) ,
+   .int_take_o          ( int_take_o               ) ,
    .sreg_cfg_o          ( sreg_cfg_o               ) ,
    .sreg_ctrl_o         ( sreg_ctrl_o              ) ,
    .sreg_arith_i        ( sreg_arith_i             ) , // Arith Input

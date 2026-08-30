@@ -121,15 +121,82 @@ module register_bank(
 
   (* MARK_DEBUG = "TRUE" *) wire write_pulse = toggle_s1 ^ toggle_s2;
 
-  assign step_lut_write_o = write_pulse & (reg0[9:8] == 2'd0);
-  assign offset_lut_write_o = write_pulse & (reg0[9:8] == 2'd1);
-  wire threshold_write = write_pulse & (reg0[9:8] == 2'd2);
-  wire ctrl_write = write_pulse & (reg0[9:8] == 2'd3);
+  wire [6:0] cfg_len = reg0[30:24];
+  wire [2:0] cfg_last = reg0[23:21];
+  wire [4:0] cfg_target = reg0[20:16];
+  wire [7:0] cfg_base = reg0[15:8];
 
-  assign step_lut_addr_o = reg0[5:0];
-  assign step_lut_data_o = reg1;
-  assign offset_lut_addr_o = reg0[5:0];
-  assign offset_lut_data_o = reg1;
+  wire lut_commit = write_pulse & ((cfg_target == 5'd0) | (cfg_target == 5'd1));
+  wire threshold_write = write_pulse & (cfg_target == 5'd2);
+  wire ctrl_write = write_pulse & (cfg_target == 5'd3);
+
+  (* MARK_DEBUG = "TRUE" *) reg burst_active;
+  (* MARK_DEBUG = "TRUE" *) reg [2:0] burst_cnt;
+  reg burst_sel;
+  reg [2:0] burst_last;
+  reg [7:0] burst_base;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      burst_active <= 1'b0;
+      burst_cnt <= 3'd0;
+      burst_sel <= 1'b0;
+      burst_last <= 3'd0;
+      burst_base <= 8'd0;
+    end else if (lut_commit) begin
+      burst_active <= 1'b1;
+      burst_cnt <= 3'd0;
+      burst_sel <= cfg_target[0];
+      burst_last <= cfg_last;
+      burst_base <= cfg_base;
+    end else if (burst_active & (burst_cnt == burst_last)) begin
+      burst_active <= 1'b0;
+      burst_cnt <= 3'd0;
+      burst_sel <= burst_sel;
+      burst_last <= burst_last;
+      burst_base <= burst_base;
+    end else if (burst_active) begin
+      burst_active <= 1'b1;
+      burst_cnt <= burst_cnt + 3'd1;
+      burst_sel <= burst_sel;
+      burst_last <= burst_last;
+      burst_base <= burst_base;
+    end else begin
+      burst_active <= burst_active;
+      burst_cnt <= burst_cnt;
+      burst_sel <= burst_sel;
+      burst_last <= burst_last;
+      burst_base <= burst_base;
+    end
+  end
+
+  reg [31:0] burst_data;
+
+  always @(*) begin
+    if (burst_cnt == 3'd0)
+      burst_data = reg1;
+    else if (burst_cnt == 3'd1)
+      burst_data = reg2;
+    else if (burst_cnt == 3'd2)
+      burst_data = reg3;
+    else if (burst_cnt == 3'd3)
+      burst_data = reg4;
+    else if (burst_cnt == 3'd4)
+      burst_data = reg5;
+    else if (burst_cnt == 3'd5)
+      burst_data = reg6;
+    else
+      burst_data = reg7;
+  end
+
+  wire [7:0] burst_addr = burst_base + {5'd0, burst_cnt};
+
+  assign step_lut_write_o = burst_active & ~burst_sel;
+  assign offset_lut_write_o = burst_active & burst_sel;
+  assign step_lut_addr_o = burst_addr[5:0];
+  assign step_lut_data_o = burst_data;
+  assign offset_lut_addr_o = burst_addr[5:0];
+  assign offset_lut_data_o = burst_data;
 
   always @(posedge clk) begin
     if (!rst_n)
@@ -143,11 +210,15 @@ module register_bank(
       step_lut_len_o <= 7'd64;
       offset_lut_len_o <= 7'd64;
     end else begin
-      if (step_lut_write_o & (reg3[6:0] != 7'd0))
-        step_lut_len_o <= reg3[6:0];
+      if (lut_commit & (cfg_target == 5'd0) & (cfg_len != 7'd0))
+        step_lut_len_o <= cfg_len;
+      else
+        step_lut_len_o <= step_lut_len_o;
 
-      if (offset_lut_write_o & (reg3[6:0] != 7'd0))
-        offset_lut_len_o <= reg3[6:0];
+      if (lut_commit & (cfg_target == 5'd1) & (cfg_len != 7'd0))
+        offset_lut_len_o <= cfg_len;
+      else
+        offset_lut_len_o <= offset_lut_len_o;
     end
   end
 
