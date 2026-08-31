@@ -2243,7 +2243,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>5be6dbfc</spirit:value>
+            <spirit:value>6dadf1bd</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -2262,7 +2262,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>8c8fe2fb</spirit:value>
+            <spirit:value>f907b9f5</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -6752,14 +6752,14 @@
       </xilinx:xpmLibraries>
       <xilinx:vendorDisplayName>Quantum Instrumentation Control Kit</xilinx:vendorDisplayName>
       <xilinx:vendorURL>https://github.com/openquantumhardware/qick/</xilinx:vendorURL>
-      <xilinx:coreRevision>30</xilinx:coreRevision>
-      <xilinx:coreCreationDateTime>2026-08-30T14:11:19Z</xilinx:coreCreationDateTime>
+      <xilinx:coreRevision>31</xilinx:coreRevision>
+      <xilinx:coreCreationDateTime>2026-08-31T13:42:14Z</xilinx:coreCreationDateTime>
     </xilinx:coreExtensions>
     <xilinx:packagingInfo>
       <xilinx:xilinxVersion>2023.1</xilinx:xilinxVersion>
       <xilinx:checksum xilinx:scope="busInterfaces" xilinx:value="eef3ebd2"/>
       <xilinx:checksum xilinx:scope="memoryMaps" xilinx:value="769c350d"/>
-      <xilinx:checksum xilinx:scope="fileGroups" xilinx:value="7245c25b"/>
+      <xilinx:checksum xilinx:scope="fileGroups" xilinx:value="cf59da70"/>
       <xilinx:checksum xilinx:scope="ports" xilinx:value="d72a183d"/>
       <xilinx:checksum xilinx:scope="hdlParameters" xilinx:value="0a52d470"/>
       <xilinx:checksum xilinx:scope="parameters" xilinx:value="4960cdd2"/>

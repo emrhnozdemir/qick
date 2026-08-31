@@ -180,10 +180,10 @@ class QP2Accel:
         ``prescale_en`` (CTRL[5]): the only field that changes behaviour is
         ``estop_en``, plus ``confirm``.  So "shift" and "welford" are the
         same hardware configuration -- the Welford running-mean pipeline was
-        deleted -- and "split" differs from them by one bit.  The names are
-        kept because programs and notebooks use them, and because
-        ``reduce_sel == 3`` is still what gates ``dump_log`` and ``CAP_DIV``.
-        See MODULE_GUIDE.txt section 7.3.
+        deleted, and "welford" is kept only as a deprecated alias -- and
+        "split" differs from them by one bit.  The names are kept because
+        programs and notebooks use them, and because ``reduce_sel == 3`` is
+        still what gates ``dump_log``.  See MODULE_GUIDE.txt section 7.3.
     gdkw_calcs : tuple of str
         Subset of ``calcs`` usable with the GD/KW engine.  The engine consumes
         a 64-bit power (sized for the 32-bit-mean schemes); only a scheme
@@ -339,19 +339,22 @@ FINE_TUNING_SWEEP = QP2Accel(
 # adaptive_sweep
 # ---------------------------------------------------------------------------
 # Transcribed from firmware/ip/adaptive_sweep/src/adaptive_sweep.v (opcode
-# decode and field wiring) and src/ctrl_status_reg.v (the CTRL/STATUS word
-# layout).  The prose description of every module is in
-# personal_files/adaptive_sweep/MODULE_GUIDE.txt.
+# decode, field wiring and the status_word assign) and src/register_bank.v
+# (the CTRL word and the dt slices it latches).  The prose description of
+# every module is in personal_files/adaptive_sweep/MODULE_GUIDE.txt.
 _AS_OPS = {
     "CFG_WINDOW": QP2Op(
         number=0, mnemonic="CFG_WINDOW",
         args={
             "dt1": _word("start_freq", signed=True),
             "dt2": _word("step", signed=True),
-            "dt3": _word("n_points"),
+            "dt3": (Field("n_points", 16, 0),),
             "dt4": (Field("avg_shift", 5, 0),),
         },
-        doc="grid window; 'step' doubles as the GD forward-probe spacing and "
+        doc="grid window; 'n_points' is 16 bits (register_bank.v n_points_o "
+            "<= dt3_i[15:0]; peak_finder treats 0 as 1, so 65536 would run "
+            "as a one-point sweep - plan_sweep bounds it to 65535); 'step' "
+            "doubles as the GD forward-probe spacing and "
             "the racing-mode fixed step (fstep_i), and 'avg_shift' is the "
             "log2 of the shot count folded per armed point. It is an EXPONENT, "
             "not a count: shot_counter watches bit avg_shift of the shot "
@@ -379,8 +382,8 @@ _AS_OPS = {
         },
         doc="nsamp and the CTRL word: mode (0 peak/1 dip); reduce_sel "
             "(IGNORED BY THE RTL since 2026-08-24 - there is one datapath; "
-            "still set because reduce_sel==3 gates dump_log and CAP_DIV on "
-            "the Python side); estop_hold (0 immediate emit / 1 "
+            "still set because reduce_sel==3 gates dump_log on the Python "
+            "side); estop_hold (0 immediate emit / 1 "
             "freeze-and-drain); prescale_en (IGNORED since 2026-08-24 - the "
             "raw 32-bit shot sum goes straight into the 58-bit "
             "accumulators); estop_en (the split test is the only stopper; "
@@ -420,7 +423,10 @@ _AS_OPS = {
               "dt2": (Field("converged", 1, 0),
                       Field("capped", 1, 1),
                       Field("iter", 16, 16))},
-        doc="gradient-descent search, forward pair P(x+step) - P(x)",
+        doc="gradient-descent search, forward pair P(x+step) - P(x). In "
+            "racing mode (use_lut=0) lambda must be >= 1: at 0 the "
+            "certification |sum(dp)| > sum(|dp|) >> lambda can never pass "
+            "and x never moves",
     ),
     "RUN_KW": QP2Op(
         number=6, mnemonic="RUN_KW", blocking=True, responds=True,
@@ -436,7 +442,8 @@ _AS_OPS = {
               "dt2": (Field("converged", 1, 0),
                       Field("capped", 1, 1),
                       Field("iter", 16, 16))},
-        doc="Kiefer-Wolfowitz search, symmetric pair P(x+c) - P(x-c)",
+        doc="Kiefer-Wolfowitz search, symmetric pair P(x+c) - P(x-c). In "
+            "racing mode (use_lut=0) lambda must be >= 1, see RUN_GD",
     ),
     "GET_FREQ": QP2Op(
         number=7, mnemonic="GET_FREQ", responds=True,
@@ -468,37 +475,17 @@ _AS_OPS = {
             "dt3": (Field("m_min", 16, 0),),
             "dt4": (Field("m_max", 16, 0),),
         },
-        doc="GD/KW search window [f_lo, f_hi] and racing pair-count bounds",
+        doc="GD/KW search window [f_lo, f_hi] and racing pair-count bounds; "
+            "gradient_engine clamps both m_min and m_max to 1..255 (0 -> 1) "
+            "and plan_sweep enforces the same range",
     ),
     "GET_MEAN": QP2Op(
         number=11, mnemonic="GET_MEAN", responds=True,
         resp={"dt1": _word("mean_i", signed=True),
               "dt2": _word("mean_q", signed=True)},
         doc="32-bit mean I/Q read-back: the winning grid point's means when "
-            "the last job was a grid sweep, the last probe's for gd/kw; "
-            "meaningful for the mean32 (reduce_sel=3) calcs",
-    ),
-    "CAP_DIV": QP2Op(
-        number=13, mnemonic="CAP_DIV",
-        args={
-            "dt1": _word("mag_lo"),
-            "dt2": (Field("mag_hi", 22, 0),
-                    Field("kp1", 6, 22)),
-            "dt3": (Field("sft", 5, 0),),
-        },
-        doc="*** NOT DECODED BY THE RTL SINCE 2026-08-24. *** gm_divider.v "
-            "was deleted; the averager cap is a power of two and retirement "
-            "is a plain truncating shift, so there is no reciprocal to load. "
-            "Still emitted for split plans, where it is one dead instruction "
-            "(the op expects no response, so it cannot hang). "
-            "Historic meaning: "
-            "cap-retirement reciprocal: the Granlund-Montgomery magic for the "
-            "averager value, computed by gm_magic() at program build and sent "
-            "once before the job. mag = {mag_hi, mag_lo} (54 bits), kp1 = "
-            "ctz(avg)+1 (up to 32, so caps to 2^31), sft = p-52. "
-            "Grid-checkpoint stops divide through the built-in {1,3,5,7} "
-            "reciprocal ROM and ignore this; it is consumed only when a "
-            "point runs to the averager cap",
+            "the last job was a grid sweep, the last probe's for gd/kw (the "
+            "truncating window sum[retire_shift +: 32], for every calc)",
     ),
     "REARM": QP2Op(
         number=14, mnemonic="REARM",
@@ -521,12 +508,14 @@ AS_DIAG_FIELDS = (
     Field("nconv_count", 16, 16),
 )
 
-# status_word, built by src/ctrl_status_reg.v:
+# status_word, built inline in adaptive_sweep.v (the status_word assign):
 #   {point_idx[15:0], eng_freq_valid, eng_busy, eng_converged, eng_capped,
-#    dest, estop_en, prescale_en, early_stop, warmup_done, reduce_sel, mode,
-#    busy, finish_seen, reserved}
+#    dest, estop_en, 1'b0, early_stop, warmup_done, 3'd0, mode,
+#    busy, finish_seen, 1'b0}
 # bit 0 was drift_suspect and is now hardwired 0: the drift monitor was the
-# ckdiff test running beside the split stopper, and ckdiff is gone.
+# ckdiff test running beside the split stopper, and ckdiff is gone.  Bits 6:4
+# (reduce_sel) and 9 (prescale_en) are hardwired 0 as well since the
+# 2026-08-24 rebuild; their Fields stay so unpack_status keeps its keys.
 _AS_STATUS = (
     Field("finish_seen", 1, 1),
     Field("busy", 1, 2),
@@ -560,6 +549,8 @@ ADAPTIVE_SWEEP = QP2Accel(
     calcs=("shift", "welford", "split"),
     calc_ctrl={
         "shift":   dict(reduce_sel=1, prescale_en=1, estop_en=0),
+        # deprecated alias of "shift" (plan_sweep warns): same hardware, and
+        # its n0 only feeds the warmup_done status bit
         "welford": dict(reduce_sel=2, prescale_en=1, estop_en=0),
         # repetition-axis early stop: raw 32-bit shot sums into the mean32
         # reduction (exact divide by the realized shot count at retirement).
@@ -704,75 +695,6 @@ def ro_freq_word(prog, freq, ro_ch, gen_ch):
 #: The largest literal a TEST instruction encodes (24-bit signed); a loop
 #: bound past this is staged in a register instead.
 LOOP_IMM_MAX = (1 << 23) - 1
-
-
-def gm_magic(n, w=52):
-    """Granlund-Montgomery reciprocal for an exact divide by ``n``.
-
-    Splits ``n = d * 2**k`` (d odd) and finds the smallest precision ``p``
-    whose rounded-up reciprocal ``mag = ceil(2**p / d)`` divides every
-    numerator below ``2**w`` exactly: ``floor(t * mag / 2**p) == t // d``
-    whenever ``mag * d - 2**p <= 2**(p - w)``.  The hardware then computes
-    ``mean = ((((2*S + n + (n << 33)) >> kp1) * mag) >> 52 >> sft) - 2**32``,
-    which is bit-exact round-half-up division of S by n.
-
-    Parameters
-    ----------
-    n : int
-        The divisor (the averager cap), 1 <= n <= 2**31, with odd part at
-        most 699050 (use :func:`gm_safe_cap` to round an arbitrary request
-        up to the nearest such value).
-    w : int
-        Numerator width the constant must be exact for.  52 matches
-        src/gm_divider.v; do not change one without the other - an
-        undersized constant fails SILENTLY (the K15 bug).
-
-    Returns
-    -------
-    (mag, kp1, sft) : tuple of int
-        The 54-bit magic, the pre-shift ctz(n)+1, and the post-shift p-52,
-        exactly as OP13 CAP_DIV wants them.
-    """
-    n = int(n)
-    if not 1 <= n <= (1 << 31):
-        raise ValueError(
-            "gm_magic: the divisor must be in [1, 2**31], got %d - the "
-            "tProc's 32-bit shot loop bounds the averager cap" % (n,))
-    k = (n & -n).bit_length() - 1
-    d = n >> k
-    if 3 * d > (1 << 21):
-        raise ValueError(
-            "gm_magic: the odd part of %d is %d, above 699050, so a "
-            "full-scale signal could overflow the divider's 52-bit operand "
-            "(t < 3*odd(n)*2^31). Round the cap up with gm_safe_cap() - "
-            "the increase is below 1.5e-6 relative" % (n, d))
-    p = w
-    while True:
-        mag = -(-(1 << p) // d)
-        if mag * d - (1 << p) <= (1 << (p - w)):
-            return mag, k + 1, p - w
-        p += 1
-
-
-def gm_safe_cap(n):
-    """The smallest cap >= n that gm_magic retires exactly.
-
-    Rounds up to the nearest value whose odd part is at most 699050 (a
-    multiple of a large enough power of two), so the relative increase is
-    below 1.5e-6.  Already-safe values come back unchanged.  plan_sweep
-    applies this automatically to the averager cap and warns when it
-    changes the value.
-    """
-    n = int(n)
-    if not 1 <= n <= (1 << 31):
-        raise ValueError(
-            "gm_safe_cap: the cap must be in [1, 2**31], got %d" % (n,))
-    for k in range(0, 32):
-        cand = ((n + (1 << k) - 1) >> k) << k
-        d = cand >> ((cand & -cand).bit_length() - 1)
-        if 3 * d <= (1 << 21):
-            return cand
-    return 1 << 31
 
 
 @dataclass
@@ -1014,7 +936,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                estop_thr=None,
                x0=None, min_step=None, max_iter=None, patience=None,
                a_table=None, c_table=None,
-               use_lut=None, lambda_=0, m_min=2, m_max=8,
+               use_lut=None, lambda_=None, m_min=2, m_max=8,
                f_lo=None, f_hi=None,
                result_addr=0, debug=False, count_shots=False,
                dump_log=None, log_addr=None, interrupt=False):
@@ -1120,10 +1042,11 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                  "accelerator '%s' has no REARM op, so it cannot be told when "
                  "the readout pipe has drained; interrupt=True needs one"
                  % (accel.name,))
-        _require(calc not in (None, "shift"),
+        _require(calc_fields.get("estop_en", 0) == 1,
                  "interrupt=True only does something for an early-stopping "
-                 "calc: with calc=%r every point runs to avg shots and there "
-                 "is nothing to abort" % (calc,))
+                 "calc (one whose preset sets estop_en, i.e. 'split'): with "
+                 "calc=%r every point runs to avg shots and there is nothing "
+                 "to abort" % (calc,))
 
     def gw(f):
         return to_s32(gen_freq_word(prog, f, gen_ch, ro_ch))
@@ -1147,7 +1070,15 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                      "start/stop")
             step = (stop - start) / (n_points - 1)
         n_points = int(n_points)
-        _require(n_points >= 1, "n_points must be >= 1, got %d" % (n_points,))
+        # the field is as wide as the RTL slice (register_bank.v keeps
+        # dt3_i[15:0] on adaptive_sweep), and peak_finder runs a count of 0
+        # as one point, so an oversized request must be rejected, not packed
+        n_field = [f for word in accel.op("CFG_WINDOW").args.values()
+                   for f in word if f.name == "n_points"][0]
+        _require(1 <= n_points <= n_field.mask,
+                 "n_points must be in [1, %d] on accelerator '%s' (its "
+                 "CFG_WINDOW n_points field is %d bits wide), got %d"
+                 % (n_field.mask, accel.name, n_field.bits, n_points))
         if stop is None:
             stop = start + step * (n_points - 1)
     else:
@@ -1214,6 +1145,11 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
 
     # --- calc-specific -----------------------------------------------------
     if calc == "welford":
+        warnings.warn(
+            "calc='welford' is a deprecated alias of calc='shift': the Welford "
+            "running-mean pipeline was removed from adaptive_sweep on "
+            "2026-08-24, both presets configure the same datapath, and n0 "
+            "only drives the warmup_done status bit", stacklevel=3)
         _require(n0 is not None,
                  "calc='welford' needs n0= (the warmup shot count)")
         _require(1 <= int(n0) <= avg,
@@ -1330,9 +1266,22 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                  "patience must be in [0, 255], got %s" % (patience,))
         plan.patience = patience
 
-        _require(0 <= int(lambda_) < (1 << 5),
-                 "lambda_ must be in [0, 31], got %s" % (lambda_,))
-        plan.lam = int(lambda_)
+        if plan.use_lut:
+            # the engine ignores lambda in scheduled mode (S_DECIDE goes
+            # straight to S_STEP), so only the field width is checked
+            plan.lam = 0 if lambda_ is None else int(lambda_)
+            _require(0 <= plan.lam < (1 << 5),
+                     "lambda_ must be in [0, 31], got %s" % (lambda_,))
+        else:
+            # |sum(dp)| <= sum(|dp|) always (triangle inequality), so at
+            # lambda 0 the race |sum(dp)| > sum(|dp|) >> lambda can never
+            # certify a move: every iteration exhausts m_max and ties, and
+            # the search sits at x0 until max_iter
+            plan.lam = 1 if lambda_ is None else int(lambda_)
+            _require(1 <= plan.lam < (1 << 5),
+                     "racing mode needs lambda_ in [1, 31], got %s: at 0 the "
+                     "certification test can never pass and x never moves"
+                     % (lambda_,))
 
         if plan.use_lut:
             _require(a_table is not None and c_table is not None,
@@ -1358,8 +1307,11 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
             _require(a_table is None and c_table is None,
                      "a_table/c_table are only used with use_lut=True; racing "
                      "mode repeats the fixed step= pair instead")
-            _require(1 <= int(m_min) <= int(m_max) < (1 << 16),
-                     "racing mode needs 1 <= m_min <= m_max < 65536, got "
+            # gradient_engine clamps pair_min and pair_max to 255 (its race
+            # accumulators are sized for 65 + 8 bits), so a larger request
+            # would be silently truncated - or, for m_min, made unreachable
+            _require(1 <= int(m_min) <= int(m_max) <= 255,
+                     "racing mode needs 1 <= m_min <= m_max <= 255, got "
                      "m_min=%s m_max=%s" % (m_min, m_max))
             plan.m_min, plan.m_max = int(m_min), int(m_max)
 
@@ -2385,11 +2337,6 @@ class AdaptiveSweep(Macro):
             cfg.update(plan.calc_fields)
             cfg.update(estop_hold=plan.emit_mode, n0=plan.n0, n_min=plan.n_min)
         asm.qpb_send(accel, 'CFG_ACQ', **cfg)
-        if plan.calc_fields.get('reduce_sel') == 3 and accel.has_op('CAP_DIV'):
-            mag, kp1, sft = gm_magic(plan.avg)
-            asm.qpb_send(accel, 'CAP_DIV',
-                         mag_lo=mag & 0xFFFFFFFF, mag_hi=mag >> 32,
-                         kp1=kp1, sft=sft)
         if plan.interrupt:
             # arms the IP's side of the protocol: from here an early stop parks
             # it instead of walking straight on to the next point
@@ -4716,8 +4663,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             ``"kw"`` (gradient-descent or Kiefer-Wolfowitz search, where each
             frequency arrives through a handshake).
         calc : str
-            Measurement scheme: ``"shift"``, ``"welford"``, or ``"split"``.
-            Defaults to the accelerator's only option, or ``"shift"``.  On
+            Measurement scheme: ``"shift"`` or ``"split"`` (``"welford"`` is
+            a deprecated alias of ``"shift"`` and warns).  Defaults to the
+            accelerator's only option, or ``"shift"``.  On
             ``adaptive_sweep`` these are presets over one shared datapath (a
             64-bit accumulator, MUX-selected reduction, and an independently
             enabled early stop), not separate pipelines.  ``split`` is the
@@ -4751,7 +4699,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             Grid step (MHz); for gd/kw, the probe spacing and racing-mode move.
             Give this or ``n_points``.
         n_points : int
-            Number of grid points.
+            Number of grid points, 1 to 65535 on ``adaptive_sweep`` (the IP
+            keeps a 16-bit count; an oversized request is rejected).
         avg : int
             Shots averaged per point, up to 2**26.  The cap is a power of
             two: ``shot_counter`` does not compare against a limit, it
@@ -4777,7 +4726,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             Shot-to-shot period (us).  Must exceed ``trig_time`` plus the
             readout length.
         n0 : int
-            Warmup shots, for ``calc="welford"``.
+            Warmup shots, for the deprecated ``calc="welford"``; it only
+            drives the ``warmup_done`` status bit.
         n_min : int
             Eligibility floor for the split-family calcs - any value, and
             the first checkpoint at or above it is the first that may stop
@@ -4855,9 +4805,15 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             accumulated spread).  Inferred from whether tables were given.
         lambda_ : int
             Racing-mode certainty shift: a move needs
-            ``|sum(dp)| > sum(|dp|) >> lambda_``.
+            ``|sum(dp)| > sum(|dp|) >> lambda_``.  Defaults to 1 and must be
+            in [1, 31] in racing mode: ``|sum(dp)| <= sum(|dp|)`` always, so
+            at 0 no pair count can ever certify a move and the search ties
+            at ``x0``.  Ignored by the engine (any value in [0, 31]) with
+            ``use_lut=True``.
         m_min, m_max : int
-            Racing-mode bounds on pairs per move.
+            Racing-mode bounds on pairs per move, ``1 <= m_min <= m_max <=
+            255`` (the engine's pair counter and race accumulators are sized
+            for 255).  Defaults 2 and 8.
         f_lo, f_hi : float
             Search window for gd/kw (MHz).  Default to ``start`` and ``stop``.
         result_addr : int
@@ -4882,8 +4838,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             moved on.  This is what turns an early stop into actual saved time
             under ``algorithm='grid'``: without it the only safe emit mode is
             ``'drain'``, where the stop is logged but every point still runs to
-            ``avg``.  Needs an accelerator with a ``REARM`` op and a calc that
-            can stop early.
+            ``avg``.  Needs an accelerator with a ``REARM`` op and a calc
+            whose preset enables the early stop (``"split"``; ``"shift"`` and
+            its alias ``"welford"`` are rejected).
 
             The program grows a landing block at its tail; its address is the
             interrupt vector, carried in ``binprog['ipc']`` and written to the

@@ -79,6 +79,22 @@ module adaptive_sweep (
   wire [31:0] offset_lut_data;
   wire [6:0] offset_lut_len;
 
+  wire [31:0] cfg_start;
+  wire [31:0] cfg_step;
+  wire [15:0] cfg_npoints;
+  wire [4:0] cfg_avg_shift;
+  wire [31:0] cfg_warmup_shots;
+  wire [31:0] cfg_nmin;
+  wire [31:0] cfg_flo;
+  wire [31:0] cfg_fhi;
+  wire [15:0] cfg_pair_min;
+  wire [15:0] cfg_pair_max;
+
+  wire search_mode;
+  wire estop_hold;
+  wire estop_en;
+  wire [2:0] cfg_confirm;
+
   register_bank registers(
     .clk(clk),
     .rst_n(rst_n),
@@ -135,21 +151,6 @@ module adaptive_sweep (
     .offset_lut_len_o(offset_lut_len)
   );
 
-  wire [31:0] cfg_start;
-  wire [31:0] cfg_step;
-  wire [15:0] cfg_npoints;
-  wire [4:0] cfg_avg_shift;
-  wire [31:0] cfg_warmup_shots;
-  wire [31:0] cfg_nmin;
-  wire [31:0] cfg_flo;
-  wire [31:0] cfg_fhi;
-  wire [15:0] cfg_pair_min;
-  wire [15:0] cfg_pair_max;
-
-  wire search_mode;
-  wire estop_hold;
-  wire estop_en;
-  wire [2:0] cfg_confirm;
   wire [31:0] status_word;
 
   wire pf_freq_valid;

@@ -35,8 +35,10 @@ module peak_finder(
   (* MARK_DEBUG = "TRUE" *) reg [63:0] best_amplitude;
   (* MARK_DEBUG = "TRUE" *) reg last_point;
   (* MARK_DEBUG = "TRUE" *) reg dip;
+  reg best_valid;
 
   (* MARK_DEBUG = "TRUE" *) wire is_better = dip ? (amp_data_i < best_amplitude) : (amp_data_i > best_amplitude);
+  wire take_point = is_better | ~best_valid;
   wire [15:0] next_index = point_idx_o + 16'd1;
 
   always @(posedge clk) begin
@@ -80,6 +82,7 @@ module peak_finder(
       best_amplitude <= 0;
       last_point <= 0;
       dip <= 0;
+      best_valid <= 0;
     end else begin
       case (state)
       S_IDLE: begin
@@ -93,6 +96,7 @@ module peak_finder(
           last_point <= (n_points_i <= 16'd1);
           dip <= dip_i;
           best_amplitude <= dip_i ? {64{1'b1}} : {64{1'b0}};
+          best_valid <= 0;
           best_freq_o <= 0;
           best_mean_i_o <= 0;
           best_mean_q_o <= 0;
@@ -107,11 +111,18 @@ module peak_finder(
       S_WAIT_MEAS: begin
         freq_valid_o <= 0;
         if (amp_valid_i) begin
-          if (is_better) begin
+          if (take_point) begin
             best_amplitude <= amp_data_i;
             best_freq_o <= frequency;
             best_mean_i_o <= mean_i_i;
             best_mean_q_o <= mean_q_i;
+            best_valid <= 1;
+          end else begin
+            best_amplitude <= best_amplitude;
+            best_freq_o <= best_freq_o;
+            best_mean_i_o <= best_mean_i_o;
+            best_mean_q_o <= best_mean_q_o;
+            best_valid <= best_valid;
           end
 
           if (last_point)

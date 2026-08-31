@@ -288,6 +288,31 @@ module tb_adaptive_sweep;
     end
   endtask
 
+  task automatic run_probes_ab(input integer avg, input integer isum_a, input integer isum_b, input integer guardmax);
+    integer g;
+    integer k;
+    begin
+      g = 0;
+      k = 0;
+      while (!qtag_rdy_o && (g < guardmax)) begin
+        qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
+        if (!qtag_rdy_o && qtag_dt2_o[0]) begin
+          feed_point(avg, ((k % 2) == 0) ? isum_a : isum_b, 0);
+          k = k + 1;
+        end else begin
+          k = k;
+        end
+        g = g + 1;
+      end
+      if (g >= guardmax) begin
+        $display("FAIL: timed out serving GD/KW probes (ab)");
+        errors = errors + 1;
+      end else begin
+        g = g;
+      end
+    end
+  endtask
+
   task automatic wait_finish;
     integer guard;
     begin
@@ -378,6 +403,29 @@ module tb_adaptive_sweep;
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T0c point_idx reached 1 (status[31:16], now lossless)",
             {16'd0, qtag_dt1_o[31:16]}, 32'd1);
+
+    // T0z  ALL-ZERO GRID, peak mode. Every point has power 0, so the strict
+    //      is_better never fires; the first measurement is taken anyway
+    //      (best_valid) and the answer is the first grid frequency, not 0.
+    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd3, AVG_T0_SH);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    feed_point(AVG_T0, 0, 0);
+    feed_point(AVG_T0, 0, 0);
+    feed_point(AVG_T0, 0, 0);
+    wait_finish;
+    check32("T0z all-zero grid returns the first frequency", qtag_dt1_o, START_FREQ);
+    check64("T0z all-zero grid power", dut.u_peak_finder.best_amplitude, 64'd0);
+
+    // T0t  TIES: three equal points, the first occurrence wins.
+    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd3, AVG_T0_SH);
+    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    feed_point(AVG_T0, 100 * 128, 0);
+    feed_point(AVG_T0, 100 * 128, 0);
+    feed_point(AVG_T0, 100 * 128, 0);
+    wait_finish;
+    check32("T0t tie keeps the first frequency", qtag_dt1_o, START_FREQ);
 
     qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
     qp2_op(5'd0, START_FREQ, STEP, N_POINTS, AVG_T0_SH);
@@ -530,6 +578,33 @@ module tb_adaptive_sweep;
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T5 status dest", {31'd0, qtag_dt1_o[11]}, 32'd1);
+
+    // TR1  RACING MODE MOVES. lambda 1, m_min 1, m_max 2, patience 0,
+    //      max_iter 3. Probe B (x + step) is served louder than probe A (x),
+    //      so every pair certifies on its own (|dp| > |dp| >> 1) and x steps
+    //      up by cfg_step each iteration: 3 iterations, 6 probes, capped.
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(5'd0, START_FREQ, STEP, N_POINTS, 32'd1);
+    qp2_op(5'd9, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd2);
+    search_before = search_valid_cnt;
+    qp2_op(5'd5, START_FREQ, 32'h0000_0010, 32'd0, 32'd3);
+    run_probes_ab(2, 100 * 128, 200 * 128, 400);
+    check32("TR1 racing gd moved +3 steps", qtag_dt1_o, START_FREQ + 3 * STEP);
+    check32("TR1 racing gd done word (capped, iter 3)", qtag_dt2_o, 32'h0003_0002);
+    check32("TR1 racing gd served 6 probes", search_valid_cnt - search_before, 32'd6);
+
+    // TR0  lambda 0 IS DEGENERATE. Same response, lambda 0: |sum(dp)| can
+    //      never exceed sum(|dp|), so no pair count certifies; every
+    //      iteration exhausts m_max = 2 and ties, and x never leaves x0.
+    //      This is the case plan_sweep rejects (lambda_ >= 1 in racing mode).
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    search_before = search_valid_cnt;
+    qp2_op(5'd5, START_FREQ, 32'h0000_0000, 32'd0, 32'd3);
+    run_probes_ab(2, 100 * 128, 200 * 128, 400);
+    check32("TR0 lambda 0 never moves", qtag_dt1_o, START_FREQ);
+    check32("TR0 lambda 0 done word (capped, iter 3)", qtag_dt2_o, 32'h0003_0002);
+    check32("TR0 lambda 0 served 12 probes", search_valid_cnt - search_before, 32'd12);
 
     qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
     qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);

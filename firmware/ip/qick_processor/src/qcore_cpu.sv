@@ -322,11 +322,15 @@ end
 /////////////////////////////////////////////////
 // A request is held until the core is actually fetching, so a redirect is
 // never dropped on a stall and never flushes a pipeline that cannot advance.
+// It is also held while a port write is still in the pipeline (ID..X2): the
+// redirect flushes the trigger queue one cycle after it is taken, and a TRIG
+// that had not reached the queue by then would land after the flush and fire.
 reg  int_pend ;
-wire int_armed, int_take ;
+wire int_armed, int_take, int_port_wr_pend ;
 
+assign int_port_wr_pend = id_ctrl.port_we | rd_ctrl.port_we | x1_ctrl.port_we | x2_ctrl.port_we ;
 assign int_armed = |ipc_i ;
-assign int_take  = (interrupt_i | int_pend) & int_armed & fetch_en ;
+assign int_take  = (interrupt_i | int_pend) & int_armed & fetch_en & ~int_port_wr_pend ;
 assign int_take_o = int_take ;
 
 always_ff @ (posedge clk_i) begin

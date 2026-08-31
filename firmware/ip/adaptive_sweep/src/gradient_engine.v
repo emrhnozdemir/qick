@@ -359,7 +359,7 @@ module gradient_engine (
       step <= step_i;
       min_step <= min_step_i;
       max_iteration <= (max_iteration_i == 16'd0) ? 16'd1 : max_iteration_i;
-      pair_min <= (pair_min_i == 16'd0) ? 16'd1 : pair_min_i;
+      pair_min <= (pair_min_i == 16'd0) ? 16'd1 : (pair_min_i > 16'd255) ? 16'd255 : pair_min_i;
       pair_max <= (pair_max_i == 16'd0) ? 16'd1 : (pair_max_i > 16'd255) ? 16'd255 : pair_max_i;
       patience <= patience_i;
       lambda <= lambda_i;

@@ -75,9 +75,11 @@ Temporary Items
 # Claude Code
 .claude/
 CLAUDE.md
+skill-observations/
 
 # Graphify output
 graphify-out/
 
 # Personal Files
 personal_files/
+*.md
