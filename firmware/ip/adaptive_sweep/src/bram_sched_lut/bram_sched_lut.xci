@@ -5,7 +5,7 @@
     "cell_name": "u_gradient_engine/step_schedule",
     "component_reference": "xilinx.com:ip:blk_mem_gen:8.4",
     "ip_revision": "6",
-    "gen_directory": "../../../../../../../../../users/emirh/desktop/qick/firmware/projects/qick_tprocv2_4x2_standard/top/top.tmp/adaptive_sweep_v1_0_project/adaptive_sweep_v1_0_project.gen/sources_1/ip/bram_sched_lut",
+    "gen_directory": "../../../../projects/qick_tprocv2_4x2_standard/top/top.tmp/adaptive_sweep_v1_0_project/adaptive_sweep_v1_0_project.gen/sources_1/ip/bram_sched_lut",
     "parameters": {
       "component_parameters": {
         "Component_Name": [ { "value": "bram_sched_lut", "resolve_type": "user", "usage": "all" } ],
@@ -175,7 +175,7 @@
         "IPCONTEXT": [ { "value": "IP_Flow" } ],
         "IPREVISION": [ { "value": "6" } ],
         "MANAGED": [ { "value": "TRUE" } ],
-        "OUTPUTDIR": [ { "value": "../../../../../../../../../users/emirh/desktop/qick/firmware/projects/qick_tprocv2_4x2_standard/top/top.tmp/adaptive_sweep_v1_0_project/adaptive_sweep_v1_0_project.gen/sources_1/ip/bram_sched_lut" } ],
+        "OUTPUTDIR": [ { "value": "../../../../projects/qick_tprocv2_4x2_standard/top/top.tmp/adaptive_sweep_v1_0_project/adaptive_sweep_v1_0_project.gen/sources_1/ip/bram_sched_lut" } ],
         "SELECTEDSIMMODEL": [ { "value": "" } ],
         "SHAREDDIR": [ { "value": "." } ],
         "SWVERSION": [ { "value": "2023.1" } ],

@@ -3,9 +3,8 @@
 // --------------------------------------------------------------------------------
 // Tool Version: Vivado v.2023.1 (win64) Build 3865809 Sun May  7 15:05:29 MDT 2023
 // Date        : Fri Aug  7 15:57:02 2026
-// Host        : Emirhan running 64-bit major release  (build 9200)
 // Command     : write_verilog -force -mode synth_stub
-//               c:/Users/emirh/Desktop/qick/firmware/ip/adaptive_sweep/src/bram_sched_lut/bram_sched_lut_stub.v
+//               bram_sched_lut_stub.v
 // Design      : bram_sched_lut
 // Purpose     : Stub declaration of top-level module interface
 // Device      : xczu48dr-ffvg1517-2-e

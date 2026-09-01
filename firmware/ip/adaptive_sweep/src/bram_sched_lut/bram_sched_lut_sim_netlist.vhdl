@@ -3,9 +3,8 @@
 -- --------------------------------------------------------------------------------
 -- Tool Version: Vivado v.2023.1 (win64) Build 3865809 Sun May  7 15:05:29 MDT 2023
 -- Date        : Fri Aug  7 15:57:03 2026
--- Host        : Emirhan running 64-bit major release  (build 9200)
 -- Command     : write_vhdl -force -mode funcsim
---               c:/Users/emirh/Desktop/qick/firmware/ip/adaptive_sweep/src/bram_sched_lut/bram_sched_lut_sim_netlist.vhdl
+--               bram_sched_lut_sim_netlist.vhdl
 -- Design      : bram_sched_lut
 -- Purpose     : This VHDL netlist is a functional simulation representation of the design and should not be modified or
 --               synthesized. This netlist cannot be used for SDF annotated simulation.

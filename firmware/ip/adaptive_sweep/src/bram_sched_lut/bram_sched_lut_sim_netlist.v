@@ -3,9 +3,8 @@
 // --------------------------------------------------------------------------------
 // Tool Version: Vivado v.2023.1 (win64) Build 3865809 Sun May  7 15:05:29 MDT 2023
 // Date        : Fri Aug  7 15:57:02 2026
-// Host        : Emirhan running 64-bit major release  (build 9200)
 // Command     : write_verilog -force -mode funcsim
-//               c:/Users/emirh/Desktop/qick/firmware/ip/adaptive_sweep/src/bram_sched_lut/bram_sched_lut_sim_netlist.v
+//               bram_sched_lut_sim_netlist.v
 // Design      : bram_sched_lut
 // Purpose     : This verilog netlist is a functional simulation representation of the design and should not be modified
 //               or synthesized. This netlist cannot be used for SDF annotated simulation.
