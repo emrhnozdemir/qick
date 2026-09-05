@@ -594,6 +594,132 @@ def get_accel(name):
             % (name, sorted(ACCELS))) from None
 
 
+# =========================================================================
+# Public adaptive-sweep mode names
+# =========================================================================
+# The RTL has exactly two bits that decide how a sweep behaves, and both live
+# in the CTRL word written by CFG_ACQ (register_bank.v lines 227-230):
+#
+#   search_mode  CTRL[0]  0 = keep the LARGEST power seen, 1 = keep the
+#                         smallest.  It reaches peak_finder as dip_i and
+#                         gradient_engine as dip_i; peak_finder seeds its
+#                         running best with 0 for a peak and all-ones for a
+#                         dip (peak_finder.v line 98).
+#   estop_en     CTRL[6]  0 = every point runs the full 1 << avg_shift shots,
+#                         1 = the split test may retire a point early
+#                         (threshold_compare.v line 167 gates stop_o on it).
+#
+# Those two bits are orthogonal, so there are four real hardware behaviours.
+# ``sweep_mode`` names them.  It is a shorthand over the existing ``calc`` and
+# ``mode`` arguments, not a new hardware select: "adaptive" means the preset
+# that sets estop_en (calc='split'), "fixed" means the one that does not
+# (calc='shift'), and "peak"/"dip" is search_mode.
+
+#: Public sweep-mode name -> the encoded values it selects.  ``calc`` and
+#: ``mode`` are the existing keyword arguments; ``search_mode`` and
+#: ``estop_en`` are the CTRL bits those end up as, and are what the
+#: machine-readable contract records.
+SWEEP_MODES = OrderedDict([
+    ("fixed_peak",    dict(calc="shift", mode="peak", search_mode=0, estop_en=0)),
+    ("fixed_dip",     dict(calc="shift", mode="dip",  search_mode=1, estop_en=0)),
+    ("adaptive_peak", dict(calc="split", mode="peak", search_mode=0, estop_en=1)),
+    ("adaptive_dip",  dict(calc="split", mode="dip",  search_mode=1, estop_en=1)),
+])
+
+#: Accepted spellings of the ``mode`` argument -> the ``search_mode`` bit.
+#: The canonical names are "peak" and "dip"; the integers are the encoded
+#: values themselves, accepted so a value round-tripped through the contract
+#: or through a status word can be handed straight back.
+MODE_ALIASES = OrderedDict([
+    ("peak", 0), ("dip", 1),
+    ("max", 0), ("min", 1),
+    (0, 0), (1, 1),
+])
+
+#: Deprecated ``sweep_mode`` spellings -> the canonical name.  Kept working so
+#: existing programs do not break; they raise a DeprecationWarning, which is
+#: silent under Python's default filters.
+SWEEP_MODE_ALIASES = OrderedDict([
+    ("grid_peak", "fixed_peak"),
+    ("grid_dip", "fixed_dip"),
+    ("early_stop_peak", "adaptive_peak"),
+    ("early_stop_dip", "adaptive_dip"),
+])
+
+
+def resolve_mode(mode):
+    """Map a ``mode`` argument to the encoded ``search_mode`` bit.
+
+    Parameters
+    ----------
+    mode : str or int
+        ``"peak"``/``"dip"`` (canonical), ``"max"``/``"min"`` (aliases), or
+        the encoded value ``0``/``1``.
+
+    Returns
+    -------
+    int
+        0 for a peak search, 1 for a dip search.
+    """
+    key = mode.lower() if isinstance(mode, str) else mode
+    if isinstance(key, bool):
+        key = int(key)
+    try:
+        return MODE_ALIASES[key]
+    except (KeyError, TypeError):
+        raise ValueError(
+            "mode must be one of %s (or the encoded value 0/1), got %r"
+            % (sorted(k for k in MODE_ALIASES if isinstance(k, str)), mode)
+        ) from None
+
+
+def resolve_sweep_mode(sweep_mode):
+    """Map a public ``sweep_mode`` name to the values it selects.
+
+    Parameters
+    ----------
+    sweep_mode : str
+        One of :data:`SWEEP_MODES`, or a deprecated alias from
+        :data:`SWEEP_MODE_ALIASES`.
+
+    Returns
+    -------
+    dict
+        ``{'calc': ..., 'mode': ..., 'search_mode': ..., 'estop_en': ...}``.
+    """
+    if not isinstance(sweep_mode, str):
+        raise ValueError(
+            "sweep_mode must be a string naming one of %s, got %r"
+            % (list(SWEEP_MODES), sweep_mode))
+    key = sweep_mode.lower()
+    if key in SWEEP_MODE_ALIASES:
+        canonical = SWEEP_MODE_ALIASES[key]
+        warnings.warn(
+            "sweep_mode=%r is a deprecated alias of %r; the behaviour is "
+            "unchanged" % (sweep_mode, canonical),
+            DeprecationWarning, stacklevel=3)
+        key = canonical
+    if key not in SWEEP_MODES:
+        raise ValueError(
+            "unknown sweep_mode %r; accepted values are %s (deprecated "
+            "aliases: %s)"
+            % (sweep_mode, list(SWEEP_MODES), list(SWEEP_MODE_ALIASES)))
+    return dict(SWEEP_MODES[key])
+
+
+def sweep_mode_name(calc, mode):
+    """The public :data:`SWEEP_MODES` name for a ``(calc, mode)`` pair.
+
+    Returns ``None`` for a combination that has no public name (a calc whose
+    preset is neither of the two the names cover).
+    """
+    bit = resolve_mode(mode)
+    for name, spec in SWEEP_MODES.items():
+        if spec["calc"] == calc and resolve_mode(spec["mode"]) == bit:
+            return name
+    return None
+
+
 # status-word bit masks the tProc tests directly, from tprocv2_assembler.py's
 # alias table (bit_qpb_rdy / bit_qpb_new) and the CTRL word used to ack.
 BIT_QPB_RDY = 0x0400
@@ -697,6 +823,162 @@ def ro_freq_word(prog, freq, ro_ch, gen_ch):
 LOOP_IMM_MAX = (1 << 23) - 1
 
 
+# =========================================================================
+# Machine-readable QP2 / adaptive-sweep contract
+# =========================================================================
+# The tables above (QP2Accel / QP2Op / Field, the CTRL presets, the status
+# layout, the result-block offsets) are the authoritative Python description
+# of the encodings.  qp2_contract() serialises them, plus the few
+# adaptive-sweep facts that live outside them, into plain JSON-able data.
+#
+# IMPORTANT, and stated honestly: this is an EXPORT, not a generator.  Neither
+# Python nor the Verilog reads the JSON back; the RTL remains the hardware
+# authority and these tables remain the Python authority.  Nothing in this
+# module depends on the export existing - qp2_contract() only serialises what
+# is already here, so asm_v2.py runs identically whether or not a snapshot has
+# ever been written.  The snapshot and the checker that compares it against
+# both the tables above and the Verilog they were transcribed from live in
+# personal_files/adaptive_sweep/contract/.
+
+#: What register_bank.v decodes cfg_target (reg0[20:16]) as, and what the
+#: Adaptive_Sweep driver writes for each.
+AXI_TABLE_TARGETS = OrderedDict([
+    ("step_lut", 0),        # gd/kw a_k step schedule
+    ("offset_lut", 1),      # gd/kw c_k probe-width schedule
+    ("estop_threshold", 2), # the 16-bit reciprocal D
+    ("ctrl", 3),            # the CTRL word, same bits CFG_ACQ dt2 carries
+])
+
+#: Named bits of the CTRL word.  CFG_ACQ dt2 IS this word (register_bank.v
+#: assigns ctrl from dt2_i), and the AXI target-3 write lands on the same
+#: register, so the two paths must agree bit for bit.
+CTRL_BITS = OrderedDict([
+    ("search_mode", (1, 0)),   # (width, lsb) - 0 peak / 1 dip
+    ("estop_hold", (1, 4)),    # 0 emit immediately / 1 freeze and drain
+    ("estop_en", (1, 6)),      # arm the split early stop
+    ("confirm", (3, 17)),      # consecutive passing checkpoints needed
+])
+
+
+def _field_contract(f):
+    return {"name": f.name, "bits": f.bits, "lsb": f.lsb, "signed": bool(f.signed)}
+
+
+def _op_contract(op):
+    return {
+        "number": op.number,
+        "blocking": bool(op.blocking),
+        "responds": bool(op.responds),
+        "args": {k: [_field_contract(f) for f in v] for k, v in op.args.items()},
+        "resp": {k: [_field_contract(f) for f in v] for k, v in op.resp.items()},
+        "doc": " ".join(op.doc.split()),
+    }
+
+
+def _accel_contract(accel):
+    return {
+        "name": accel.name,
+        "rtl_source": accel.rtl_source,
+        "algorithms": list(accel.algorithms),
+        "calcs": list(accel.calcs),
+        "calc_ctrl": {k: dict(v) for k, v in accel.calc_ctrl.items()},
+        "gdkw_calcs": list(accel.gdkw_calcs),
+        "lut_depth": accel.lut_depth,
+        "ops": {m: _op_contract(op) for m, op in accel.ops.items()},
+        "status_bits": [_field_contract(f) for f in accel.status_bits],
+    }
+
+
+#: Bumped whenever the exported shape changes (not when a value changes).
+CONTRACT_VERSION = 1
+
+
+def qp2_contract():
+    """The QP2 / adaptive-sweep encodings as plain JSON-able data.
+
+    Returns
+    -------
+    dict
+        ``accelerators`` holds one entry per :data:`ACCELS` member: its opcode
+        map (numbers, per-``dt`` field names with width / lsb / signedness),
+        its response layout, its status-word layout, and its calc presets.
+        ``adaptive_sweep`` holds the facts that are not part of an opcode: the
+        CTRL bit map, the AXI table targets, the GET_DIAG payload, the public
+        sweep-mode names and what they encode to, the data-memory result
+        block, and the early-stop redirect contract with the tProcessor.
+
+    Notes
+    -----
+    This is a serialisation of the tables in this module, which were
+    transcribed from the RTL by hand.  It is a *contract*: a machine-readable
+    consistency checker, not a source of truth.  Nothing here or in the
+    Verilog consumes its output.  ``personal_files/adaptive_sweep/contract/
+    gen_contract.py`` writes the snapshot and checks it against both this
+    module and the RTL.
+    """
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "generated_from": "qick_lib/qick/asm_v2.py",
+        "authority": "the RTL is the hardware authority; the Python tables in "
+                     "asm_v2.py are the software authority; this file is an "
+                     "export of the Python tables, checked against both",
+        "accelerators": {n: _accel_contract(a) for n, a in ACCELS.items()},
+        "adaptive_sweep": {
+            "ctrl_bits": {k: {"bits": w, "lsb": l}
+                          for k, (w, l) in CTRL_BITS.items()},
+            "ctrl_rtl_source": "firmware/ip/adaptive_sweep/src/register_bank.v",
+            "axi_table_targets": dict(AXI_TABLE_TARGETS),
+            "diag_fields": [_field_contract(f) for f in AS_DIAG_FIELDS],
+            "sweep_modes": {k: dict(v) for k, v in SWEEP_MODES.items()},
+            "sweep_mode_aliases": dict(SWEEP_MODE_ALIASES),
+            "mode_aliases": {str(k): v for k, v in MODE_ALIASES.items()},
+            "estop_threshold": {
+                "register_bits": 16,
+                "encoding": "D = round(1 / estop_thr)",
+                "reset_value": 64,
+                "test": "a checkpoint passes iff (|dI|+|dQ|) * D <= |SI|+|SQ|",
+                "units": "estop_thr is a dimensionless noise/signal ratio in (0, 1]",
+            },
+            "checkpoints": {
+                "grid": "n = 4, 8, 16, ... (shot_counter watches one rising bit "
+                        "at a time, starting at bit 2)",
+                "exponent_field": "k, the checkpoint log2, reported in "
+                                  "GET_DIAG dt2 bits 7:3",
+                "cap": "1 << avg_shift shots, avg_shift clamped to 26",
+            },
+            "result_block": {
+                "words": RESULT_BLOCK,
+                "freq": RESULT_FREQ,
+                "done": RESULT_DONE,
+                "status": RESULT_STATUS,
+                "diag": RESULT_DIAG,
+                "done_sentinel": DONE_SENTINEL,
+                "literal_dmem_max": LITERAL_DMEM_MAX,
+            },
+            "redirect": {
+                "name": "early-stop acquisition-abort redirect",
+                "request": "adaptive_sweep.v interrupt_o, a one-cycle pulse "
+                           "registered from ac_early_pulse AND int_en",
+                "arm_op": "REARM (opcode 14), sent once before START to arm and "
+                          "again from the landing block to release the park",
+                "destination": "the tProcessor TPROC_IPC register "
+                               "(qproc_axi_reg slv_reg9), loaded by the "
+                               "compiler with the landing block address",
+                "armed_when": "TPROC_IPC != 0",
+                "clock": "both sides run on clk_core; there is no CDC",
+                "doc": "personal_files/adaptive_sweep/docs/EARLY_STOP_REDIRECT.md",
+            },
+            "tproc_constants": {
+                "bit_qpb_rdy": BIT_QPB_RDY,
+                "bit_qpb_new": BIT_QPB_NEW,
+                "cfg_src_qpb": CFG_SRC_QPB,
+                "ctrl_clr_qpb": CTRL_CLR_QPB,
+                "qpb_ack": QPB_ACK,
+            },
+        },
+    }
+
+
 @dataclass
 class SweepPlan:
     """Everything the code generator needs, in machine units.
@@ -735,6 +1017,9 @@ class SweepPlan:
     avg_shift: int = 0
     nsamp: int = 1
     mode: int = 0
+    #: Public :data:`SWEEP_MODES` name for this (calc, mode) pair, empty for
+    #: a combination that has no public name.
+    sweep_mode: str = ""
     trig_time: float = 0.0
     shot_period: float = 0.0
 
@@ -825,6 +1110,28 @@ class SweepPlan:
             freq += prog.gen_chs[self.gen_ch]["mixer_freq"]["rounded"]
         return freq
 
+    def index_of_word(self, word):
+        """The grid index whose drive word is ``word``, or None.
+
+        ``peak_finder`` walks ``start + k*step`` in 32-bit words, wrapping the
+        same way the tProcessor does, so the winning index is recoverable from
+        the winning word by replaying that walk.  It is *not* the ``point_idx``
+        the status word carries: that one stops at the last index visited, not
+        at the best one.  Returns None for a gd/kw run (which revisits
+        frequencies, so a word does not name an index), for a degenerate step,
+        or for a word that is not on the grid.
+        """
+        if self.handshake or self.n_points <= 0 or self.gen_step == 0:
+            return None
+        target = to_u32(word)
+        here = to_u32(self.gen_start)
+        step = to_u32(self.gen_step)
+        for k in range(self.n_points):
+            if here == target:
+                return k
+            here = (here + step) & MASK32
+        return None
+
     def describe(self):
         """A short human-readable summary, for logging and notebooks."""
         lines = ["adaptive_sweep '%s' on %s (%s/%s)"
@@ -844,8 +1151,9 @@ class SweepPlan:
                             self.ro_start, self.ro_step))
             lines.append("  %d shots/point -> %d shots total"
                          % (self.avg, self.total_shots))
-        lines.append("  nsamp %d, mode %s, result at dmem[%d]"
+        lines.append("  nsamp %d, mode %s%s, result at dmem[%d]"
                      % (self.nsamp, "dip" if self.mode else "peak",
+                        " (%s)" % (self.sweep_mode,) if self.sweep_mode else "",
                         self.result_addr))
         return "\n".join(lines)
 
@@ -930,7 +1238,7 @@ def _ratio_scaling(ratio, max_delta):
 def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                gen_ch=None, ro_ch=None, pulse=None, ro_cfg=None,
                start=None, stop=None, step=None, n_points=None,
-               avg=1, nsamp=None, mode="peak",
+               avg=1, nsamp=None, mode=None, sweep_mode=None,
                trig_time=0.0, shot_period=None,
                n0=None, n_min=None, emit_mode=None,
                estop_thr=None,
@@ -950,6 +1258,27 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     SweepPlan
     """
     accel = get_accel(accel)
+
+    # --- public mode name --------------------------------------------------
+    # sweep_mode is shorthand over calc + mode, so resolve it before either is
+    # used.  Passing it together with a conflicting calc/mode is an error
+    # rather than a silent override.
+    if sweep_mode is not None:
+        spec = resolve_sweep_mode(sweep_mode)
+        if calc is not None and calc != spec["calc"]:
+            raise ValueError(
+                "sweep_mode=%r selects calc=%r, which contradicts the "
+                "calc=%r you passed; give one or the other"
+                % (sweep_mode, spec["calc"], calc))
+        if mode is not None and resolve_mode(mode) != resolve_mode(spec["mode"]):
+            raise ValueError(
+                "sweep_mode=%r selects mode=%r, which contradicts the "
+                "mode=%r you passed; give one or the other"
+                % (sweep_mode, spec["mode"], mode))
+        calc = spec["calc"]
+        mode = spec["mode"]
+    if mode is None:
+        mode = "peak"
 
     # --- capability checks -------------------------------------------------
     _require(algorithm in accel.algorithms,
@@ -1010,12 +1339,10 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     _require(nsamp >= 1,
              "nsamp must be >= 1; it is the number of raw ADC samples folded "
              "per shot, and defaults to the declared readout window")
-    _require(mode in ("peak", "dip"),
-             "mode must be 'peak' or 'dip', got %r" % (mode,))
+    mode_bit = resolve_mode(mode)
     _require(not debug or accel.has_op("GET_DIAG"),
              "debug=True asks for the diagnostic counters, but accelerator "
              "'%s' has no diagnostic read" % (accel.name,))
-    mode_bit = 1 if mode == "dip" else 0
 
     if shot_period is None:
         ro_len_us = prog.ro_chs[ro_ch]["length"] / prog.soccfg["readouts"][ro_ch]["f_output"]
@@ -1035,6 +1362,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         result_addr=int(result_addr), debug=bool(debug),
         count_shots=bool(count_shots),
         interrupt=1 if interrupt else 0,
+        sweep_mode=sweep_mode_name(calc, mode_bit) or "",
     )
 
     if interrupt:
@@ -1149,7 +1477,8 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
             "calc='welford' is a deprecated alias of calc='shift': the Welford "
             "running-mean pipeline was removed from adaptive_sweep on "
             "2026-08-24, both presets configure the same datapath, and n0 "
-            "only drives the warmup_done status bit", stacklevel=3)
+            "only drives the warmup_done status bit",
+            DeprecationWarning, stacklevel=3)
         _require(n0 is not None,
                  "calc='welford' needs n0= (the warmup shot count)")
         _require(1 <= int(n0) <= avg,
@@ -4718,8 +5047,30 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         nsamp : int
             Raw ADC samples folded per shot.  Defaults to the declared readout
             window length, which is what the averaging buffer itself uses.
-        mode : str
-            ``"peak"`` to maximise, ``"dip"`` to minimise.
+        mode : str or int
+            ``"peak"`` to maximise, ``"dip"`` to minimise.  ``"max"``/``"min"``
+            are accepted aliases, and so are the encoded values ``0``/``1``
+            (the ``search_mode`` bit, CTRL[0]).  Anything else raises a
+            ValueError naming the accepted spellings.
+        sweep_mode : str
+            Optional shorthand naming the whole hardware behaviour instead of
+            spelling out ``calc`` and ``mode``:
+
+            ==================  ==========  ==========  ===========  =========
+            sweep_mode          calc        mode        search_mode  estop_en
+            ==================  ==========  ==========  ===========  =========
+            ``fixed_peak``      ``shift``   ``peak``    0            0
+            ``fixed_dip``       ``shift``   ``dip``     1            0
+            ``adaptive_peak``   ``split``   ``peak``    0            1
+            ``adaptive_dip``    ``split``   ``dip``     1            1
+            ==================  ==========  ==========  ===========  =========
+
+            "fixed" means every point runs the full ``avg`` shots; "adaptive"
+            means the split early stop may retire a point sooner.  Passing
+            ``sweep_mode`` together with a contradicting ``calc`` or ``mode``
+            is an error.  ``grid_peak``/``grid_dip``/``early_stop_peak``/
+            ``early_stop_dip`` still work as deprecated aliases (they raise a
+            DeprecationWarning, which Python hides by default).
         trig_time : float
             Readout trigger time within a shot (us).
         shot_period : float
@@ -4898,10 +5249,50 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         Returns
         -------
         dict
-            ``freq`` (MHz), ``freq_word`` (the raw drive word), and ``done``
-            (whether the sweep finished).  On accelerators that report them,
-            also ``status`` and its decoded fields, and ``n_used`` when the
-            sweep was declared with ``debug=True``.  Keys the accelerator
+            Always present:
+
+            ``freq`` : float
+                Winning/final drive frequency, MHz.
+            ``freq_word`` : int
+                The raw 32-bit drive register word behind ``freq``.
+            ``done`` : bool
+                Whether the done sentinel was in the block.
+            ``stop_reason`` : str
+                ``'grid_complete'`` for a finished grid sweep,
+                ``'converged'``/``'max_iterations'``/``'finished'`` for gd/kw,
+                ``'incomplete'`` if the sentinel was missing.  This is why the
+                *sweep* ended; per-point early stops are in ``stop_log``.
+
+            Present when they can be defined unambiguously:
+
+            ``frequency_index`` : int
+                Grid index of ``freq_word``, replayed from ``start + k*step``
+                (grid algorithms only).  Not the status word's ``point_idx``,
+                which stops at the last index visited.
+            ``sweep_mode`` : str
+                Public :data:`SWEEP_MODES` name this sweep was declared with.
+            ``threshold`` : float, ``threshold_encoded`` : int
+                Realized early-stop noise/signal ratio and the 16-bit
+                reciprocal D actually written to the IP (split calcs only).
+            ``status`` : int and its decoded flags
+                On accelerators with a status read.
+            ``n_used`` : int
+                GET_DIAG shot count for the LAST point the accelerator
+                emitted, with ``debug=True``.  Not necessarily the winner.
+            ``stop_log`` : dict of arrays, ``accelerator_shots`` : int,
+            ``retained_shots`` : int
+                With ``dump_log``: the per-point verdicts, the total shots the
+                accelerator actually folded, and the winning point's own shot
+                count.
+            ``observed_shots`` : int
+                With ``count_shots=True``: the tProcessor's externally
+                readable counter, which counts one per shot the sweep fires
+                plus one per program repetition.
+
+            ``i``, ``q``, ``power``, ``signal_magnitude``, ``noise_magnitude``
+            and ``threshold_margin`` are NOT returned: this build's result
+            protocol does not carry them.
+            :attr:`SWEEP_UNAVAILABLE` says why for each.  Keys the accelerator
             cannot produce are absent rather than filled with whatever data
             memory happened to hold.
         """
@@ -4915,7 +5306,19 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             log_words = [int(w) & 0xFFFFFFFF for w in
                          soc.tproc.read_mem('dmem', length=plan.n_points,
                                             addr=plan.log_addr)]
-            out['stop_log'] = self.decode_stop_log(log_words, name=name)
+            log = self.decode_stop_log(log_words, name=name)
+            out['stop_log'] = log
+            # the per-point log is the only place the *realized* shot counts
+            # are recorded, so these two are available only alongside it
+            out['accelerator_shots'] = int(log['n_used'].sum())
+            idx = out.get('frequency_index')
+            if idx is not None and 0 <= idx < len(log['n_used']):
+                out['retained_shots'] = int(log['n_used'][idx])
+        if plan.count_shots:
+            # the tProcessor's externally readable counter: one increment per
+            # shot the sweep fires, plus one per program repetition
+            out['observed_shots'] = int(
+                soc.tproc.single_read(addr=getattr(self, 'COUNTER_ADDR', 1)))
         return out
 
     def decode_stop_log(self, words, name=None):
@@ -4963,12 +5366,19 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                                + plan.step_mhz * np.arange(len(words)))
         return out
 
-    def wait_for_sweep(self, soc, name=None, timeout=60.0, poll=0.001):
+    def wait_for_sweep(self, soc, name=None, timeout=60.0, poll=0.001,
+                       summary=True):
         """Block until an accelerated sweep has written its result.
 
         The sweep signals completion by writing a sentinel into its result
         block, as the very last thing it does, so seeing it means every other
         result word has already settled.
+
+        This is the top-level "run the sweep to completion" call, so it is
+        also where the run summary is printed: once, after the sweep has
+        actually finished, and never on the timeout path.  Lower-level helpers
+        (:meth:`get_sweep_result`, :meth:`decode_sweep_result`) print nothing,
+        so calling them repeatedly is quiet.
 
         Parameters
         ----------
@@ -4980,6 +5390,10 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             Seconds to wait before giving up.
         poll : float
             Seconds between reads.
+        summary : bool
+            Print :meth:`print_adaptive_sweep_summary` once the sweep has
+            finished.  Pass False in a loop that runs the same sweep many
+            times.
 
         Returns
         -------
@@ -5000,7 +5414,10 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                 'dmem', length=1,
                 addr=plan.result_addr + RESULT_DONE)[0]) & 0xFFFFFFFF
             if word == DONE_SENTINEL:
-                return self.get_sweep_result(soc, name=name)
+                result = self.get_sweep_result(soc, name=name)
+                if summary:
+                    self.print_adaptive_sweep_summary(name=name, result=result)
+                return result
             if time.time() > deadline:
                 raise TimeoutError(
                     "sweep %r did not finish within %g s; its done word at "
@@ -5048,7 +5465,310 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                 out.update(plan.accel.unpack_status(words[RESULT_STATUS]))
         if plan.writes_diag:
             out['n_used'] = words[RESULT_DIAG]
+
+        # --- fields derived from what is already in the block --------------
+        # the winning index is replayed from the winning word, NOT taken from
+        # the status word: point_idx stops at the last index the sweep visited
+        idx = plan.index_of_word(words[RESULT_FREQ])
+        if idx is not None:
+            out['frequency_index'] = idx
+        if plan.sweep_mode:
+            out['sweep_mode'] = plan.sweep_mode
+        if plan.estop_d:
+            out['threshold'] = plan.estop_thr
+            out['threshold_encoded'] = plan.estop_d
+        if not out['done']:
+            out['stop_reason'] = 'incomplete'
+        elif plan.handshake:
+            out['stop_reason'] = ('converged' if out.get('converged')
+                                  else 'max_iterations' if out.get('capped')
+                                  else 'finished')
+        else:
+            out['stop_reason'] = 'grid_complete'
         return out
+
+    #: Result fields the current hardware/result protocol cannot supply, and
+    #: why.  They are reported as "unavailable" rather than guessed at.
+    SWEEP_UNAVAILABLE = OrderedDict([
+        ("i", "the winning mean I is inside the IP (readable with QP2 "
+              "GET_MEAN), but the 4-word result block has no slot for it"),
+        ("q", "the winning mean Q is inside the IP (readable with QP2 "
+              "GET_MEAN), but the 4-word result block has no slot for it"),
+        ("power", "the winning power never leaves the IP: qtag_dt2_o is "
+                  "hardwired to 0 at pf_finish"),
+        ("signal_magnitude", "a per-checkpoint value internal to "
+                             "threshold_compare.v; not exported over QP2 or AXI"),
+        ("noise_magnitude", "a per-checkpoint value internal to "
+                            "threshold_compare.v; not exported over QP2 or AXI"),
+        ("threshold_margin", "signal minus scaled noise, internal to "
+                             "threshold_compare.v; not exported over QP2 or AXI"),
+    ])
+
+    def get_adaptive_sweep_summary(self, soc=None, name=None, result=None):
+        """Configuration and result of an accelerated sweep, as a dict.
+
+        This is a reporting helper: it reads nothing the sweep did not already
+        produce, and it never changes the program or the hardware.
+
+        Parameters
+        ----------
+        soc : QickSoc or None
+            If given (and ``result`` is not), the result block is read from
+            the board with :meth:`get_sweep_result`.  Without it the summary
+            carries configuration only.
+        name : str or None
+            Which sweep; may be omitted if the program declares only one.
+        result : dict or None
+            An already-decoded result, as :meth:`get_sweep_result` returns.
+            Use this to summarise a result you have in hand instead of
+            re-reading the board.
+
+        Returns
+        -------
+        dict
+            An ordinary dict with these keys:
+
+            ``name``, ``accelerator``, ``algorithm``, ``calc``, ``sweep_mode``
+                What ran.  ``sweep_mode`` is the public name from
+                :data:`SWEEP_MODES`, or ``None`` for a combination that has no
+                public name.
+            ``config``
+                dict of the declared parameters, in physical units where they
+                have them, plus the register words they became.
+            ``result``
+                dict of the runtime result; empty if none was supplied.
+            ``unavailable``
+                dict of field name -> why this build cannot report it.
+        """
+        name = self._sweep_name(name)
+        plan = self.get_sweep_plan(name)
+        if result is None and soc is not None:
+            result = self.get_sweep_result(soc, name=name)
+
+        cfg = OrderedDict()
+        cfg['mode'] = 'dip' if plan.mode else 'peak'
+        cfg['nsamp'] = plan.nsamp
+        cfg['trig_time_us'] = plan.trig_time
+        cfg['shot_period_us'] = plan.shot_period
+        if plan.handshake:
+            cfg['window_mhz'] = (plan.f_lo_mhz, plan.f_hi_mhz)
+            cfg['x0_mhz'] = plan.x0_mhz
+            cfg['probe_step_mhz'] = plan.step_mhz
+            cfg['min_step_mhz'] = plan.min_step_mhz
+            cfg['max_iter'] = plan.max_iter
+            cfg['patience'] = plan.patience
+            cfg['use_lut'] = bool(plan.use_lut)
+            if not plan.use_lut:
+                cfg['lambda'] = plan.lam
+                cfg['pairs_per_move'] = (plan.m_min, plan.m_max)
+        else:
+            cfg['start_mhz'] = plan.start_mhz
+            cfg['stop_mhz'] = plan.stop_mhz
+            cfg['step_mhz'] = plan.step_mhz
+            cfg['n_points'] = plan.n_points
+            cfg['gen_start_word'] = plan.gen_start
+            cfg['gen_step_word'] = plan.gen_step
+            cfg['ro_start_word'] = plan.ro_start
+            cfg['ro_step_word'] = plan.ro_step
+        cfg['max_shots_per_point'] = plan.avg
+        cfg['avg_shift'] = plan.avg_shift
+        if plan.avg_rounded:
+            cfg['shots_per_point_requested'] = plan.avg_requested
+        cfg['shots_planned'] = plan.total_shots
+        if plan.estop_d:
+            cfg['estop_threshold'] = plan.estop_thr
+            cfg['estop_threshold_encoded'] = plan.estop_d
+            cfg['estop_threshold_requested'] = plan.estop_thr_requested
+            cfg['n_min'] = plan.n_min
+            cfg['confirm'] = plan.confirm
+            cfg['emit_mode'] = 'drain' if plan.emit_mode else 'immediate'
+        cfg['redirect'] = bool(plan.interrupt)
+        if plan.interrupt and plan.landing_label:
+            cfg['redirect_landing_label'] = plan.landing_label
+        cfg['result_addr'] = plan.result_addr
+        cfg['result_words'] = RESULT_BLOCK
+        if plan.dump_log:
+            cfg['stop_log_addr'] = plan.log_addr
+            cfg['stop_log_words'] = plan.n_points
+        if self.binprog is not None:
+            # whole-program counts: an accelerated sweep is emitted as one
+            # macro inside the program, so these are the honest numbers we
+            # can quote, not a per-macro breakdown
+            if self.binprog.get('pmem') is not None:
+                cfg['program_instructions'] = len(self.binprog['pmem'])
+            if self.binprog.get('dmem') is not None:
+                cfg['program_dmem_words'] = len(self.binprog['dmem'])
+
+        res = OrderedDict()
+        if result is not None:
+            for key in ('freq', 'freq_word', 'frequency_index', 'done',
+                        'stop_reason', 'threshold', 'threshold_encoded',
+                        'retained_shots', 'accelerator_shots',
+                        'observed_shots', 'n_used', 'status', 'converged',
+                        'capped', 'iterations'):
+                if key in result:
+                    res[key] = result[key]
+            if 'stop_log' in result:
+                log = result['stop_log']
+                res['points_stopped_early'] = int(log['converged'].sum())
+                res['points_capped'] = int(log['capped'].sum())
+
+        unavailable = OrderedDict(self.SWEEP_UNAVAILABLE)
+        if 'observed_shots' not in res:
+            unavailable['observed_shots'] = (
+                "declare the sweep with count_shots=True and pass soc= to read "
+                "the tProcessor's external shot counter")
+        if 'retained_shots' not in res:
+            unavailable['retained_shots'] = (
+                "the per-point shot counts are only recorded when the sweep "
+                "runs with dump_log (interrupt=True and an early-stopping calc)")
+
+        return {
+            'name': name,
+            'accelerator': plan.accel.name,
+            'algorithm': plan.algorithm,
+            'calc': plan.calc,
+            'sweep_mode': plan.sweep_mode or None,
+            'config': dict(cfg),
+            'result': dict(res),
+            'unavailable': dict(unavailable),
+        }
+
+    def print_adaptive_sweep_summary(self, soc=None, name=None, result=None,
+                                     file=None):
+        """Print :meth:`get_adaptive_sweep_summary` in a readable block.
+
+        Called automatically by :meth:`wait_for_sweep` once a sweep has
+        finished; call it yourself to re-print, or to summarise a result you
+        already hold.
+
+        Parameters
+        ----------
+        soc, name, result
+            As for :meth:`get_adaptive_sweep_summary`.
+        file : file-like or None
+            Where to write; defaults to stdout.
+        """
+        s = self.get_adaptive_sweep_summary(soc=soc, name=name, result=result)
+        for line in self.format_adaptive_sweep_summary(s):
+            print(line, file=file)
+
+    @staticmethod
+    def format_adaptive_sweep_summary(summary):
+        """Turn a summary dict into the lines
+        :meth:`print_adaptive_sweep_summary` prints."""
+        cfg = summary['config']
+        res = summary['result']
+        una = summary['unavailable']
+
+        def row(label, text):
+            """One label/value line, wrapped to a terminal width."""
+            indent = "  %-22s " % (label,)
+            wrapped = textwrap.wrap(str(text), width=96,
+                                    initial_indent=indent,
+                                    subsequent_indent=" " * len(indent))
+            return "\n".join(wrapped) if wrapped else indent.rstrip()
+
+        head = "adaptive sweep %r  --  %s / %s / %s" % (
+            summary['name'], summary['accelerator'], summary['algorithm'],
+            summary['calc'])
+        if summary['sweep_mode']:
+            head += "  (%s)" % (summary['sweep_mode'],)
+        else:
+            head += "  (mode %s)" % (cfg['mode'],)
+        lines = [head, "configuration"]
+
+        if 'n_points' in cfg:
+            lines.append(row("band", "%.4f - %.4f MHz, %d points, step %.6f MHz"
+                             % (cfg['start_mhz'], cfg['stop_mhz'],
+                                cfg['n_points'], cfg['step_mhz'])))
+            lines.append(row("drive / readout word",
+                             "start %d step %d / start %d step %d"
+                             % (cfg['gen_start_word'], cfg['gen_step_word'],
+                                cfg['ro_start_word'], cfg['ro_step_word'])))
+        else:
+            lo, hi = cfg['window_mhz']
+            lines.append(row("search window", "%.4f - %.4f MHz, x0 %.4f MHz"
+                             % (lo, hi, cfg['x0_mhz'])))
+            lines.append(row("probe / min step", "%.6f / %.6f MHz"
+                             % (cfg['probe_step_mhz'], cfg['min_step_mhz'])))
+            lines.append(row("iteration cap", "%d (patience %d)"
+                             % (cfg['max_iter'], cfg['patience'])))
+
+        shots = "max %d per point (avg_shift %d)" % (
+            cfg['max_shots_per_point'], cfg['avg_shift'])
+        if 'shots_per_point_requested' in cfg:
+            shots += ", rounded up from %d" % (cfg['shots_per_point_requested'],)
+        if cfg.get('shots_planned') is not None:
+            shots += ", %d planned in total" % (cfg['shots_planned'],)
+        lines.append(row("shots", shots))
+
+        if 'estop_threshold' in cfg:
+            lines.append(row("early stop",
+                             "threshold %.6g (D=%d), n_min %d, confirm %d, "
+                             "emit %s"
+                             % (cfg['estop_threshold'],
+                                cfg['estop_threshold_encoded'], cfg['n_min'],
+                                cfg['confirm'], cfg['emit_mode'])))
+        lines.append(row("redirect",
+                         ("enabled -> %s" % (cfg['redirect_landing_label'],))
+                         if cfg.get('redirect_landing_label')
+                         else ("enabled" if cfg['redirect'] else "disabled")))
+        lines.append(row("acquisition",
+                         "nsamp %d, trigger %.3f us, shot period %.3f us"
+                         % (cfg['nsamp'], cfg['trig_time_us'],
+                            cfg['shot_period_us'])))
+        mem = "result block dmem[%d..%d]" % (
+            cfg['result_addr'], cfg['result_addr'] + cfg['result_words'] - 1)
+        if 'stop_log_addr' in cfg:
+            mem += ", stop log dmem[%d..%d]" % (
+                cfg['stop_log_addr'],
+                cfg['stop_log_addr'] + cfg['stop_log_words'] - 1)
+        if 'program_instructions' in cfg:
+            mem = "%d instructions, %s" % (cfg['program_instructions'], mem)
+        lines.append(row("program", mem))
+
+        if not res:
+            lines.append("result")
+            lines.append(row("", "not read yet (pass soc= or result=)"))
+            return lines
+
+        lines.append("result")
+        freq = "%.6f MHz (word 0x%08x)" % (res['freq'], to_u32(res['freq_word']))
+        if 'frequency_index' in res:
+            freq += ", grid index %d" % (res['frequency_index'],)
+        lines.append(row("frequency", freq))
+        lines.append(row("stop reason", "%s%s"
+                         % (res.get('stop_reason', 'unknown'),
+                            "" if res.get('done', True) else " (done flag not set)")))
+        if 'iterations' in res:
+            lines.append(row("iterations", "%d (converged=%s capped=%s)"
+                             % (res['iterations'], res.get('converged'),
+                                res.get('capped'))))
+        if 'threshold' in res:
+            lines.append(row("threshold", "%.6g (encoded D=%d)"
+                             % (res['threshold'], res['threshold_encoded'])))
+        for key, label in (('retained_shots', 'retained shots'),
+                           ('accelerator_shots', 'shots folded'),
+                           ('observed_shots', 'shots fired'),
+                           ('n_used', 'n_used (last point)')):
+            if key in res:
+                lines.append(row(label, "%d" % (res[key],)))
+        if 'points_stopped_early' in res:
+            lines.append(row("points stopped early", "%d of %d (%d ran to the cap)"
+                             % (res['points_stopped_early'], cfg['n_points'],
+                                res['points_capped'])))
+        if 'status' in res:
+            lines.append(row("status word", "0x%08x" % (to_u32(res['status']),)))
+        for key in ('i', 'q', 'power'):
+            lines.append(row(key.upper() if len(key) == 1 else key,
+                             "unavailable -- %s" % (una[key],)))
+        rest = [k for k in una if k not in ('i', 'q', 'power')]
+        if rest:
+            lines.append(row("also unavailable",
+                             "%s (summary['unavailable'] says why for each)"
+                             % (", ".join(rest),)))
+        return lines
 
     def _sweep_name(self, name):
         """Resolve an optional sweep name, defaulting only when unambiguous."""
