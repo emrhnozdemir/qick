@@ -11,6 +11,8 @@ module early_stop_checker(
   input [31:0] warmup_shots_i,
   input [31:0] n_min_i,
   input [15:0] threshold_i,
+  input block_en_i,
+  input [31:0] block_tol_i,
   input [2:0] confirm_i,
   input hold_i,
 
@@ -47,6 +49,8 @@ module early_stop_checker(
   wire magnitude_valid;
   wire [58:0] signal_magnitude;
   wire [58:0] noise_magnitude;
+  wire [59:0] block_magnitude;
+  wire block_valid;
   wire [4:0] magnitude_exponent;
   wire signed [57:0] snapshot_i;
   wire signed [57:0] snapshot_q;
@@ -80,8 +84,10 @@ module early_stop_checker(
   magnitude_calculator magnitude(
     .clk(clk),
     .rst_n(rst_n),
+    .arm_i(arm_i),
     .check_i(check),
     .check_exponent_i(check_exponent),
+    .snapshot_exponent_i(stop_exponent),
     .sum_i_i(sum_i_i),
     .sum_q_i(sum_q_i),
     .diff_i_i(diff_i_i),
@@ -91,6 +97,8 @@ module early_stop_checker(
     .valid_o(magnitude_valid),
     .signal_magnitude_o(signal_magnitude),
     .noise_magnitude_o(noise_magnitude),
+    .block_magnitude_o(block_magnitude),
+    .block_valid_o(block_valid),
     .exponent_o(magnitude_exponent)
   );
 
@@ -100,11 +108,15 @@ module early_stop_checker(
     .arm_i(arm_i),
     .enable_i(enable_i),
     .threshold_i(threshold_i),
+    .block_en_i(block_en_i),
+    .block_tol_i(block_tol_i),
     .n_min_i(n_min_i),
     .confirm_i(confirm_i),
     .valid_i(magnitude_valid),
     .signal_magnitude_i(signal_magnitude),
     .noise_magnitude_i(noise_magnitude),
+    .block_magnitude_i(block_magnitude),
+    .block_valid_i(block_valid),
     .exponent_i(magnitude_exponent),
     .stop_o(stop),
     .stop_exponent_o(stop_exponent),

@@ -70,6 +70,7 @@ module adaptive_sweep (
   (* MARK_DEBUG = "TRUE" *) wire rearm_now = en_rise & (qtag_op_i == 5'd14);
 
   wire [15:0] threshold;
+  wire [31:0] block_tol;
   wire step_lut_write;
   wire [5:0] step_lut_addr;
   wire [31:0] step_lut_data;
@@ -93,6 +94,7 @@ module adaptive_sweep (
   wire search_mode;
   wire estop_hold;
   wire estop_en;
+  wire block_en;
   wire [2:0] cfg_confirm;
 
   register_bank registers(
@@ -137,9 +139,11 @@ module adaptive_sweep (
     .pair_min_o(cfg_pair_min),
     .pair_max_o(cfg_pair_max),
     .threshold_o(threshold),
+    .block_tol_o(block_tol),
     .search_mode_o(search_mode),
     .estop_hold_o(estop_hold),
     .estop_en_o(estop_en),
+    .block_en_o(block_en),
     .confirm_o(cfg_confirm),
     .step_lut_write_o(step_lut_write),
     .step_lut_addr_o(step_lut_addr),
@@ -370,6 +374,8 @@ module adaptive_sweep (
     .estop_en_i        (estop_en),
     .estop_hold_i      (estop_hold),
     .threshold_i       (threshold),
+    .block_en_i        (block_en),
+    .block_tol_i       (block_tol),
     .confirm_i         (cfg_confirm),
     .warmup_done_o     (ac_warmup_done),
     .early_stop_o      (ac_early_stop),

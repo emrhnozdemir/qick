@@ -48,6 +48,13 @@ module tb_adaptive_sweep;
   wire s_axi_arready;
 
   integer errors;
+  integer block_irq_count = 0;
+  integer block_irq_before;
+
+  always @(posedge clk) begin
+    if (!rst_n) block_irq_count <= 0;
+    else if (interrupt_o) block_irq_count <= block_irq_count + 1;
+  end
 
   initial begin
     clk = 1'b0;
@@ -249,6 +256,23 @@ module tb_adaptive_sweep;
     end
   endtask
 
+  task automatic feed_block_step;
+    integer n;
+    integer ii, qq;
+    begin
+      wait_arm;
+      for (n = 0; n < 64; n = n + 1) begin
+        ii = (n < 4) ? 1000 : 100000;
+        qq = (n < 4) ? -500 : -50000;
+        @(posedge clk);
+        s_axis_tvalid <= 1;
+        s_axis_tdata <= {qq[31:0], ii[31:0]};
+      end
+      @(posedge clk);
+      s_axis_tvalid <= 0;
+    end
+  endtask
+
   integer grid_valid_cnt;
   integer search_valid_cnt;
 
@@ -309,6 +333,99 @@ module tb_adaptive_sweep;
         errors = errors + 1;
       end else begin
         g = g;
+      end
+    end
+  endtask
+
+  task automatic run_probes_mixed(input integer reverse);
+    integer g;
+    integer k;
+    integer ii;
+    begin
+      g = 0;
+      k = 0;
+      while (!qtag_rdy_o && (g < 400)) begin
+        qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
+        if (!qtag_rdy_o && qtag_dt2_o[0]) begin
+          case (k)
+            0: ii = reverse ? 30 : 0;
+            1: ii = reverse ? 0 : 30;
+            2: ii = reverse ? 0 : 10;
+            3: ii = reverse ? 10 : 0;
+            default: ii = 0;
+          endcase
+          feed_point(2, ii, 0);
+          k = k + 1;
+        end
+        g = g + 1;
+      end
+      check32("mixed race served exactly two pairs", k, 32'd4);
+      if (g >= 400) begin
+        $display("FAIL: timed out serving mixed-sign race");
+        errors = errors + 1;
+      end
+    end
+  endtask
+
+  task automatic run_boundary_probes(input integer dip_mode);
+    integer g;
+    integer k;
+    integer distance_from_upper;
+    integer ii;
+    reg [31:0] upper;
+    begin
+      upper = START_FREQ + 4 * STEP;
+      g = 0;
+      k = 0;
+      while (!qtag_rdy_o && (g < 400)) begin
+        qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
+        if (!qtag_rdy_o && qtag_dt2_o[0]) begin
+          check32($sformatf("boundary probe %0d frequency", k), qtag_dt1_o,
+                  (k == 0) ? (upper - STEP) : upper);
+          distance_from_upper = (upper - qtag_dt1_o) / STEP;
+          ii = dip_mode ? (100 - distance_from_upper) : (10 * distance_from_upper);
+          feed_point(2, ii, 0);
+          k = k + 1;
+        end
+        g = g + 1;
+      end
+      check32("boundary run served exactly one pair", k, 32'd2);
+      if (g >= 400) begin
+        $display("FAIL: timed out serving upper-bound probes");
+        errors = errors + 1;
+      end
+    end
+  endtask
+
+  task automatic run_range_probes(input string name,
+      input [31:0] lo, input [31:0] hi,
+      input [31:0] expected_a, input [31:0] expected_b,
+      input integer amplitude_a, input integer amplitude_b,
+      input [31:0] expected_x);
+    integer g;
+    integer k;
+    begin
+      g = 0;
+      k = 0;
+      while (!qtag_rdy_o && (g < 400)) begin
+        qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
+        if (!qtag_rdy_o && qtag_dt2_o[0]) begin
+          check32($sformatf("%s probe %0d", name, k), qtag_dt1_o,
+                  (k == 0) ? expected_a : expected_b);
+          check32($sformatf("%s probe %0d stays in range", name, k),
+                  {31'd0, (qtag_dt1_o >= lo) && (qtag_dt1_o <= hi)}, 32'd1);
+          feed_point(2, (k == 0) ? amplitude_a : amplitude_b, 0);
+          k = k + 1;
+        end
+        g = g + 1;
+      end
+      check32($sformatf("%s exactly one pair", name), k, 32'd2);
+      check32($sformatf("%s result", name), qtag_dt1_o, expected_x);
+      check32($sformatf("%s result stays in range", name),
+              {31'd0, (qtag_dt1_o >= lo) && (qtag_dt1_o <= hi)}, 32'd1);
+      if (g >= 400) begin
+        $display("FAIL %s: timed out serving bounded probes", name);
+        errors = errors + 1;
       end
     end
   endtask
@@ -375,6 +492,8 @@ module tb_adaptive_sweep;
     s_axi_aresetn = 1'b1;
     repeat (20) @(posedge clk);
 
+    check32("BC0 block tolerance reset", dut.block_tol, 0);
+    check32("BC0 block guard reset disabled", {31'd0, dut.block_en}, 0);
 
     qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
     qp2_op(5'd0, START_FREQ, STEP, N_POINTS, AVG_T0_SH);
@@ -594,6 +713,26 @@ module tb_adaptive_sweep;
     check32("TR1 racing gd done word (capped, iter 3)", qtag_dt2_o, 32'h0003_0002);
     check32("TR1 racing gd served 6 probes", search_valid_cnt - search_before, 32'd6);
 
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd9, 32'd0, 32'hFFFF_FFFF, 32'd2, 32'd2);
+    qp2_op(5'd5, START_FREQ, 32'h0000_0010, 32'd0, 32'd1);
+    run_probes_mixed(0);
+    check32("TR2 racing follows positive accumulated sign", qtag_dt1_o, START_FREQ + STEP);
+    check32("TR2 one iteration capped", qtag_dt2_o, 32'h0001_0002);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd5, START_FREQ, 32'h0000_0010, 32'd0, 32'd1);
+    run_probes_mixed(1);
+    check32("TR3 racing follows negative accumulated sign", qtag_dt1_o, START_FREQ - STEP);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd2, NSAMP, CTRL_SHIFT | 32'd1, 32'd0, 32'd0);
+    qp2_op(5'd6, START_FREQ, 32'h0000_0010, 32'd0, 32'd1);
+    run_probes_mixed(0);
+    check32("TR4 KW dip follows accumulated sign", qtag_dt1_o, START_FREQ - STEP);
+    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(5'd9, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd2);
+
     // TR0  lambda 0 IS DEGENERATE. Same response, lambda 0: |sum(dp)| can
     //      never exceed sum(|dp|), so no pair count certifies; every
     //      iteration exhausts m_max = 2 and ties, and x never leaves x0.
@@ -713,10 +852,124 @@ module tb_adaptive_sweep;
     check32("TL1 grid path stayed idle", grid_valid_cnt - grid_before, 32'd0);
     check32("TL1 search path saw every probe", search_valid_cnt - search_before, 32'd10);
 
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(5'd0, START_FREQ, STEP, 32'd0, 32'd1);
+    qp2_op(5'd9, START_FREQ, START_FREQ + 4 * STEP, 32'd1, 32'd1);
+    qp2_op(5'd5, START_FREQ + 4 * STEP, 32'h0001_0010, 32'd0, 32'd1);
+    run_boundary_probes(0);
+    check32("TB1 GD peak moves inward from upper bound", qtag_dt1_o, START_FREQ + 3 * STEP);
+    check32("TB1 GD avoids false tie convergence", qtag_dt2_o, 32'h0001_0002);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd2, NSAMP, CTRL_SHIFT | 32'd1, 32'd0, 32'd0);
+    qp2_op(5'd5, START_FREQ + 4 * STEP, 32'h0001_0010, 32'd0, 32'd1);
+    run_boundary_probes(1);
+    check32("TB2 GD dip moves inward from upper bound", qtag_dt1_o, START_FREQ + 3 * STEP);
+    check32("TB2 GD dip avoids false tie convergence", qtag_dt2_o, 32'h0001_0002);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(5'd5, START_FREQ + 4 * STEP, 32'h0001_0011, 32'd0, 32'd1);
+    run_boundary_probes(0);
+    check32("TB3 scheduled GD moves by LUT step at upper bound", qtag_dt1_o, START_FREQ + 4 * STEP - 32'd64);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd6, START_FREQ + 4 * STEP, 32'h0001_0010, 32'd0, 32'd1);
+    run_boundary_probes(0);
+    check32("TB4 KW upper-bound behavior unchanged", qtag_dt1_o, START_FREQ + 3 * STEP);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd0, 32'd100, 32'd5, 32'd0, 32'd1);
+    qp2_op(5'd9, 32'd100, 32'd120, 32'd1, 32'd1);
+    qp2_op(5'd5, 32'd80, 32'h0001_0010, 32'd0, 32'd1);
+    run_range_probes("BR1 GD below-range seed", 100, 120, 100, 105, 100, 100, 100);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd6, 32'd140, 32'h0001_0010, 32'd0, 32'd1);
+    run_range_probes("BR2 KW above-range seed", 100, 120, 115, 120, 100, 100, 120);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd0, 32'h8000_0000, 32'd16, 32'd0, 32'd1);
+    qp2_op(5'd9, 32'h8000_0000, 32'h8000_0020, 32'd1, 32'd1);
+    qp2_op(5'd5, 32'hffff_ffff, 32'h0001_0010, 32'd0, 32'd1);
+    run_range_probes("BR3 GD unsigned upper seed", 32'h8000_0000, 32'h8000_0020,
+                     32'h8000_0010, 32'h8000_0020, 100, 100, 32'h8000_0020);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd0, 32'h8000_0000, 32'hffff_ffff, 32'd0, 32'd1);
+    qp2_op(5'd6, 32'h7fff_fff0, 32'h0001_0010, 32'd0, 32'd1);
+    run_range_probes("BR4 KW unsigned lower seed", 32'h8000_0000, 32'h8000_0020,
+                     32'h8000_0000, 32'h8000_0020, 100, 100, 32'h8000_0000);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd9, 32'hffff_fff0, 32'hffff_ffff, 32'd1, 32'd1);
+    qp2_op(5'd5, 32'hffff_fff8, 32'h0000_0010, 32'd0, 32'd1);
+    run_range_probes("BR5 positive step cannot wrap", 32'hffff_fff0, 32'hffff_ffff,
+                     32'hffff_fff8, 32'hffff_ffff, 100, 200, 32'hffff_ffff);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd9, 32'd0, 32'd32, 32'd1, 32'd1);
+    qp2_op(5'd6, 32'd16, 32'h0000_0010, 32'd0, 32'd1);
+    run_range_probes("BR6 negative step cannot wrap", 0, 32, 0, 32, 200, 100, 0);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    axi_tbl_write(5'd0, 7'd0, 32'hffff_ffff, 7'd1);
+    axi_tbl_write(5'd1, 7'd0, 32'hffff_ffff, 7'd1);
+    qp2_op(5'd9, 32'h8000_0000, 32'h8000_0020, 32'd1, 32'd1);
+    qp2_op(5'd6, 32'h8000_0010, 32'h0000_0011, 32'd0, 32'd1);
+    run_range_probes("BR7 scheduled LUT step clamps", 32'h8000_0000, 32'h8000_0020,
+                     32'h8000_0000, 32'h8000_0020, 100, 200, 32'h8000_0020);
+
+    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(5'd9, 32'h9000_0000, 32'h9000_0000, 32'd1, 32'd1);
+    qp2_op(5'd6, 32'hffff_ffff, 32'h0001_0010, 32'd0, 32'd1);
+    run_range_probes("BR8 singleton range retains bound", 32'h9000_0000, 32'h9000_0000,
+                     32'h9000_0000, 32'h9000_0000, 100, 100, 32'h9000_0000);
+
+    status_t0 = {16'd0, dut.threshold};
+    axi_tbl_write(5'd4, 0, 32'hffff_ffff, 0);
+    check32("BC1 AXI target4 retains unsigned32 tolerance", dut.block_tol, 32'hffff_ffff);
+    check32("BC1 target4 leaves relative threshold unchanged", {16'd0, dut.threshold}, status_t0);
+    axi_tbl_write(5'd4, 0, 0, 0);
+    qp2_op(5'd2, NSAMP, 32'h0002_00c6, 0, 4);
+    check32("BC1 CTRL bit7 enables block guard", {31'd0, dut.block_en}, 1);
+    qp2_op(5'd14, 0, 0, 0, 0);
+    qp2_op(5'd0, START_FREQ, STEP, 1, 6);
+    block_irq_before = block_irq_count;
+    qp2_op(5'd1, 0, 0, 0, 0);
+    feed_point(64, 1000, -500);
+    wait_finish;
+    check32("BC1 stable block stops at8", dut.ac_n_used, 8);
+    check32("BC1 emits one actual accelerator interrupt", block_irq_count - block_irq_before, 1);
+    check32("BC1 retains stable signed mean Q", dut.ac_mean_q, -500);
+
+    qp2_op(5'd2, NSAMP, 32'h0002_00c6, 0, 4);
+    qp2_op(5'd14, 0, 0, 0, 0);
+    qp2_op(5'd0, START_FREQ, STEP, 1, 6);
+    block_irq_before = block_irq_count;
+    qp2_op(5'd1, 0, 0, 0, 0);
+    feed_block_step;
+    wait_finish;
+    check32("BC2 step drift runs tocap", dut.ac_n_used, 64);
+    check32("BC2 rejected block emits no interrupt", block_irq_count - block_irq_before, 0);
+    check32("BC2 cap mean I", dut.ac_mean_i, 93812);
+
+    qp2_op(5'd2, NSAMP, 32'h0002_0046, 0, 4);
+    qp2_op(5'd14, 0, 0, 0, 0);
+    qp2_op(5'd0, START_FREQ, STEP, 1, 6);
+    block_irq_before = block_irq_count;
+    qp2_op(5'd1, 0, 0, 0, 0);
+    feed_block_step;
+    wait_finish;
+    check32("BC3 clearing bit7 restores checkpoint4", dut.ac_n_used, 4);
+    check32("BC3 legacy emits one interrupt", block_irq_count - block_irq_before, 1);
+    check32("BC3 legacy retains first-four mean", dut.ac_mean_i, 1000);
+
     if (errors == 0)
       $display("ALL TESTS PASSED");
     else
-      $display("%0d FAILURE(S)", errors);
+      $fatal(1, "%0d FAILURE(S)", errors);
 
     $finish;
   end

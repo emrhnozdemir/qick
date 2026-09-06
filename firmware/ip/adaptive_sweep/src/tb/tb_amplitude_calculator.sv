@@ -21,6 +21,8 @@ module tb_amplitude_calculator;
   reg estop_en_i;
   reg estop_hold_i;
   reg [15:0] threshold_i;
+  reg block_en_i = 0;
+  reg [31:0] block_tol_i = 0;
   reg [2:0] confirm_i;
 
   wire warmup_done_o;
@@ -49,6 +51,8 @@ module tb_amplitude_calculator;
     .estop_en_i       (estop_en_i),
     .estop_hold_i     (estop_hold_i),
     .threshold_i      (threshold_i),
+    .block_en_i       (block_en_i),
+    .block_tol_i      (block_tol_i),
     .confirm_i        (confirm_i),
     .warmup_done_o    (warmup_done_o),
     .early_stop_o     (early_stop_o),
@@ -166,6 +170,36 @@ module tb_amplitude_calculator;
     begin
       for (k = 0; k < n; k = k + 1)
         feed(ii, qq, gap);
+    end
+  endtask
+
+  task automatic feed_overlapping_checkpoints;
+    integer k;
+    integer ii;
+    integer qq;
+    begin
+      for (k = 0; k < 64; k = k + 1) begin
+        ii = (k < 4) ? 1000 : 100000;
+        qq = (k < 4) ? -500 : -50000;
+        @(posedge clk);
+        s_axis_tvalid <= 1'b1;
+        s_axis_tdata <= {qq[31:0], ii[31:0]};
+      end
+      @(posedge clk);
+      s_axis_tvalid <= 1'b0;
+    end
+  endtask
+
+  task automatic feed_continuous(input integer n, input integer ii, input integer qq);
+    integer k;
+    begin
+      for (k = 0; k < n; k = k + 1) begin
+        @(posedge clk);
+        s_axis_tvalid <= 1;
+        s_axis_tdata <= {qq[31:0], ii[31:0]};
+      end
+      @(posedge clk);
+      s_axis_tvalid <= 0;
     end
   endtask
 
@@ -350,20 +384,148 @@ module tb_amplitude_calculator;
     chk32("A9 avg_shift 8 passes through",
           {27'd0, dut.stop_check.counter.cap_exponent}, 32'd8);
 
+    cfg(6, 1, 0, 4, 1, 64);
+    do_arm;
+    feed_overlapping_checkpoints;
+    wait_power("A10");
+    chk32("A10 overlapping checkpoint mean I", mean_i_o, 32'sd1000);
+    chk32("A10 overlapping checkpoint mean Q", mean_q_o, -32'sd500);
+    chk32("A10 overlapping checkpoint n_used", n_used_o, 32'd4);
+    chk64("A10 overlapping checkpoint power", power_seen, 64'd1250000);
+
+    cfg(6, 1, 1, 4, 1, 64);
+    do_arm;
+    feed_overlapping_checkpoints;
+    wait_power("A11");
+    chk32("A11 overlapping checkpoint hold mean I", mean_i_o, 32'sd1000);
+    chk32("A11 overlapping checkpoint hold mean Q", mean_q_o, -32'sd500);
+    chk32("A11 overlapping checkpoint hold n_used", n_used_o, 32'd4);
+    chk32("A11 hold suppresses interrupt", {31'd0, early_pulse_seen}, 32'd0);
+    chk64("A11 overlapping checkpoint hold power", power_seen, 64'd1250000);
+
+    block_en_i = 1;
+    block_tol_i = 0;
+    cfg(6, 1, 0, 4, 1, 64);
+    do_arm;
+    feed_continuous(64, 1000, -500);
+    wait_power("A12");
+    chk32("A12 first complete block checkpoint", n_used_o, 8);
+    chk32("A12 signed stable mean I", mean_i_o, 1000);
+    chk32("A12 signed stable mean Q", mean_q_o, -500);
+    chk32("A12 early interrupt", {31'd0, early_pulse_seen}, 1);
+
+    cfg(6, 1, 0, 4, 1, 64);
+    do_arm;
+    feed_overlapping_checkpoints;
+    wait_power("A13");
+    chk32("A13 step drift reaches cap", n_used_o, 64);
+    chk32("A13 step drift is not converged", {31'd0, early_stop_o}, 0);
+    chk32("A13 block failure does not mark odd/even saturation", {31'd0, log_seen[9]}, 0);
+    chk32("A13 cap mean I", mean_i_o, 93812);
+    chk32("A13 cap mean Q floors negative average", mean_q_o, -46907);
+
+    block_tol_i = 30;
+    cfg(6, 1, 0, 4, 1, 64);
+    do_arm;
+    feed_n(4, 1000, -500, 3);
+    feed_n(60, 1010, -480, 3);
+    wait_power("A14");
+    chk32("A14 tolerance equality passes at8", n_used_o, 8);
+    chk32("A14 mean I", mean_i_o, 1005);
+    chk32("A14 mean Q", mean_q_o, -490);
+
+    block_tol_i = 29;
+    cfg(6, 1, 0, 4, 1, 64);
+    do_arm;
+    feed_n(4, 1000, -500, 3);
+    feed_n(60, 1010, -480, 3);
+    wait_power("A15");
+    chk32("A15 tolerance one lower rejects8 and passes16", n_used_o, 16);
+    chk32("A15 mean I", mean_i_o, 1007);
+    chk32("A15 mean Q", mean_q_o, -485);
+
+    block_tol_i = 0;
+    cfg(6, 1, 0, 4, 1, 64);
+    do_arm;
+    feed_continuous(64, 32'h8000_0000, 32'h8000_0000);
+    wait_power("A16");
+    chk32("A16 signed minimum stable block", n_used_o, 8);
+    chk64("A16 signed minimum power", power_seen, 64'h8000_0000_0000_0000);
+
+    cfg(6, 1, 0, 4, 2, 64);
+    do_arm;
+    feed_continuous(64, 0, 0);
+    wait_power("A17");
+    chk32("A17 confirmation needs complete checkpoints8 and16", n_used_o, 16);
+    chk64("A17 exactly zero remains stable", power_seen, 0);
+
+    block_tol_i = 32'hffff_ffff;
+    cfg(6, 1, 0, 4, 1, 64);
+    do_arm;
+    chk32("A18 arm invalidates both snapshot epochs", {30'd0, dut.stop_check.magnitude.snapshot_valid}, 0);
+    feed_n(4, 1234, -4321, 3);
+    repeat (12) @(posedge clk);
+    chk32("A18 no retirement without midpoint baseline", {31'd0, power_hit}, 0);
+    feed_n(4, 1234, -4321, 3);
+    wait_power("A18");
+    chk32("A18 fresh baseline permits8", n_used_o, 8);
+
+    block_tol_i = 0;
+    cfg(6, 1, 1, 4, 1, 64);
+    do_arm;
+    feed_continuous(8, 1000, -500);
+    feed_continuous(56, 100000, -50000);
+    wait_power("A19");
+    chk32("A19 hold keeps accepted8 snapshot through cap", n_used_o, 8);
+    chk32("A19 hold mean I", mean_i_o, 1000);
+    chk32("A19 hold mean Q", mean_q_o, -500);
+    chk32("A19 hold suppresses interrupt", {31'd0, early_pulse_seen}, 0);
+
+    cfg(3, 1, 0, 4, 1, 64);
+    do_arm;
+    feed_n(8, 1000, 0, 3);
+    wait_power("A20");
+    chk32("A20 cap8 has no earlier complete block test", {31'd0, early_stop_o}, 0);
+    chk32("A20 cap8 shot count", n_used_o, 8);
+
+    cfg(5, 0, 0, 4, 1, 64);
+    do_arm;
+    feed_continuous(32, 1000, -500);
+    wait_power("A21");
+    chk32("A21 disabled early stopping ignores block guard", n_used_o, 32);
+    chk32("A21 disabled early stopping emits no interrupt", {31'd0, early_pulse_seen}, 0);
+
+    block_tol_i = 32'hffff_ffff;
+    cfg(6, 1, 0, 4, 1, 64);
+    do_arm;
+    feed_n(4, 32'h8000_0000, 0, 3);
+    feed_n(60, 32'h7fff_ffff, 0, 3);
+    wait_power("A22");
+    chk32("A22 full-width tolerance accepts one-channel rail difference", n_used_o, 8);
+    chk32("A22 symmetric rails preserve negative rounding", mean_i_o, -1);
+
+    cfg(6, 1, 0, 4, 1, 64);
+    do_arm;
+    feed_n(4, 32'h8000_0000, 32'h8000_0000, 3);
+    feed_n(60, 32'h7fff_ffff, 32'h7fff_ffff, 3);
+    wait_power("A23");
+    chk32("A23 two-channel L1 rejects8 and accepts16", n_used_o, 16);
+    chk32("A23 rail mean I", mean_i_o, 32'h3fff_ffff);
+    chk32("A23 rail mean Q", mean_q_o, 32'h3fff_ffff);
+
     repeat (20) @(posedge clk);
 
     if (errors == 0)
       $display("ALL TESTS PASSED");
     else
-      $display("%0d FAILURE(S)", errors);
+      $fatal(1, "%0d FAILURE(S)", errors);
 
     $finish;
   end
 
   initial begin
     #2000000;
-    $display("FAIL: global timeout");
-    $finish;
+    $fatal(1, "FAIL: global timeout");
   end
 
 endmodule

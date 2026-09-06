@@ -67,6 +67,15 @@ module gradient_engine (
   (* MARK_DEBUG = "TRUE" *) reg [63:0] power_a;
   (* MARK_DEBUG = "TRUE" *) reg [63:0] power_b;
 
+  wire [31:0] initial_x;
+  range_clip #(.W(32)) seed_clamp(
+    .a_i(x0_i),
+    .lo_i(f_lo_i),
+    .hi_i(f_hi_i),
+    .is_signed_i(1'b0),
+    .y_o(initial_x)
+  );
+
   assign x_o = x;
 
   wire [15:0] iteration;
@@ -142,7 +151,7 @@ module gradient_engine (
     .x_minus_o(probe_low)
   );
 
-  wire [31:0] probe_first = two_sided ? probe_low : x;
+  wire [31:0] probe_first = (two_sided | (probe_high == x)) ? probe_low : x;
   wire [31:0] probe_second = probe_high;
 
   wire signed [64:0] power_delta;
@@ -234,10 +243,12 @@ module gradient_engine (
   wire race_exhausted = (pair_count >= pair_max);
 
   wire signed [33:0] step_delta;
+  wire step_positive = scheduled ? held_positive : (~signed_sum[72] & (signed_sum != 0));
+  wire step_negative = scheduled ? held_negative : signed_sum[72];
 
   signed_step #(.W(34)) stepper(
-    .pos_i(held_positive),
-    .neg_i(held_negative),
+    .pos_i(step_positive),
+    .neg_i(step_negative),
     .step_i({2'b00, step_size}),
     .delta_o(step_delta)
   );
@@ -370,7 +381,7 @@ module gradient_engine (
     if (!rst_n)
       x <= 0;
     else if ((state == S_IDLE) & start_i)
-      x <= x0_i;
+      x <= initial_x;
     else if (state == S_STEP)
       x <= next_x[31:0];
   end

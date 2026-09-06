@@ -16,6 +16,7 @@ module qproc_dispatcher # (
    input  wire          core_en        ,
    input  wire          core_rst       ,
    input  wire          trig_flush_i   , // discard queued triggers (interrupt abort)
+   input  wire [OUT_TRIG_QTY-1:0] trig_flush_mask_i,
    input  wire          time_en        ,
    input  wire          time_rst       ,
    input  wire  [47:0]  c_time_ref_dt  ,
@@ -42,6 +43,37 @@ module qproc_dispatcher # (
 
 
 // FIFOS & DISPATCHER
+
+reg c_trig_flush_toggle;
+reg [OUT_TRIG_QTY-1:0] c_trig_flush_mask;
+always_ff @(posedge c_clk_i, negedge c_rst_ni) begin
+   if (!c_rst_ni) begin
+      c_trig_flush_toggle <= 1'b0;
+      c_trig_flush_mask <= '0;
+   end else if (trig_flush_i) begin
+      c_trig_flush_toggle <= ~c_trig_flush_toggle;
+      c_trig_flush_mask <= trig_flush_mask_i;
+   end
+end
+
+(* ASYNC_REG = "TRUE" *) reg [2:0] t_trig_flush_sync;
+(* ASYNC_REG = "TRUE" *) reg [OUT_TRIG_QTY-1:0] t_trig_mask_cdc, t_trig_mask_sync;
+reg t_trig_flush_seen;
+always_ff @(posedge t_clk_i, negedge t_rst_ni) begin
+   if (!t_rst_ni) begin
+      t_trig_flush_sync <= 3'b000;
+      t_trig_mask_cdc <= '0;
+      t_trig_mask_sync <= '0;
+      t_trig_flush_seen <= 1'b0;
+   end else begin
+      t_trig_flush_sync <= {t_trig_flush_sync[1:0], c_trig_flush_toggle};
+      t_trig_mask_cdc <= c_trig_flush_mask;
+      t_trig_mask_sync <= t_trig_mask_cdc;
+      t_trig_flush_seen <= t_trig_flush_sync[2];
+   end
+end
+wire [OUT_TRIG_QTY-1:0] t_trig_flush =
+   {OUT_TRIG_QTY{t_trig_flush_sync[2] ^ t_trig_flush_seen}} & t_trig_mask_sync;
  
 // .p_type > Select between WAVE or DATA (TRIG is DATA with high address)
 // .p_addr > Select Port Addr (Bit 3 select between DATA and TRIGGER (Addr 0 to 7 are Data, Addr 8 to 15 are Trigger)
@@ -77,6 +109,19 @@ reg                        trig_pop_r[OUT_TRIG_QTY], trig_pop_r2[OUT_TRIG_QTY];
 (* ASYNC_REG = "TRUE" *) reg [OUT_TRIG_QTY-1:0] c_fifo_trig_empty ;
 wire [OUT_TRIG_QTY-1:0]    t_fifo_trig_empty, c_fifo_trig_full ;
 reg  [OUT_TRIG_QTY-1:0]    t_fifo_trig_empty_r;
+reg [OUT_TRIG_QTY-1:0] t_trig_flush_active;
+wire [OUT_TRIG_QTY-1:0] t_trig_abort = t_trig_flush | t_trig_flush_active;
+integer ind_trig_flush;
+always_ff @(posedge t_clk_i, negedge t_rst_ni) begin
+   if (!t_rst_ni)
+      t_trig_flush_active <= '0;
+   else
+      for (ind_trig_flush=0; ind_trig_flush < OUT_TRIG_QTY; ind_trig_flush=ind_trig_flush+1)
+         if (t_trig_flush[ind_trig_flush])
+            t_trig_flush_active[ind_trig_flush] <= 1'b1;
+         else if (t_fifo_trig_empty[ind_trig_flush])
+            t_trig_flush_active[ind_trig_flush] <= 1'b0;
+end
 
 (* ASYNC_REG = "TRUE" *) reg [OUT_DPORT_QTY-1:0] fifo_data_empty_cdc;
 (* ASYNC_REG = "TRUE" *) reg [OUT_DPORT_QTY-1:0] c_fifo_data_empty ;
@@ -172,6 +217,7 @@ always_ff @ (posedge c_clk_i, negedge c_rst_ni) begin
 end
 
 
+integer ind_trig_pipe;
 always_ff @ (posedge t_clk_i, negedge t_rst_ni) begin
    if (!t_rst_ni) begin
       time_abs_r           <= '{default:'0} ;
@@ -186,8 +232,10 @@ always_ff @ (posedge t_clk_i, negedge t_rst_ni) begin
       t_fifo_wave_empty_r  <= '{default:'0} ;
    end else begin
       time_abs_r           <= time_abs_i;
-      trig_pop_r           <= trig_pop;
-      trig_pop_r2          <= trig_pop_r;
+      for (ind_trig_pipe=0; ind_trig_pipe < OUT_TRIG_QTY; ind_trig_pipe=ind_trig_pipe+1) begin
+         trig_pop_r[ind_trig_pipe] <= t_trig_abort[ind_trig_pipe] ? 1'b0 : trig_pop[ind_trig_pipe];
+         trig_pop_r2[ind_trig_pipe] <= t_trig_abort[ind_trig_pipe] ? 1'b0 : trig_pop_r[ind_trig_pipe];
+      end
       data_pop_r           <= data_pop;
       data_pop_r2          <= data_pop_r;
       wave_pop_r           <= wave_pop;
@@ -215,7 +263,7 @@ generate
          .wr_en_i    ( 1'b1     ) ,
          .push_i     ( c_fifo_trig_push_s[ind_tfifo] ) ,
          .data_i     ( {c_fifo_data_in_r[0],c_fifo_time_in_r}  ) ,
-         .flush_i    ( core_rst | trig_flush_i     ),
+         .flush_i    ( core_rst | (trig_flush_i & trig_flush_mask_i[ind_tfifo]) ),
          .rd_clk_i   ( t_clk_i      ) ,
          .rd_rst_ni  ( t_rst_ni     ) ,
          .rd_en_i    ( time_en_r    ) ,
@@ -232,7 +280,7 @@ generate
       always_comb begin : TRIG_DISPATCHER
          trig_pop[ind_tfifo] = 0;
          trig_pop_prev[ind_tfifo] = |({trig_pop_r[ind_tfifo], trig_pop_r2[ind_tfifo]});
-         if (time_en_r & ~t_fifo_trig_empty_r[ind_tfifo] )
+         if (time_en_r & ~t_fifo_trig_empty_r[ind_tfifo] & ~t_trig_abort[ind_tfifo])
             if ( trig_t_gr_r[ind_tfifo] & ~trig_pop_prev[ind_tfifo] ) 
                trig_pop      [ind_tfifo] = 1'b1 ;
       end //ALWAYS
@@ -334,7 +382,7 @@ always_ff @ (posedge t_clk_i, negedge t_rst_ni) begin
    for (ind_tport=0; ind_tport < OUT_TRIG_QTY; ind_tport=ind_tport+1) begin: OUT_TRIG_PORT
       if (!t_rst_ni) 
          port_trig_r[ind_tport]   <= 1'b0;
-      else if (time_rst_r) 
+      else if (time_rst_r | t_trig_abort[ind_tport])
          port_trig_r[ind_tport]   <= 1'b0;
       else 
          if (trig_pop[ind_tport]) 

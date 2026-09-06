@@ -3,6 +3,7 @@ Drivers for qick_processor Peripherals.
 2024-5-22
 """
 from pynq.buffer import allocate
+from numbers import Integral
 import numpy as np
 from qick.ip import SocIP
 
@@ -935,7 +936,7 @@ class Adaptive_Sweep(SocIP):
 
     ``REG0 = {[31] toggle, [30:24] len, [23:21] count-1, [20:16] target,
     [15:8] addr, [7:0] reserved}``, with target 0 = a-LUT, 1 = c-LUT,
-    2 = early-stop threshold, 3 = CTRL.
+    2 = early-stop threshold, 3 = CTRL, 4 = absolute block tolerance.
 
     Payload registers are written first, then REG0 twice: once with the
     control fields and the toggle UNCHANGED, once with REG0[31] FLIPPED.  The
@@ -1025,11 +1026,26 @@ class Adaptive_Sweep(SocIP):
         self.set_estop_d(d)
         return 1.0 / d
 
+    def set_block_tol(self, value):
+        """Set the unsigned absolute L1 tolerance of consecutive I/Q means.
+
+        Units are integrated I/Q words per shot, before host normalization.
+        Zero requires exact agreement; enable is separately controlled by
+        CTRL bit 7. At N shots the hardware compares the block-sum difference
+        against ``(N/2) * value`` using a shift.
+        """
+        if (not isinstance(value, Integral) or isinstance(value, (bool, np.bool_))
+                or not 0 <= value <= 0xFFFFFFFF):
+            raise ValueError("block_tol must be an integer in [0, 4294967295]")
+        self.tbl_d0 = int(value)
+        self._tbl_commit(4)
+
     def set_ctrl(self, word):
         """Write the CTRL register directly (target 3).
 
         CTRL drives ``search_mode`` (bit 0, 0 peak / 1 dip), ``estop_hold``
-        (bit 4), ``estop_en`` (bit 6) and ``confirm`` (bits 19:17).  The
+        (bit 4), ``estop_en`` (bit 6), ``block_en`` (bit 7), and ``confirm``
+        (bits 19:17). The
         generated program sets it at init over QP2 OP2; writing it here
         afterwards retargets a LOADED program, so those four can be swept
         without a rebuild, exactly as the threshold can.
@@ -1038,9 +1054,12 @@ class Adaptive_Sweep(SocIP):
         self._tbl_commit(3)
 
     def load_tables(self, plan):
-        """Load everything a SweepPlan carries (threshold, a-LUT, c-LUT)."""
+        """Load the plan's thresholds, a-LUT, and c-LUT before execution."""
         if plan.estop_d:
             self.set_estop_d(plan.estop_d)
+
+
+            self.set_block_tol(getattr(plan, 'block_tol', None) or 0)
         if plan.a_words:
             self.load_alut(plan.a_words)
         if plan.c_words:

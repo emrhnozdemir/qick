@@ -151,9 +151,18 @@ wire           int_take; // redirect taken -> discard queued triggers
 // a loop: flush_i -> async_full_o (_qproc_ips.sv) -> some_fifo_full -> core_en ->
 // fetch_en -> int_take. The flush only needs one cycle; clr_fifo_req latches it.
 reg            int_take_r;
+reg [31:0]     interrupt_trig_mask;
 always_ff @(posedge c_clk_i, negedge c_rst_ni) begin
-   if (!c_rst_ni) int_take_r <= 1'b0;
-   else           int_take_r <= int_take;
+   if (!c_rst_ni) begin
+      int_take_r <= 1'b0;
+      interrupt_trig_mask <= 32'd0;
+   end else begin
+      int_take_r <= int_take;
+      if (core_rst)
+         interrupt_trig_mask <= 32'd0;
+      else if (ext_p2_pen && (core_usr_operation == 5'd15))
+         interrupt_trig_mask <= core_usr_a_dt;
+   end
 end
 reg            t_core_rst_prev_net; // NET Request to RESET the Processor and go to previous state
 
@@ -735,6 +744,7 @@ qproc_dispatcher # (
    .core_en        ( core_en       ) ,  
    .core_rst       ( core_rst      ) ,  
    .trig_flush_i   ( int_take_r    ) ,
+   .trig_flush_mask_i ( interrupt_trig_mask[OUT_TRIG_QTY-1:0] ) ,
    .time_en        ( time_en       ) ,  
    .time_rst       ( time_rst      ) ,   
    .c_time_ref_dt  ( c_time_ref_dt ) ,

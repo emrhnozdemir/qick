@@ -70,7 +70,6 @@ Temporary Items
 .*.swp
 
 !/.gitignore
-!/README.md
 
 # Claude Code
 .claude/
@@ -83,3 +82,4 @@ graphify-out/
 # Personal Files
 personal_files/
 *.md
+!/README.md

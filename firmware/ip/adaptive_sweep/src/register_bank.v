@@ -45,10 +45,12 @@ module register_bank(
   (* MARK_DEBUG = "TRUE" *) output reg [15:0] pair_min_o,
   (* MARK_DEBUG = "TRUE" *) output reg [15:0] pair_max_o,
   (* MARK_DEBUG = "TRUE" *) output reg [15:0] threshold_o,
+  (* MARK_DEBUG = "TRUE" *) output reg [31:0] block_tol_o,
 
   output search_mode_o,
   output estop_hold_o,
   output estop_en_o,
+  output block_en_o,
   output [2:0] confirm_o,
 
   output step_lut_write_o,
@@ -129,6 +131,7 @@ module register_bank(
   wire lut_commit = write_pulse & ((cfg_target == 5'd0) | (cfg_target == 5'd1));
   wire threshold_write = write_pulse & (cfg_target == 5'd2);
   wire ctrl_write = write_pulse & (cfg_target == 5'd3);
+  wire block_tol_write = write_pulse & (cfg_target == 5'd4);
 
   (* MARK_DEBUG = "TRUE" *) reg burst_active;
   (* MARK_DEBUG = "TRUE" *) reg [2:0] burst_cnt;
@@ -206,6 +209,13 @@ module register_bank(
   end
 
   always @(posedge clk) begin
+    if (!rst_n)
+      block_tol_o <= 32'd0;
+    else if (block_tol_write)
+      block_tol_o <= reg1;
+  end
+
+  always @(posedge clk) begin
     if (!rst_n) begin
       step_lut_len_o <= 7'd64;
       offset_lut_len_o <= 7'd64;
@@ -227,6 +237,7 @@ module register_bank(
   assign search_mode_o = ctrl[0];
   assign estop_hold_o = ctrl[4];
   assign estop_en_o = ctrl[6];
+  assign block_en_o = ctrl[7];
   assign confirm_o = ctrl[19:17];
 
   always @(posedge clk) begin

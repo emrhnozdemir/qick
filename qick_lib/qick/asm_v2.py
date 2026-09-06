@@ -376,6 +376,7 @@ _AS_OPS = {
                     Field("estop_hold", 1, 4),
                     Field("prescale_en", 1, 5),
                     Field("estop_en", 1, 6),
+                    Field("block_en", 1, 7),
                     Field("confirm", 3, 17)),
             "dt3": _word("n0"),
             "dt4": _word("n_min"),
@@ -386,7 +387,10 @@ _AS_OPS = {
             "side); estop_hold (0 immediate emit / 1 "
             "freeze-and-drain); prescale_en (IGNORED since 2026-08-24 - the "
             "raw 32-bit shot sum goes straight into the 58-bit "
-            "accumulators); estop_en (the split test is the only stopper; "
+            "accumulators); estop_en (enable early stopping); block_en "
+            "(also require consecutive-half I/Q agreement, with absolute "
+            "tolerance in AXI target 4; first complete test is at 8 shots); "
+            "the odd/even test uses a reciprocal threshold: "
             "its threshold is not in this word - it lives in the IP's AXI "
             "register, written by the Adaptive_Sweep driver); "
             "confirm (consecutive passing checkpoints required to stop; the "
@@ -496,6 +500,12 @@ _AS_OPS = {
             "after the quiet window that lets the last committed shot drain, it "
             "releases the park and arms the point the sweep had already moved "
             "on to. Fire-and-forget: no response, no ack",
+    ),
+    "CFG_INTERRUPT": QP2Op(
+        number=15, mnemonic="CFG_INTERRUPT",
+        args={"dt1": _word("trigger_mask")},
+        doc="configure the tProcessor's early-stop trigger cancellation mask; "
+            "decoded by the processor, with no separate log memory",
     ),
 }
 
@@ -771,13 +781,10 @@ ARITH_OPS = {
 
 #: Offsets inside the result block written to data memory.
 RESULT_FREQ = 0        #: best/final drive frequency word
-RESULT_DONE = 1        #: done sentinel, written last
+RESULT_START = 1       #: actual drive start word (also for winner-centered stages)
 RESULT_STATUS = 2      #: accelerator status word (only if it has a status read)
 RESULT_DIAG = 3        #: n_used, when debug=True
 RESULT_BLOCK = 4       #: words reserved per sweep
-
-#: Value written to the done word once the sweep has finished.
-DONE_SENTINEL = 0x600D
 
 #: Largest data-memory address a *literal* ``DMEM_WR [&N]`` can reach.  The
 #: address field is 11 bits, encoded signed (tprocv2_assembler.py:1320 calls
@@ -818,6 +825,53 @@ def ro_freq_word(prog, freq, ro_ch, gen_ch):
     return word
 
 
+def _sweep_frequency_lattice(prog, gen_ch, ro_ch):
+    """Return the common DDS quantum in MHz and the two integer word steps."""
+    gencfg = prog.soccfg['gens'][gen_ch]
+    rocfg = prog.soccfg['readouts'][ro_ch]
+    gquant = int(prog.soccfg.calc_fstep_int(gencfg, [rocfg]))
+    rquant = int(prog.soccfg.calc_fstep_int(rocfg, [gencfg]))
+    quantum = Fraction(float(gencfg['f_dds'])) * gquant / (1 << gencfg['b_dds'])
+    return quantum, gquant, -rquant if prog.FLIP_DOWNCONVERSION else rquant
+
+
+def _sweep_step_words(prog, step, gen_ch, ro_ch):
+    """Round a delta's magnitude down on the shared DDS lattice, without an origin."""
+    _require(np.isfinite(step), "sweep step must be finite")
+    quantum, gquant, rquant = _sweep_frequency_lattice(prog, gen_ch, ro_ch)
+    ticks = int(Fraction(float(step)) / quantum)
+    drive = ticks * gquant
+    _require(-(1 << 31) < drive < (1 << 31),
+             "sweep step must fit a signed 32-bit drive-word delta")
+    return drive, to_s32(ticks * rquant)
+
+
+def _sweep_inward_endpoint(prog, freq, gen_ch, ro_ch, direction):
+    """Return paired words and an unwrapped drive coordinate inside a bound.
+
+    ``direction=1`` rounds a lower bound up; ``-1`` rounds an upper bound
+    down; ``0`` rounds a seed to nearest. Exact rational comparisons prevent
+    nearest rounding from putting a bound outside the requested MHz interval.
+    """
+    _require(np.isfinite(freq), "sweep frequency bounds must be finite")
+    quantum, gquant, _ = _sweep_frequency_lattice(prog, gen_ch, ro_ch)
+    gencfg = prog.soccfg['gens'][gen_ch]
+    mixer = 0.0
+    if prog.ABSOLUTE_FREQS and gencfg['has_mixer']:
+        mixer = float(prog.gen_chs[gen_ch]['mixer_freq']['rounded'])
+    coordinate = (Fraction(float(freq)) - Fraction(mixer)) / quantum
+    ticks = (-((-coordinate.numerator) // coordinate.denominator)
+             if direction > 0 else coordinate.numerator // coordinate.denominator
+             if direction < 0 else round(coordinate))
+    unwrapped = ticks * gquant
+    actual = float(Fraction(mixer) + ticks * quantum)
+
+    gen_freq_word(prog, actual, gen_ch, ro_ch)
+    drive = to_s32(unwrapped % (1 << gencfg['b_dds']))
+    readout = to_s32(ro_freq_word(prog, actual, ro_ch, gen_ch))
+    return drive, readout, unwrapped
+
+
 #: The largest literal a TEST instruction encodes (24-bit signed); a loop
 #: bound past this is staged in a register instead.
 LOOP_IMM_MAX = (1 << 23) - 1
@@ -847,6 +901,7 @@ AXI_TABLE_TARGETS = OrderedDict([
     ("offset_lut", 1),      # gd/kw c_k probe-width schedule
     ("estop_threshold", 2), # the 16-bit reciprocal D
     ("ctrl", 3),            # the CTRL word, same bits CFG_ACQ dt2 carries
+    ("block_tol", 4),
 ])
 
 #: Named bits of the CTRL word.  CFG_ACQ dt2 IS this word (register_bank.v
@@ -856,6 +911,7 @@ CTRL_BITS = OrderedDict([
     ("search_mode", (1, 0)),   # (width, lsb) - 0 peak / 1 dip
     ("estop_hold", (1, 4)),    # 0 emit immediately / 1 freeze and drain
     ("estop_en", (1, 6)),      # arm the split early stop
+    ("block_en", (1, 7)),
     ("confirm", (3, 17)),      # consecutive passing checkpoints needed
 ])
 
@@ -890,7 +946,7 @@ def _accel_contract(accel):
 
 
 #: Bumped whenever the exported shape changes (not when a value changes).
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 3
 
 
 def qp2_contract():
@@ -946,13 +1002,22 @@ def qp2_contract():
                                   "GET_DIAG dt2 bits 7:3",
                 "cap": "1 << avg_shift shots, avg_shift clamped to 26",
             },
+            "block_stability": {
+                "register_bits": 32,
+                "reset_value": 0,
+                "enable": "CTRL bit 7, independent of tolerance value",
+                "test": "|SI_N-2*SI_half| + |SQ_N-2*SQ_half| <= (N/2)*block_tol",
+                "first_checkpoint": 8,
+                "units": "absolute L1 change in mean integrated I/Q words",
+                "confirmation": "odd/even and block tests must both pass before confirmation",
+            },
             "result_block": {
                 "words": RESULT_BLOCK,
                 "freq": RESULT_FREQ,
-                "done": RESULT_DONE,
+                "start": RESULT_START,
                 "status": RESULT_STATUS,
                 "diag": RESULT_DIAG,
-                "done_sentinel": DONE_SENTINEL,
+                "completion": "standard QICK external counter, not a DMEM sentinel",
                 "literal_dmem_max": LITERAL_DMEM_MAX,
             },
             "redirect": {
@@ -963,9 +1028,12 @@ def qp2_contract():
                           "again from the landing block to release the park",
                 "destination": "the tProcessor TPROC_IPC register "
                                "(qproc_axi_reg slv_reg9), loaded by the "
-                               "compiler with the landing block address",
+                               "compiler with the active-stage dispatcher address",
+                "trigger_mask_op": "CFG_INTERRUPT (opcode 15), dt1 is a "
+                                   "32-bit dedicated-trigger cancellation mask",
                 "armed_when": "TPROC_IPC != 0",
-                "clock": "both sides run on clk_core; there is no CDC",
+                "clock": "request and redirect use clk_core; selected output "
+                         "clear crosses into the dispatcher timing clock",
                 "doc": "personal_files/adaptive_sweep/docs/EARLY_STOP_REDIRECT.md",
             },
             "tproc_constants": {
@@ -1012,6 +1080,11 @@ class SweepPlan:
     gen_step: int = 0
     ro_start: int = 0
     ro_step: int = 0
+    gen_limit: int = 0
+    ro_limit: int = 0
+    gen_span: int = 0
+    gen_direction: int = 1
+    gen_start_unwrapped: Optional[int] = None
 
     avg: int = 1
     avg_shift: int = 0
@@ -1031,6 +1104,7 @@ class SweepPlan:
     estop_thr: float = 0.0
     estop_d: int = 0
     confirm: int = 0
+    block_tol: Optional[int] = None
     avg_requested: int = 0
     avg_rounded: int = 0
     dump_log: int = 0
@@ -1073,6 +1147,17 @@ class SweepPlan:
     interrupt: int = 0
     #: Set by the code generator: label of the landing block the IPC points at
     landing_label: Optional[str] = None
+    start_regs: Optional[Tuple[str, str]] = None
+
+    @property
+    def early_stop(self):
+        """Early retirement and processor interruption are enabled together."""
+        return bool(self.interrupt)
+
+    @property
+    def record_points(self):
+        """Whether the tProcessor writes point diagnostics to its own DMEM."""
+        return bool(self.dump_log)
 
     @property
     def handshake(self):
@@ -1089,28 +1174,34 @@ class SweepPlan:
     def freq_of_word(self, prog, word):
         """Convert a drive register word back to MHz.
 
-        The word is reduced modulo the generator's DDS width first, because
-        that is what the generator itself does with it, and the generator's
-        digital-mixer offset is added back, ``gen_freq_word`` subtracts it,
-        so leaving it out here would report a frequency low by the mixer
-        setting.
+        A DDS word names frequencies separated by a full DDS period. Resolve
+        that ambiguity using the requested band's inward start and sweep
+        direction, so a band crossing zero reports its negative frequencies
+        instead of their large positive aliases. Every accepted band is
+        shorter than one period. Refinement stages keep the original band
+        as their reference even when their actual start moves at runtime.
 
         Note that the accelerator walks its grid as ``start + k*step`` in
         register words, exactly as the tProcessor does, so the two never
-        disagree, but the resulting grid is uniform in *words*, not exactly
-        uniform in MHz. Over a 2 GHz, 4000-point sweep the far end sits a few
-        tens of kHz off the nominal frequency. This conversion reports where
-        the tone actually was, so the answer itself carries no such error.
+        disagree, but the realized step can differ slightly from the requested
+        MHz step. Decode that actual word spacing and restore the generator's
+        digital-mixer offset, which ``gen_freq_word`` subtracts.
         """
         gencfg = prog.soccfg["gens"][self.gen_ch]
-        b_dds = gencfg["b_dds"]
-        freq = float(prog.soccfg.reg2freq(to_u32(word) % (1 << b_dds),
-                                          gen_ch=self.gen_ch))
+        period = 1 << gencfg['b_dds']
+        if self.gen_start_unwrapped is None:
+
+
+            coordinate = to_u32(word) % period
+        else:
+            distance = (self.gen_direction * (to_u32(word) - to_u32(self.gen_start))) % period
+            coordinate = self.gen_start_unwrapped + self.gen_direction * distance
+        freq = float(prog.soccfg.reg2freq(coordinate, gen_ch=self.gen_ch))
         if prog.ABSOLUTE_FREQS and gencfg["has_mixer"]:
             freq += prog.gen_chs[self.gen_ch]["mixer_freq"]["rounded"]
         return freq
 
-    def index_of_word(self, word):
+    def index_of_word(self, word, start_word=None):
         """The grid index whose drive word is ``word``, or None.
 
         ``peak_finder`` walks ``start + k*step`` in 32-bit words, wrapping the
@@ -1124,7 +1215,7 @@ class SweepPlan:
         if self.handshake or self.n_points <= 0 or self.gen_step == 0:
             return None
         target = to_u32(word)
-        here = to_u32(self.gen_start)
+        here = to_u32(self.gen_start if start_word is None else start_word)
         step = to_u32(self.gen_step)
         for k in range(self.n_points):
             if here == target:
@@ -1241,13 +1332,14 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                avg=1, nsamp=None, mode=None, sweep_mode=None,
                trig_time=0.0, shot_period=None,
                n0=None, n_min=None, emit_mode=None,
-               estop_thr=None,
+               estop_thr=None, block_tol=None,
                x0=None, min_step=None, max_iter=None, patience=None,
                a_table=None, c_table=None,
                use_lut=None, lambda_=None, m_min=2, m_max=8,
                f_lo=None, f_hi=None,
                result_addr=0, debug=False, count_shots=False,
-               dump_log=None, log_addr=None, interrupt=False):
+               dump_log=None, log_addr=None, interrupt=None,
+               early_stop=None, confirm=None, record_points=None, points_addr=None):
     """Validate a sweep declaration and convert it to machine units.
 
     See :meth:`qick.asm_v2.QickProgramV2.adaptive_sweep` for the parameter
@@ -1280,6 +1372,33 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     if mode is None:
         mode = "peak"
 
+
+
+    if interrupt is not None:
+        warnings.warn("interrupt is deprecated; use early_stop", DeprecationWarning,
+                      stacklevel=3)
+        _require(early_stop is None or bool(early_stop) == bool(interrupt),
+                 "early_stop and interrupt disagree")
+        early_stop = bool(interrupt)
+    if early_stop is None:
+        early_stop = (calc == "split")
+    if early_stop:
+        _require(calc in (None, "split"), "early_stop=True requires calc='split'")
+        calc = "split"
+    else:
+        _require(calc != "split",
+                 "calc='split' enables early stopping; use early_stop=True, "
+                 "or calc='shift' for full-length averaging")
+    interrupt = bool(early_stop)
+    if record_points is not None:
+        _require(dump_log is None or bool(dump_log) == bool(record_points),
+                 "record_points and dump_log disagree")
+        dump_log = bool(record_points)
+    if points_addr is not None:
+        _require(log_addr is None or log_addr == points_addr,
+                 "points_addr and log_addr disagree")
+        log_addr = points_addr
+
     # --- capability checks -------------------------------------------------
     _require(algorithm in accel.algorithms,
              "accelerator '%s' does not implement algorithm=%r; it implements "
@@ -1287,6 +1406,19 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     if calc is None:
         calc = accel.calcs[0] if len(accel.calcs) == 1 else "shift"
     calc_fields = accel.calc_fields(calc)
+    if block_tol is not None:
+        _require(early_stop, "block_tol only applies with early_stop=True")
+        _require(isinstance(block_tol, Integral) and not isinstance(block_tol, (bool, np.bool_))
+                 and 0 <= block_tol <= 0xFFFFFFFF,
+                 "block_tol must be an integer in [0, 4294967295]")
+        _require('block_en' in accel.op('CFG_ACQ').field_names(),
+                 "this accelerator does not support block stability checks")
+        calc_fields['block_en'] = 1
+    if confirm is not None:
+        _require(early_stop, "confirm only applies with early_stop=True")
+        _require(isinstance(confirm, Integral) and 1 <= confirm <= 7,
+                 "confirm must be an integer in [1, 7]")
+        calc_fields['confirm'] = int(confirm)
     if algorithm in ("gd", "kw"):
         _require(calc in accel.gdkw_calcs,
                  "calc=%r cannot drive the GD/KW engine: its power can exceed "
@@ -1375,6 +1507,12 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                  "calc (one whose preset sets estop_en, i.e. 'split'): with "
                  "calc=%r every point runs to avg shots and there is nothing "
                  "to abort" % (calc,))
+        rocfg = prog.soccfg['readouts'][ro_ch]
+        _require(rocfg['trigger_type'] in ('trig', 'tport'),
+                 "early_stop currently requires a dedicated trigger port; "
+                 "shared digital-port triggers cannot be selectively cancelled")
+        _require(0 <= rocfg['trigger_port'] < 32,
+                 "early_stop trigger_port must fit the 32-bit cancellation mask")
 
     def gw(f):
         return to_s32(gen_freq_word(prog, f, gen_ch, ro_ch))
@@ -1384,19 +1522,41 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
 
     # --- grid geometry -----------------------------------------------------
     _require(start is not None, "start (MHz) is required")
+    _require(np.isfinite(start), "start must be finite")
+    stop_supplied = stop is not None
+    step_supplied = step is not None
+    count_supplied = n_points is not None
+    if stop_supplied:
+        _require(np.isfinite(stop), "stop must be finite")
+    if step_supplied:
+        _require(np.isfinite(step) and step != 0, "step must be finite and nonzero")
     if algorithm == "grid":
         _require(stop is not None or (step is not None and n_points is not None),
                  "give stop=, or both step= and n_points=")
-        if n_points is None:
-            _require(step is not None and step != 0,
-                     "step must be nonzero when n_points is not given")
-            n_points = int(round((stop - start) / step)) + 1
+        if count_supplied:
+            _require(isinstance(n_points, Integral) and n_points > 0,
+                     "n_points must be a positive integer")
+            n_points = int(n_points)
+        if not count_supplied:
+            _require(step is not None, "step is required when n_points is not given")
+            ratio = ((Fraction(str(float(stop))) - Fraction(str(float(start))))
+                     / Fraction(str(float(step))))
+            _require(ratio >= 0, "step must point from start toward stop")
+            n_points = ratio.numerator // ratio.denominator + 1
         elif step is None:
             _require(stop is not None, "give stop= or step=")
             _require(n_points > 1,
                      "n_points must be > 1 when the step is derived from "
                      "start/stop")
             step = (stop - start) / (n_points - 1)
+            _require(step != 0, "start and stop must differ for a multi-point grid")
+        elif stop_supplied:
+            distance = Fraction(str(float(stop))) - Fraction(str(float(start)))
+            delta = Fraction(str(float(step)))
+            _require(distance * delta >= 0,
+                     "step must point from start toward stop")
+            _require(abs(delta) * (n_points - 1) <= abs(distance),
+                     "n_points and step exceed the requested start/stop range")
         n_points = int(n_points)
         # the field is as wide as the RTL slice (register_bank.v keeps
         # dt3_i[15:0] on adaptive_sweep), and peak_finder runs a count of 0
@@ -1410,26 +1570,48 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         if stop is None:
             stop = start + step * (n_points - 1)
     else:
-        _require(step is not None and step != 0,
+        _require(stop is not None and start < stop,
+                 "gd/kw require start < stop")
+        _require(step is not None and step > 0,
                  "gd/kw need step= (MHz): it is the probe spacing and the "
-                 "racing-mode move size")
+                 "racing-mode move size, and must be positive")
         n_points = 0
-        if stop is None:
-            stop = start
 
     plan.start_mhz = float(start)
     plan.stop_mhz = float(stop)
     plan.step_mhz = float(step)
     plan.n_points = n_points
-    plan.gen_start = gw(start)
-    plan.ro_start = rw(start)
-    # the step is a *delta* of words, and the two axes scale differently:
-    # computing each from its own converter is the whole point
-    plan.gen_step = to_s32(gw(start + step) - plan.gen_start)
-    plan.ro_step = to_s32(rw(start + step) - plan.ro_start)
+    plan.gen_direction = 1 if step > 0 or plan.handshake else -1
+    plan.gen_start, plan.ro_start, first_coordinate = _sweep_inward_endpoint(
+        prog, start, gen_ch, ro_ch, plan.gen_direction)
+    plan.gen_start_unwrapped = first_coordinate
+    plan.gen_limit, plan.ro_limit, last_coordinate = _sweep_inward_endpoint(
+        prog, stop, gen_ch, ro_ch, -plan.gen_direction)
+    plan.gen_span = plan.gen_direction * (last_coordinate - first_coordinate)
+    _require(plan.gen_span >= 0 or not stop_supplied,
+             "the requested range contains no frequency on the shared DDS lattice")
+    plan.gen_step, plan.ro_step = _sweep_step_words(prog, step, gen_ch, ro_ch)
+    if algorithm == 'grid' and stop_supplied and n_points > 1:
+
+
+
+        _, gquant, rquant = _sweep_frequency_lattice(prog, gen_ch, ro_ch)
+        ticks = min(abs(plan.gen_step) // gquant,
+                    plan.gen_span // ((n_points - 1) * gquant))
+        plan.gen_step = plan.gen_direction * ticks * gquant
+        plan.ro_step = to_s32(plan.gen_direction * ticks * rquant)
     _require(plan.gen_step != 0,
              "step=%g MHz rounds to a zero drive-word step; the sweep would "
              "never move" % (step,))
+    if not stop_supplied:
+
+
+        plan.gen_limit = to_s32(plan.gen_start + (n_points - 1) * plan.gen_step)
+        plan.ro_limit = to_s32(plan.ro_start + (n_points - 1) * plan.ro_step)
+        plan.gen_span = (n_points - 1) * abs(plan.gen_step)
+    _require(plan.gen_span < (1 << gencfg['b_dds']),
+             "the drive DDS wraps inside start/stop (the range spans a full "
+             "DDS period); narrow the search window")
 
     # The accelerator walks the grid in 32-bit arithmetic and the tProcessor
     # steps the waveform register the same way, so a 32-bit wrap is harmless --
@@ -1454,7 +1636,8 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     # asked for at least that many shots - and plan.avg is retargeted with it so
     # the tProcessor's shot loop and the IP's cap stay the same number.
     plan.avg_requested = avg
-    if avg & (avg - 1):
+    exponent_cap = 'avg_shift' in accel.op('CFG_WINDOW').field_names()
+    if exponent_cap and avg & (avg - 1):
         rounded = 1 << avg.bit_length()
         warnings.warn(
             "avg=%d is not a power of two; the accelerator's shot cap is "
@@ -1466,7 +1649,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         plan.avg = rounded
         plan.avg_rounded = 1
     plan.avg_shift = avg.bit_length() - 1
-    _require(plan.avg_shift <= 26,
+    _require(not exponent_cap or plan.avg_shift <= 26,
              "avg=%d needs avg_shift=%d, above the 26 that shot_counter "
              "clamps to (its cap tops out at 2**26 = %d shots)"
              % (avg, plan.avg_shift, 1 << 26))
@@ -1531,6 +1714,9 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                 emit_mode = "drain"
             else:
                 emit_mode = "immediate"
+        _require(emit_mode == "immediate",
+                 "early_stop interrupts the shot loop and requires immediate emission; "
+                 "use early_stop=False for a fixed-shot comparison")
         _require(emit_mode in ("immediate", "drain"),
                  "emit_mode must be 'immediate' or 'drain', got %r" % (emit_mode,))
         if algorithm == "grid" and emit_mode == "immediate" and not interrupt:
@@ -1545,6 +1731,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                 "frequency through algorithm='gd'/'kw'.")
         plan.emit_mode = 1 if emit_mode == "drain" else 0
         plan.confirm = plan.calc_fields.get("confirm", 0)
+        plan.block_tol = None if block_tol is None else int(block_tol)
     else:
         _require(n_min is None, "n_min only applies to calc='split'")
         _require(emit_mode is None, "emit_mode only applies to calc='split'")
@@ -1560,28 +1747,47 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
 
         f_lo = start if f_lo is None else f_lo
         f_hi = stop if f_hi is None else f_hi
+        _require(np.isfinite(f_lo) and np.isfinite(f_hi),
+                 "f_lo and f_hi must be finite")
         _require(f_lo < f_hi,
                  "f_lo (%g MHz) must be below f_hi (%g MHz)" % (f_lo, f_hi))
+        _require(start <= f_lo < f_hi <= stop,
+                 "f_lo/f_hi must stay inside the requested start/stop range")
         plan.f_lo_mhz, plan.f_hi_mhz = float(f_lo), float(f_hi)
-        plan.f_lo = gw(f_lo)
-        plan.f_hi = gw(f_hi)
+        plan.f_lo, low_readout, low_coordinate = _sweep_inward_endpoint(
+            prog, f_lo, gen_ch, ro_ch, 1)
+        plan.f_hi, high_readout, high_coordinate = _sweep_inward_endpoint(
+            prog, f_hi, gen_ch, ro_ch, -1)
+        _require(low_coordinate < high_coordinate,
+                 "f_lo/f_hi must contain at least two shared DDS frequencies")
         _require(to_u32(plan.f_lo) < to_u32(plan.f_hi),
                  "f_lo and f_hi map to drive words %d and %d, which are not in "
                  "increasing order; the engine clips against unsigned words, so "
                  "the window must not wrap" % (plan.f_lo, plan.f_hi))
 
         x0 = start if x0 is None else x0
+        _require(np.isfinite(x0), "x0 must be finite")
         _require(f_lo <= x0 <= f_hi,
                  "x0=%g MHz is outside the search window [%g, %g] MHz"
                  % (x0, f_lo, f_hi))
         plan.x0_mhz = float(x0)
-        plan.x0 = gw(x0)
+        plan.x0, plan.ro_x0, seed_coordinate = _sweep_inward_endpoint(
+            prog, x0, gen_ch, ro_ch, 0)
+
+
+
+        if seed_coordinate < low_coordinate:
+            plan.x0, plan.ro_x0 = plan.f_lo, low_readout
+        elif seed_coordinate > high_coordinate:
+            plan.x0, plan.ro_x0 = plan.f_hi, high_readout
 
         _require(min_step is not None,
                  "gd/kw need min_step= (MHz): the convergence threshold on the "
                  "step size")
+        _require(np.isfinite(min_step) and min_step > 0,
+                 "min_step must be finite and positive")
         plan.min_step_mhz = float(min_step)
-        plan.min_step = abs(to_s32(gw(start + min_step) - gw(start)))
+        plan.min_step = _sweep_step_words(prog, min_step, gen_ch, ro_ch)[0]
         _require(plan.min_step > 0,
                  "min_step=%g MHz rounds to a zero drive-word step" % (min_step,))
 
@@ -1621,9 +1827,12 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                 _require(len(table) <= accel.lut_depth,
                          "%s has %d entries but the schedule LUT is only %d "
                          "deep" % (label, len(table), accel.lut_depth))
-            plan.a_words = [abs(to_s32(gw(start + v) - plan.gen_start))
+            _require(all(np.isfinite(v) and v > 0 for v in a_table)
+                     and all(np.isfinite(v) and v > 0 for v in c_table),
+                     "a_table/c_table entries must be finite and positive")
+            plan.a_words = [_sweep_step_words(prog, v, gen_ch, ro_ch)[0]
                             for v in a_table]
-            plan.c_words = [abs(to_s32(gw(start + v) - plan.gen_start))
+            plan.c_words = [_sweep_step_words(prog, v, gen_ch, ro_ch)[0]
                             for v in c_table]
             for label, words, table in (("a_table", plan.a_words, a_table),
                                         ("c_table", plan.c_words, c_table)):
@@ -1650,16 +1859,29 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         f_mid = 0.5 * (plan.f_lo_mhz + plan.f_hi_mhz)
         plan.gen_base = gw(f_mid)
         plan.ro_base = rw(f_mid)
-        plan.ro_x0 = rw(x0)
-        gen_span = to_s32(plan.f_hi) - to_s32(plan.f_lo)
-        ro_span = to_s32(rw(f_hi)) - to_s32(rw(f_lo))
-        _require(gen_span != 0,
-                 "f_lo and f_hi map to the same drive word; widen the search "
-                 "window")
-        max_delta = max(abs(to_s32(plan.f_hi) - plan.gen_base),
-                        abs(to_s32(plan.f_lo) - plan.gen_base))
+
+
+
+        rocfg = prog.soccfg["readouts"][ro_ch]
+        ratio = ((gencfg["f_dds"] / rocfg["f_dds"])
+                 * 2.0 ** (rocfg["b_dds"] - gencfg["b_dds"]))
+        if prog.FLIP_DOWNCONVERSION:
+            ratio = -ratio
+
+
+
+        base = to_u32(plan.gen_base)
+        _require(plan.f_hi_mhz - plan.f_lo_mhz < gencfg["f_dds"]
+                 and to_u32(plan.f_lo) <= base <= to_u32(plan.f_hi),
+                 "the drive DDS wraps inside f_lo/f_hi; narrow the search window")
+        deltas = [to_u32(word) - base for word in (plan.f_lo, plan.f_hi)]
+        _require(all(-(1 << 31) <= delta < (1 << 31) for delta in deltas),
+                 "the search window needs drive deltas outside signed 32-bit "
+                 "range; narrow f_lo/f_hi")
+        max_delta = max(abs(to_s32(word - plan.gen_base))
+                        for word in (plan.f_lo, plan.f_hi))
         plan.ro_ratio, plan.ro_pre_shift, plan.ro_post_shift = _ratio_scaling(
-            ro_span / gen_span, max_delta)
+            ratio, max_delta)
     else:
         for label, value in (("x0", x0), ("min_step", min_step),
                              ("max_iter", max_iter), ("patience", patience),
@@ -2638,6 +2860,8 @@ class AdaptiveSweep(Macro):
     # name, kwargs
 
     def preprocess(self, prog):
+        _require(self.name not in prog._sweep_plans and self.name not in prog._sweep_groups,
+                 "sweep name %r is already declared" % self.name)
         self.plan = plan_sweep(prog, name=self.name, **self.kwargs)
         prog._sweep_plans[self.name] = self.plan
         asm = AsmV2()
@@ -2667,6 +2891,13 @@ class AdaptiveSweep(Macro):
             cfg.update(estop_hold=plan.emit_mode, n0=plan.n0, n_min=plan.n_min)
         asm.qpb_send(accel, 'CFG_ACQ', **cfg)
         if plan.interrupt:
+            plan.landing_label = self._label(prog, 'landing')
+            isr_id = len(prog._sweep_isr_targets)
+            prog._sweep_isr_targets.append(plan)
+            prog.add_reg('qp2_isr_id', allow_reuse=True)
+            asm.write_reg('qp2_isr_id', isr_id)
+            asm.qpb_send(accel, 'CFG_INTERRUPT', trigger_mask=
+                         1 << prog.soccfg['readouts'][plan.ro_ch]['trigger_port'])
             # arms the IP's side of the protocol: from here an early stop parks
             # it instead of walking straight on to the next point
             asm.qpb_send(accel, 'REARM')
@@ -2674,7 +2905,7 @@ class AdaptiveSweep(Macro):
     def _seed_wave(self, asm, wave, word):
         """Overwrite a waveform's frequency field with an absolute word."""
         asm.read_wmem(wave)
-        asm.write_reg(dst='w_freq', src=to_s32(word))
+        asm.write_reg(dst='w_freq', src=to_s32(word) if isinstance(word, Integral) else word)
         asm.write_wmem(wave)
 
     def _step_wave(self, asm, wave, delta):
@@ -2711,8 +2942,7 @@ class AdaptiveSweep(Macro):
         quiet = plan.trig_time + ro_len_us + plan.shot_period
 
         end_label = self._label(prog, 'nolanding')
-        landing_label = self._label(prog, 'landing')
-        plan.landing_label = landing_label
+        landing_label = plan.landing_label
 
         # the normal path steps over the block; nothing but the redirect enters it
         asm.jump(end_label)
@@ -2736,7 +2966,7 @@ class AdaptiveSweep(Macro):
         # index the tProcessor is already holding, which is why no frequency
         # has to be sent back.
         if plan.dump_log and reg_point is not None:
-            reg_a = prog.add_reg('%s_log_a' % (plan.name), allow_reuse=True)
+            reg_a = prog.add_reg('qp2_log_a', allow_reuse=True)
             asm.qpb_send(plan.accel, 'GET_DIAG')
             asm.qpb_wait_new()
             asm.append_macro(AluReg(dst=reg_a, arg1=reg_point, op='+',
@@ -2788,7 +3018,7 @@ class AdaptiveSweep(Macro):
         label = self._label(prog, 'shot')
         last = plan.avg - 1
         if last > LOOP_IMM_MAX:
-            reg_lim = prog.add_reg('%s_shotlim' % (plan.name),
+            reg_lim = prog.add_reg('qp2_shotlim',
                                    allow_reuse=True)
             asm.write_reg(dst=reg_lim, src=to_s32(last))
             last = reg_lim
@@ -2804,12 +3034,14 @@ class AdaptiveSweep(Macro):
         asm.append_macro(LoopBack(label=label, reg=reg_shot, last=last))
 
     def _store_result(self, prog, asm, plan, status_src):
-        """Copy the response words into the result block and raise the flag.
+        """Copy the response words into the result block.
 
         The frequency word goes to data memory *before* any further peripheral
         read, because a status read overwrites the response registers.
         """
         asm.write_dmem(addr=plan.result_addr + RESULT_FREQ, src='s_core_r1')
+        asm.write_dmem(addr=plan.result_addr + RESULT_START,
+                       src=plan.start_regs[0] if plan.start_regs else plan.gen_start)
         if status_src is not None:
             asm.write_dmem(addr=plan.result_addr + RESULT_STATUS,
                            src=status_src)
@@ -2851,31 +3083,43 @@ class AdaptiveSweep(Macro):
             # checked against dmem_size, because a 4001-point log has to live
             # past the 11-bit literal range.  log_addr + n_points - 1 = 4004
             # for the notebook sweep, which a literal DMEM_WR cannot encode.
-            reg_a = prog.add_reg('%s_log_a' % (plan.name), allow_reuse=True)
+            reg_a = prog.add_reg('qp2_log_a', allow_reuse=True)
             asm.write_reg(dst=reg_a,
                           src=to_s32(plan.log_addr + plan.n_points - 1))
             asm.write_dmem(addr=reg_a, src='s_core_r2')
             asm.qpb_ack()
-        # written last, so a host that sees it knows the rest is settled
-        asm.write_dmem(addr=plan.result_addr + RESULT_DONE, src=DONE_SENTINEL)
+
+
 
     #grid --------------------------------------------------------------
 
     def _emit_grid(self, prog, asm, plan):
         accel = plan.accel
-        reg_point = prog.add_reg('%s_point' % (plan.name))
-        reg_shot = prog.add_reg('%s_shot' % (plan.name))
+        reg_point = prog.add_reg('qp2_point', allow_reuse=True)
+        reg_shot = prog.add_reg('qp2_shot', allow_reuse=True)
 
         self._config(prog, asm, plan)
-        asm.qpb_send(accel, 'CFG_WINDOW', start_freq=plan.gen_start,
-                     step=plan.gen_step, n_points=plan.n_points,
-                     avg_shift=plan.avg_shift)
+        avg_field = ({'avg_shift': plan.avg_shift}
+                     if 'avg_shift' in accel.op('CFG_WINDOW').field_names()
+                     else {'averager_value': plan.avg})
+        if plan.start_regs:
+            for key in ('qp2_dt2', 'qp2_dt3', 'qp2_dt4'):
+                prog.add_reg(key, allow_reuse=True)
+            asm.write_reg('qp2_dt2', plan.gen_step)
+            asm.write_reg('qp2_dt3', plan.n_points)
+            asm.write_reg('qp2_dt4', next(iter(avg_field.values())))
+            asm.pb(accel.op('CFG_WINDOW').number, r1=plan.start_regs[0],
+                   r2='qp2_dt2', r3='qp2_dt3', r4='qp2_dt4')
+        else:
+            asm.qpb_send(accel, 'CFG_WINDOW', start_freq=plan.gen_start,
+                         step=plan.gen_step, n_points=plan.n_points, **avg_field)
 
         # seed both waveforms at the first point before the IP starts, so the
         # very first shot already measures the frequency the IP believes it is
         # measuring
-        self._seed_wave(asm, plan.gen_wave, plan.gen_start)
-        self._seed_wave(asm, plan.ro_wave, plan.ro_start)
+        gstart, rstart = plan.start_regs or (plan.gen_start, plan.ro_start)
+        self._seed_wave(asm, plan.gen_wave, gstart)
+        self._seed_wave(asm, plan.ro_wave, rstart)
 
         asm.qpb_send(accel, 'START')
         # confirm the peripheral actually took the job before polling for its
@@ -2948,6 +3192,12 @@ class AdaptiveSweep(Macro):
         asm.qpb_wait_new()
         asm.write_reg(dst=reg_gen, src='s_core_r1')
         asm.write_reg(dst='qp2_tmp', src='s_core_r2')
+
+
+
+
+        asm.cond_jump(label=done, arg1='s_status', op='&', arg2=BIT_QPB_RDY,
+                      test='NZ')
         asm.qpb_ack()
         # dt2_o[0] is the pending flag; a read with nothing pending does not
         # ack the engine, so spinning here is harmless
@@ -3024,6 +3274,156 @@ class AdaptiveSweep(Macro):
         # clear the ARITH response and re-select the peripheral in one write,
         # for the same reason the QP2 ack does
         asm.write_reg(dst='s_ctrl', src=ARITH_ACK_TO_QPB)
+
+class FineTuningSweep(AdaptiveSweep):
+    """Compile finer grids, keeping every point inside the original band."""
+
+    def preprocess(self, prog):
+        stages = list(self.schedule)
+        _require(stages, "fine-tuning schedule cannot be empty")
+        _require(stages[0][1] is None, "the first schedule window must be None (full band)")
+        previous_step = float('inf')
+        for index, (step, half_window) in enumerate(stages):
+            _require(0 < step < previous_step,
+                     "fine-tuning steps must be positive and strictly decreasing")
+            if index:
+                _require(half_window is not None and half_window > 0,
+                         "later stages need a positive half-window in MHz")
+                count = 2 * half_window / step
+                _require(abs(count - round(count)) < 1e-9,
+                         "twice the half-window must be an integer multiple of the step")
+            previous_step = step
+        _require(self.name not in prog._sweep_groups and self.name not in prog._sweep_plans,
+                 "sweep name %r is already declared" % self.name)
+        args = dict(self.kwargs)
+        _require('step' not in args and 'n_points' not in args,
+                 "fine_tuning_sweep takes its steps and point counts from schedule")
+        initial_start = args['start']
+        initial_stop = args.pop('stop')
+        _require(initial_stop > initial_start, "fine-tuning stop must exceed start")
+        result_base = int(args.pop('result_addr', 0))
+        points_base = args.pop('points_addr', None)
+        legacy_points_base = args.pop('log_addr', None)
+        _require(points_base is None or legacy_points_base is None
+                 or points_base == legacy_points_base,
+                 "points_addr and log_addr disagree")
+        if points_base is None:
+            points_base = legacy_points_base
+        if points_base is None:
+            points_base = result_base + len(stages) * RESULT_BLOCK
+        asm = AsmV2()
+        gstart = prog.add_reg('qp2_start_gen', allow_reuse=True)
+        rstart = prog.add_reg('qp2_start_ro', allow_reuse=True)
+        names = []
+        previous = None
+        band = None
+        for index, (step, half_window) in enumerate(stages):
+            stage_args = dict(args, step=step,
+                              stop=initial_stop,
+                              result_addr=result_base + index * RESULT_BLOCK)
+            if index:
+                drive_step, _ = _sweep_step_words(prog, step, band.gen_ch, band.ro_ch)
+                _require(drive_step > 0, "fine-tuning step rounds to zero")
+                nominal_span = Fraction(str(float(initial_stop))) - Fraction(str(float(initial_start)))
+                nominal_count = int(nominal_span / Fraction(str(float(step)))) + 1
+                stage_args['n_points'] = min(int(round(2 * half_window / step)) + 1,
+                                            nominal_count, band.gen_span // drive_step + 1)
+
+            recording = stage_args.get('record_points')
+            if recording is None:
+                recording = stage_args.get('dump_log')
+            stopping = stage_args.get('early_stop')
+            if stopping is None:
+                stopping = stage_args.get('interrupt')
+            if stopping is None:
+                mode = stage_args.get('sweep_mode')
+                stopping = stage_args.get('calc') == 'split' or (
+                    mode is not None and resolve_sweep_mode(mode)['calc'] == 'split')
+            if bool(recording) or (recording is None and stopping):
+                stage_args['points_addr'] = points_base
+            stage_name = '%s_stage%d' % (self.name, index)
+            _require(stage_name not in prog._sweep_plans and stage_name not in prog._sweep_groups,
+                     "generated stage name %r is already declared" % stage_name)
+            plan = plan_sweep(prog, name=stage_name, algorithm='grid', **stage_args)
+            plan.start_regs = (gstart, rstart)
+            prog._sweep_plans[stage_name] = plan
+            names.append(stage_name)
+            if plan.record_points:
+                points_base += plan.n_points
+            if previous is None:
+                band = plan
+                asm.write_reg(gstart, plan.gen_start)
+                asm.write_reg(rstart, plan.ro_start)
+            else:
+
+
+                seek_g = prog.add_reg('qp2_seek_gen', allow_reuse=True)
+                seek_r = prog.add_reg('qp2_seek_ro', allow_reuse=True)
+                seek_n = prog.add_reg('qp2_seek_n', allow_reuse=True)
+                winner = prog.add_reg('qp2_winner', allow_reuse=True)
+                seek = self._label(prog, 'seek')
+                found = self._label(prog, 'found')
+                asm.read_dmem(winner, previous.result_addr + RESULT_FREQ)
+                asm.write_reg(seek_g, gstart)
+                asm.write_reg(seek_r, rstart)
+                asm.write_reg(seek_n, 0)
+                asm.label(seek)
+                asm.cond_jump(found, seek_g, 'Z', op='-', arg2=winner)
+                asm.inc_reg(seek_g, previous.gen_step)
+                asm.inc_reg(seek_r, previous.ro_step)
+                asm.append_macro(LoopBack(label=seek, reg=seek_n,
+                                          last=previous.n_points - 1))
+                asm.end()
+                asm.label(found)
+                span = (plan.n_points - 1) * plan.gen_step
+                _require(span <= band.gen_span, "refinement window exceeds the original band")
+                _, gquant, rquant = _sweep_frequency_lattice(prog, plan.gen_ch, plan.ro_ch)
+                half_ticks = (span // gquant) // 2
+                ghalf, rhalf = half_ticks * gquant, to_s32(half_ticks * rquant)
+                lower = self._label(prog, 'lower_bound')
+                upper = self._label(prog, 'upper_bound')
+                bounded = self._label(prog, 'bounded')
+
+
+
+
+
+                for endpoint, distance, target, reverse in (
+                        (band.gen_start, ghalf, lower, False),
+                        (band.gen_limit, span - ghalf, upper, True)):
+                    if distance == 0:
+                        continue
+                    skip = self._label(prog, 'bound_ok')
+                    asm.write_reg(seek_n, endpoint)
+                    if reverse:
+                        asm.alu_reg(winner, seek_n, '-', seek_g)
+                    else:
+                        asm.alu_reg(winner, seek_g, '-', seek_n)
+                    if distance < (1 << 31):
+                        asm.cond_jump(skip, winner, 'S')
+                    else:
+                        asm.cond_jump(target, winner, 'NS')
+                    asm.write_reg(seek_n, to_s32(distance))
+                    asm.cond_jump(target, winner, 'S', op='-', arg2=seek_n)
+                    asm.label(skip)
+                asm.alu_reg(gstart, seek_g, '-', ghalf)
+                asm.alu_reg(rstart, seek_r, '-', rhalf)
+                asm.jump(bounded)
+                asm.label(lower)
+                asm.write_reg(gstart, band.gen_start)
+                asm.write_reg(rstart, band.ro_start)
+                asm.jump(bounded)
+                asm.label(upper)
+                asm.write_reg(gstart, to_s32(band.gen_limit - span))
+                asm.write_reg(rstart, to_s32(band.ro_limit - (plan.n_points - 1) * plan.ro_step))
+                asm.label(bounded)
+            self._emit_grid(prog, asm, plan)
+            previous = plan
+        prog._sweep_groups[self.name] = names
+        self.children = asm.macro_list
+        for child in self.children:
+            child.preprocess(prog)
+
 
 # loops
 
@@ -4501,7 +4901,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
     FLIP_DOWNCONVERSION = True
 
     # supported revisions of the tProc v2 core
-    ASM_REVISIONS = [21, 22, 23, 24, 25, 26, 27]
+    ASM_REVISIONS = [21, 22, 23, 24, 25, 26, 27, 31]
 
     def __init__(self, soccfg):
         super().__init__(soccfg)
@@ -4541,7 +4941,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         # Attributes to dump when saving the program to JSON.
         # The dump just keeps enough information to execute the program - ASM and initial waveform values.
         # Most of the high-level information (macros, sweeps) is lost.
-        self.dump_keys += ['waves', 'prog_list', 'labels', 'dmem_image']
+        self.dump_keys += ['waves', 'prog_list', 'labels', 'dmem_image', 'ipc_image']
 
     def _init_declarations(self):
         # initialize the high-level objects that get filled in manually, or by a make_program()
@@ -4568,6 +4968,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
 
         # accelerated sweeps declared with adaptive_sweep(), by name
         self._sweep_plans = {}
+        self._sweep_groups = {}
 
     def _init_instructions(self):
         # initialize the low-level objects that get filled by macro expansion
@@ -4595,6 +4996,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         #: dump_prog()/load_prog(), because a reloaded program has no macros
         #: left for compile_datamem() to rebuild it from.
         self.dmem_image = None
+        self.ipc_image = 0
+        self._sweep_isr_targets = []
+        self._sweep_isr_dispatch = None
         # counters for compiler-generated labels (poll loops etc.)
         # these are reset per compile, and macro expansion order is
         # deterministic, so recompiling a program reproduces the same names
@@ -4603,6 +5007,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
     def load_prog(self, progdict):
         # note that we only dump+load the raw waveforms and ASM (the low-level stuff that gets converted to binary)
         # we don't load the macros, pulses, or sweeps (the high-level stuff that gets translated to the low-level stuff)
+        progdict = dict(progdict)
+        progdict.setdefault('ipc_image', 0)
         super().load_prog(progdict)
         # re-create the Waveform objects
         self.waves = [Waveform(**w) for w in self.waves]
@@ -4642,13 +5048,13 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         """
         if not self._sweep_plans:
             return None
-        # The result block has to be *written*, not just reserved: nothing
-        # else clears data memory between runs, so a second run of the same
-        # program would otherwise find the first run's done sentinel already
-        # set and report a stale answer as a fresh one.
+
+
         size = 0
         for plan in self._sweep_plans.values():
             size = max(size, plan.result_addr + RESULT_BLOCK)
+            if plan.record_points:
+                size = max(size, plan.log_addr + plan.n_points)
         d_mem = np.zeros(size, dtype=np.int32)
         return d_mem
 
@@ -4659,17 +5065,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         unless a program asks for one, so a program without an accelerated
         sweep - or with one that does not stop early - runs exactly as before.
         """
-        landing = [plan.landing_label for plan in self._sweep_plans.values()
-                   if plan.landing_label is not None]
-        if not landing:
-            return 0
-        if len(landing) > 1:
-            raise RuntimeError(
-                "the tProc has one interrupt vector but this program declares "
-                "%d sweeps with interrupt=True (%s); only one sweep in a "
-                "program can use the early-stop interrupt"
-                % (len(landing), ', '.join(landing)))
-        addr = self.labels[landing[0]]
+        if self._sweep_isr_dispatch is None:
+            return self.ipc_image
+        addr = self.labels[self._sweep_isr_dispatch]
         return int(addr.lstrip('&'))
 
     def compile(self):
@@ -4683,6 +5081,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         self.binprog['wmem'] = self._compile_waves()
         self.binprog['dmem'] = self.compile_datamem()
         self.binprog['ipc'] = self._compile_ipc()
+        self.ipc_image = self.binprog['ipc']
         if self.binprog['dmem'] is not None:
             self.dmem_image = [int(w) for w in self.binprog['dmem']]
         # check that the program will fit
@@ -4699,6 +5098,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
 
         # reset the low-level program objects
         self._init_instructions()
+        self._sweep_plans = {}
+        self._sweep_groups = {}
 
         for macro in self.macro_list:
             # get the loop names and counts and fill the loop dict
@@ -4727,6 +5128,19 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                 WriteReg(dst=k, src=v.init.start).translate(self)
         for i, macro in enumerate(self.macro_list):
             macro.translate(self)
+        if self._sweep_isr_targets:
+
+
+
+            after = self._next_auto_label('qp2_after_isr')
+            self._sweep_isr_dispatch = self._next_auto_label('qp2_isr')
+            Jump(label=after).translate(self)
+            Label(label=self._sweep_isr_dispatch).translate(self)
+            for index, plan in enumerate(self._sweep_isr_targets):
+                CondJump(label=plan.landing_label, arg1='qp2_isr_id', op='-',
+                         arg2=index, test='Z').translate(self)
+            End().translate(self)
+            Label(label=after).translate(self)
 
     def _add_asm(self, inst, addr_inc=1):
         inst = inst.copy()
@@ -4971,9 +5385,10 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         next and where the optimum is.  The tProcessor owns the tone, it
         writes waveform memory and fires shots.  This call validates the
         parameters, converts them from physical units to the register words the
-        accelerator wants, and emits the whole program: configuration ops,
-        table loads, the run command, the service loop, and the result
+        accelerator wants, and emits the configuration ops,
+        run command, service loop, and result
         read-back into data memory.
+        :meth:`run_sweeps` loads AXI threshold and schedule settings on the host.
 
         A program that uses this is a *job* program, not a shot-averaged one.
         Call it from ``_initialize()``, leave ``_body()`` empty, and use
@@ -5000,18 +5415,11 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             enabled early stop), not separate pipelines.  ``split`` is the
             repetition-axis early stop: each point accumulates raw shot
             sums, the split test checks convergence at power-of-two
-            checkpoints (4, 8, 16, ...) with a confirm depth of 2, and the
+            checkpoints (4, 8, 16, ...) with a default confirm depth of 2, and the
             point retires as an exact 32-bit mean divided by the shot count
-            it really used.  Note the split test is blind to
-            slow drift by construction: it stops at the same shot count a
-            drifting point would as a clean one, and the mean it certifies
-            is then wrong.
-
-            The ``"hsplit"`` and ``"quarter"`` presets - the same test on
-            half- and quarter-octave checkpoint grids, worth roughly 1.2x
-            shots and a further 2-4% - were removed on 2026-08-23 along with
-            the m = 3, 5, 7 reciprocal lookup they retired through.  The
-            checkpoint grid is now fixed at 4, 8, 16, ...
+            it really used. Alternating samples can agree despite slow drift,
+            so passing this test does not establish an unbiased mean or a
+            confidence interval. The checkpoint grid is fixed at 4, 8, 16, ...
         gen_ch : int
             Generator channel carrying the drive, already declared.
         ro_ch : int
@@ -5023,10 +5431,14 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         ro_cfg : str
             Name of the readout config from :meth:`add_readoutconfig`.
         start, stop : float
-            Band edges (MHz).  For gd/kw these default the search window.
+            Allowed band edges (MHz), rounded inward to the shared DDS
+            lattice. For gd/kw these also bound any explicit search window.
         step : float
             Grid step (MHz); for gd/kw, the probe spacing and racing-mode move.
-            Give this or ``n_points``.
+            Give this or ``n_points``. Its realized magnitude rounds downward
+            to the shared DDS lattice. Bounded grids may shorten it by a
+            further lattice quantum to keep the requested count inside the
+            inward-rounded endpoints; inspect ``plan.gen_step``/``ro_step``.
         n_points : int
             Number of grid points, 1 to 65535 on ``adaptive_sweep`` (the IP
             keeps a 16-bit count; an oversized request is rejected).
@@ -5085,17 +5497,15 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             (0 makes every checkpoint eligible; it does NOT disable the
             stop).
         emit_mode : str
-            ``"drain"`` or ``"immediate"``, for the early-stopping calcs.
-            Grid sweeps must use ``"drain"``: an early emission would advance
-            the accelerator while the tProcessor keeps its fixed schedule.
+            Early stopping uses ``"immediate"`` with its interrupt handler.
+            It is selected automatically; ``"drain"`` is rejected when
+            ``early_stop=True``.
         estop_thr : float
             Early-stop threshold for the split-family calcs: the noise /
             signal ratio a checkpoint must reach to pass, so a checkpoint
             passes iff ``|dI|+|dQ| <= estop_thr * (|SI|+|SQ|)``.  In
-            ``(0, 1]``, default ``1/64``.  Halving it costs roughly 4x the
-            shots; the achieved relative error is distributional (median
-            ~0.55*thr, ~4% of points beyond 2*thr), so ask for half of a
-            hard requirement.
+            ``(0, 1]``, default ``1/64``. This is a stopping heuristic;
+            validate achieved accuracy for the experiment's noise and response.
 
             The IP stores the integer reciprocal ``D = round(1/estop_thr)``
             in a 16-bit register and tests ``(|dI|+|dQ|)*D <= |SI|+|SQ|``,
@@ -5113,9 +5523,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             threshold sweep needs no program rebuild.  The register comes
             out of reset at ``D=64``, so an unwritten register behaves as
             ``estop_thr=1/64`` rather than disabling the stop.
-        dump_log : bool
+        record_points : bool
             Record, per grid point, the shot count at which that point
-            stopped early.  Needs ``calc='split'`` and ``interrupt=True``,
+            stopped early. Needs ``early_stop=True``,
             and defaults to True when both hold.  There is no log buffer in
             the accelerator: the interrupt handler reads OP4's verdict word
             and stores it at ``dmem[log_addr + point]`` while it is already
@@ -5130,9 +5540,11 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             ``get_sweep_result`` / ``wait_for_sweep`` return a ``stop_log``
             dict of per-frequency arrays: ``n_used``, ``converged``,
             ``capped``, ``saturated`` and ``freq_mhz``.
-        log_addr : int
+        points_addr : int
             Data-memory address of the dumped log.  Defaults to just past
             the result block.
+        dump_log, log_addr : bool, int
+            Compatibility aliases for ``record_points`` and ``points_addr``.
         x0 : float
             Starting frequency for gd/kw (MHz).  Defaults to ``start``.
         min_step : float
@@ -5166,7 +5578,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             255`` (the engine's pair counter and race accumulators are sized
             for 255).  Defaults 2 and 8.
         f_lo, f_hi : float
-            Search window for gd/kw (MHz).  Default to ``start`` and ``stop``.
+            Search window for gd/kw (MHz), contained within ``[start, stop]``.
+            Defaults to the original band; overrides outside it are rejected.
         result_addr : int
             Data-memory address of the result block.  Literal data-memory
             addresses are 11-bit signed, so this must leave the 4-word block
@@ -5181,22 +5594,31 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             ``soc.start_readout(total_shots, counter_addr=1)`` can follow
             along.  Off by default, because that is the same counter
             ``acquire()`` and ``run_rounds()`` poll against ``reps``: with it
-            on, those would return after the sweep's first shot.  Read the
-            result with :meth:`wait_for_sweep` instead.
+            on, those would return after the sweep's first shot. Counter-based
+            sweep helpers reject this setting; use ``record_points`` instead.
+        early_stop : bool
+            Enable the split test and its tProcessor interrupt together.
+            Defaults to False unless a split/adaptive preset was requested.
+            Requires a dedicated readout trigger and matching firmware with
+            PB15 selective trigger cancellation. Multiple stages share one
+            interrupt vector, dispatched using the active stage's register.
+        confirm : int
+            Consecutive passing checkpoints, from 1 through 7. ``n_min`` gates
+            stopping; earlier passing checkpoints contribute to the streak.
+            Only accepted with ``early_stop=True``; default 2.
+        block_tol : int or None
+            Also require agreement between the first and second halves of
+            the samples at each doubling checkpoint. The tolerance is the
+            absolute L1 change in the block means, in integrated I/Q units
+            before host normalization: ``abs(delta_I) + abs(delta_Q)``.
+            An integer in [0, 4294967295] enables the guard; zero requires
+            exact agreement. ``None`` retains the odd/even rule alone.
+            Both tests must pass before the confirmation counter advances.
+            The first complete block comparison is at 8 shots, so confirm=2
+            cannot stop before 16. Only accepted with ``early_stop=True``.
+            Requires firmware with CTRL bit 7 and AXI target 4 support.
         interrupt : bool
-            Let a point that stops early abort the tProc's shot loop, instead
-            of firing the remaining shots into an accelerator that has already
-            moved on.  This is what turns an early stop into actual saved time
-            under ``algorithm='grid'``: without it the only safe emit mode is
-            ``'drain'``, where the stop is logged but every point still runs to
-            ``avg``.  Needs an accelerator with a ``REARM`` op and a calc
-            whose preset enables the early stop (``"split"``; ``"shift"`` and
-            its alias ``"welford"`` are rejected).
-
-            The program grows a landing block at its tail; its address is the
-            interrupt vector, carried in ``binprog['ipc']`` and written to the
-            tProc by ``load_bin_program()``.  Only one sweep per program can
-            use it, because the tProc has one vector.
+            Deprecated compatibility alias for ``early_stop``.
         Raises
         ------
         ValueError
@@ -5207,6 +5629,32 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         self.append_macro(AdaptiveSweep(
             name=name,
             kwargs=dict(accel=accel, algorithm=algorithm, calc=calc, **kwargs)))
+
+    def fine_tuning_sweep(self, name, *, schedule, accel='adaptive_sweep', **kwargs):
+        """Run successively finer grids around each preceding winner.
+
+        ``schedule`` contains ``(step_MHz, half_window_MHz)`` pairs. The
+        first window must be None and uses ``start`` through ``stop``.
+        Later windows are centered on the preceding winner and shifted inward
+        at either boundary, with matched generator/readout DDS arithmetic.
+        A window wider than the original band uses fewer points. Every stage
+        remains within the original, inward-quantized ``[start, stop]`` band.
+        Example: ``[(25, None), (5, 25), (0.5, 5)]``.
+
+        Other arguments are grid arguments accepted by :meth:`adaptive_sweep`,
+        including ``early_stop`` and ``record_points``. Each stage gets its
+        own four-word DMEM result. The group result includes all stages.
+        """
+        self.append_macro(FineTuningSweep(
+            name=name, schedule=schedule, kwargs=dict(accel=accel, **kwargs)))
+
+    def gd_sweep(self, name, *, accel='adaptive_sweep', **kwargs):
+        """Run the hardware gradient search; see :meth:`adaptive_sweep`."""
+        self.adaptive_sweep(name, accel, algorithm='gd', **kwargs)
+
+    def kw_sweep(self, name, *, accel='adaptive_sweep', **kwargs):
+        """Run the hardware Kiefer-Wolfowitz search; see :meth:`adaptive_sweep`."""
+        self.adaptive_sweep(name, accel, algorithm='kw', **kwargs)
 
     def get_sweep_plan(self, name):
         """Look up the converted parameters of a declared sweep.
@@ -5227,14 +5675,16 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             raise RuntimeError("get_sweep_plan() can only be called on a "
                                "program after it's been compiled")
         try:
-            return self._sweep_plans[name]
+            return self._sweep_plans[self._sweep_groups.get(name, [name])[-1]]
         except KeyError:
             raise KeyError("no adaptive_sweep named %r in this program; it has "
                            "%s" % (name, sorted(self._sweep_plans))) from None
 
     def list_sweeps(self):
         """Names of the accelerated sweeps declared in this program."""
-        return list(self._sweep_plans)
+        grouped = {name for stages in self._sweep_groups.values() for name in stages}
+        return ([name for name in self._sweep_plans if name not in grouped]
+                + list(self._sweep_groups))
 
     def get_sweep_result(self, soc, name=None):
         """Read an accelerated sweep's result back from the board.
@@ -5256,11 +5706,12 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             ``freq_word`` : int
                 The raw 32-bit drive register word behind ``freq``.
             ``done`` : bool
-                Whether the done sentinel was in the block.
+                Whether the normal QICK external completion counter reached
+                the configured number of experiment iterations.
             ``stop_reason`` : str
                 ``'grid_complete'`` for a finished grid sweep,
                 ``'converged'``/``'max_iterations'``/``'finished'`` for gd/kw,
-                ``'incomplete'`` if the sentinel was missing.  This is why the
+                ``'incomplete'`` while the counter is below its target. This is why the
                 *sweep* ended; per-point early stops are in ``stop_log``.
 
             Present when they can be defined unambiguously:
@@ -5279,11 +5730,14 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             ``n_used`` : int
                 GET_DIAG shot count for the LAST point the accelerator
                 emitted, with ``debug=True``.  Not necessarily the winner.
-            ``stop_log`` : dict of arrays, ``accelerator_shots`` : int,
+            ``points`` : dict of arrays, ``retained_shots_total`` : int,
             ``retained_shots`` : int
-                With ``dump_log``: the per-point verdicts, the total shots the
-                accelerator actually folded, and the winning point's own shot
-                count.
+                With ``record_points``: the per-point verdicts, total samples
+                retained in estimates, and the winning point's retained count.
+                ``stop_log`` and ``accelerator_shots`` are compatibility aliases.
+                These counts exclude discarded in-flight samples and cannot
+                measure wall time or physical triggers. Fixed grids return the
+                known full-schedule retained counts without point records.
             ``observed_shots`` : int
                 With ``count_shots=True``: the tProcessor's externally
                 readable counter, which counts one per shot the sweep fires
@@ -5297,23 +5751,47 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             memory happened to hold.
         """
         name = self._sweep_name(name)
+        if name in self._sweep_groups:
+            stages = [self.get_sweep_result(soc, stage)
+                      for stage in self._sweep_groups[name]]
+            result = dict(stages[-1], name=name, stages=stages)
+            result['done'] = all(stage['done'] for stage in stages)
+            if not result['done']:
+                result['stop_reason'] = 'incomplete'
+            result.pop('accelerator_shots', None)
+            result.pop('retained_shots_total', None)
+            if all('accelerator_shots' in stage for stage in stages):
+                result['accelerator_shots'] = sum(
+                    stage['accelerator_shots'] for stage in stages)
+                result['retained_shots_total'] = result['accelerator_shots']
+            return result
         plan = self.get_sweep_plan(name)
+
+
+        completed = self._sweep_complete(soc)
         words = [int(w) & 0xFFFFFFFF for w in
                  soc.tproc.read_mem('dmem', length=RESULT_BLOCK,
                                     addr=plan.result_addr)]
-        out = self.decode_sweep_result(words, name=name)
-        if plan.dump_log:
+        out = self.decode_sweep_result(words, name=name, completed=completed)
+        if plan.dump_log and completed:
             log_words = [int(w) & 0xFFFFFFFF for w in
                          soc.tproc.read_mem('dmem', length=plan.n_points,
                                             addr=plan.log_addr)]
-            log = self.decode_stop_log(log_words, name=name)
+            log = self.decode_stop_log(log_words, name=name,
+                                       start_word=words[RESULT_START])
             out['stop_log'] = log
+            out['points'] = log
             # the per-point log is the only place the *realized* shot counts
             # are recorded, so these two are available only alongside it
             out['accelerator_shots'] = int(log['n_used'].sum())
+            out['retained_shots_total'] = out['accelerator_shots']
             idx = out.get('frequency_index')
             if idx is not None and 0 <= idx < len(log['n_used']):
                 out['retained_shots'] = int(log['n_used'][idx])
+        elif completed and not plan.handshake and not plan.early_stop:
+            out['retained_shots_total'] = plan.total_shots
+            out['accelerator_shots'] = plan.total_shots
+            out['retained_shots'] = plan.avg
         if plan.count_shots:
             # the tProcessor's externally readable counter: one increment per
             # shot the sweep fires, plus one per program repetition
@@ -5321,7 +5799,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                 soc.tproc.single_read(addr=getattr(self, 'COUNTER_ADDR', 1)))
         return out
 
-    def decode_stop_log(self, words, name=None):
+    def decode_stop_log(self, words, name=None, *, start_word=None):
         """Turn the dumped stop words into per-point arrays.
 
         Each word is one point's GET_DIAG dt2, written by the interrupt
@@ -5362,17 +5840,19 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         out = {'n_used': np.array(n_used), 'converged': np.array(conv),
                'capped': np.array(capped), 'saturated': np.array(sat)}
         if not plan.handshake:
-            out['freq_mhz'] = (plan.start_mhz
-                               + plan.step_mhz * np.arange(len(words)))
+            start = plan.gen_start if start_word is None else start_word
+            out['freq_mhz'] = np.array([
+                plan.freq_of_word(self, start + k * plan.gen_step)
+                for k in range(len(words))])
         return out
 
     def wait_for_sweep(self, soc, name=None, timeout=60.0, poll=0.001,
                        summary=True):
         """Block until an accelerated sweep has written its result.
 
-        The sweep signals completion by writing a sentinel into its result
-        block, as the very last thing it does, so seeing it means every other
-        result word has already settled.
+        Completion uses the same external counter as QICK ``run_rounds``.
+        Call :meth:`run_sweeps` to load, reset, and start a fresh job; this
+        method only waits for a job that the caller has already started.
 
         This is the top-level "run the sweep to completion" call, so it is
         also where the run summary is printed: once, after the sweep has
@@ -5403,30 +5883,95 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         Raises
         ------
         TimeoutError
-            If the sentinel does not appear in time.
+            If the completion counter does not reach its target in time.
         """
+        self._wait_for_sweep_counter(soc, timeout, poll)
+        result = self.get_sweep_result(soc, name=name)
+        if summary:
+            self.print_adaptive_sweep_summary(name=name, result=result)
+        return result
+
+    def _sweep_completion_spec(self):
+        """Use the same externally readable counter as QICK run_rounds()."""
+        counter = getattr(self, 'counter_addr', None)
+        dimensions = getattr(self, 'loop_dims', None)
+        if counter is None or not dimensions:
+            raise RuntimeError(
+                "counter-based sweep completion needs an AveragerProgramV2 "
+                "(sweeps in _initialize, empty _body, reps=1), or an "
+                "AcquireProgramV2 with setup_counter() and matching increments")
+        if any(p.count_shots for p in self._sweep_plans.values()):
+            raise ValueError("count_shots=True reuses the completion counter; "
+                             "use record_points=True for retained-shot diagnostics")
+        return int(counter), int(np.prod(dimensions))
+
+    def _sweep_complete(self, soc):
+        counter, target = self._sweep_completion_spec()
+        return int(soc.get_tproc_counter(addr=counter)) >= target
+
+    def _wait_for_sweep_counter(self, soc, timeout, poll):
         import time
-        name = self._sweep_name(name)
-        plan = self.get_sweep_plan(name)
-        deadline = time.time() + timeout
-        while True:
-            word = int(soc.tproc.read_mem(
-                'dmem', length=1,
-                addr=plan.result_addr + RESULT_DONE)[0]) & 0xFFFFFFFF
-            if word == DONE_SENTINEL:
-                result = self.get_sweep_result(soc, name=name)
-                if summary:
-                    self.print_adaptive_sweep_summary(name=name, result=result)
-                return result
-            if time.time() > deadline:
-                raise TimeoutError(
-                    "sweep %r did not finish within %g s; its done word at "
-                    "dmem[%d] is 0x%x, not 0x%x"
-                    % (name, timeout, plan.result_addr + RESULT_DONE, word,
-                       DONE_SENTINEL))
+        self._validate_sweep_wait(timeout, poll)
+        self._sweep_completion_spec()
+        deadline = time.monotonic() + timeout
+        while not self._sweep_complete(soc):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("sweep program did not finish within %g s" % timeout)
             time.sleep(poll)
 
-    def decode_sweep_result(self, words, name=None):
+    @staticmethod
+    def _validate_sweep_wait(timeout, poll):
+        _require(np.isfinite(timeout) and timeout > 0
+                 and np.isfinite(poll) and poll >= 0,
+                 "timeout must be finite and positive; poll finite and nonnegative")
+
+    def run_sweeps(self, soc, *, timeout=60.0, poll=0.001,
+                   load_envelopes=True, accelerator=None):
+        """Run one complete sweep job using QICK's normal counter lifecycle.
+
+        Like run_rounds(), reload memories and clear the external counter
+        before starting. Enable the averaging buffer because its m2 output is
+        the accelerator input. Return results keyed by declared sweep name.
+        No accelerator log RAM or DMEM completion sentinel is used.
+        """
+        self._validate_sweep_wait(timeout, poll)
+        if self.binprog is None:
+            self.compile()
+        counter, _ = self._sweep_completion_spec()
+        settings = [p for p in self._sweep_plans.values()
+                    if p.estop_d or p.a_words or p.c_words]
+        if settings:
+            first = settings[0]
+            signature = lambda p: (p.estop_d, p.block_tol, tuple(p.a_words), tuple(p.c_words))
+            _require(all(signature(p) == signature(first) for p in settings),
+                     "one run shares the AXI thresholds and schedules; use separate "
+                     "runs when these settings differ")
+            if accelerator is None:
+                accelerator = getattr(soc, 'adaptive_sweep_0', None)
+            _require(accelerator is not None,
+                     "pass the adaptive-sweep driver as accelerator=, or expose "
+                     "it on the board as adaptive_sweep_0")
+        self.config_all(soc, load_envelopes=load_envelopes, load_mem=False)
+        self.config_bufs(soc, enable_avg=True, enable_buf=False)
+        if settings:
+            accelerator.load_tables(settings[0])
+        soc.reload_mem()
+        soc.clear_tproc_counter(addr=counter)
+        soc.prepare_round()
+        soc.start_src('internal')
+        try:
+            soc.start_tproc()
+            self._wait_for_sweep_counter(soc, timeout, poll)
+            return {name: self.get_sweep_result(soc, name)
+                    for name in self.list_sweeps()}
+        except BaseException:
+            soc.stop_tproc()
+            raise
+        finally:
+            soc.start_src('internal')
+            soc.cleanup_round()
+
+    def decode_sweep_result(self, words, name=None, *, completed=False):
         """Turn a raw result block into physical units.
 
         Split out from :meth:`get_sweep_result` so the same decoding can be
@@ -5448,8 +5993,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         out = {
             'name': name,
             'freq_word': words[RESULT_FREQ],
+            'start_word': words[RESULT_START],
             'freq': plan.freq_of_word(self, words[RESULT_FREQ]),
-            'done': words[RESULT_DONE] == DONE_SENTINEL,
+            'done': bool(completed),
         }
         # only report words the generated program actually wrote; an
         # accelerator without a status or diagnostic read leaves those slots
@@ -5469,7 +6015,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         # --- fields derived from what is already in the block --------------
         # the winning index is replayed from the winning word, NOT taken from
         # the status word: point_idx stops at the last index the sweep visited
-        idx = plan.index_of_word(words[RESULT_FREQ])
+        idx = plan.index_of_word(words[RESULT_FREQ], words[RESULT_START])
         if idx is not None:
             out['frequency_index'] = idx
         if plan.sweep_mode:
@@ -5477,6 +6023,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         if plan.estop_d:
             out['threshold'] = plan.estop_thr
             out['threshold_encoded'] = plan.estop_d
+            out['early_stop_method'] = ('odd_even_block' if plan.block_tol is not None
+                                        else 'odd_even')
+            out['block_tol'] = plan.block_tol
         if not out['done']:
             out['stop_reason'] = 'incomplete'
         elif plan.handshake:
@@ -5581,8 +6130,12 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             cfg['estop_threshold_requested'] = plan.estop_thr_requested
             cfg['n_min'] = plan.n_min
             cfg['confirm'] = plan.confirm
+            cfg['early_stop_method'] = ('odd_even_block' if plan.block_tol is not None
+                                        else 'odd_even')
+            cfg['block_tol'] = plan.block_tol
             cfg['emit_mode'] = 'drain' if plan.emit_mode else 'immediate'
         cfg['redirect'] = bool(plan.interrupt)
+        cfg['early_stop'] = plan.early_stop
         if plan.interrupt and plan.landing_label:
             cfg['redirect_landing_label'] = plan.landing_label
         cfg['result_addr'] = plan.result_addr
@@ -5603,7 +6156,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         if result is not None:
             for key in ('freq', 'freq_word', 'frequency_index', 'done',
                         'stop_reason', 'threshold', 'threshold_encoded',
-                        'retained_shots', 'accelerator_shots',
+                        'retained_shots', 'accelerator_shots', 'retained_shots_total',
                         'observed_shots', 'n_used', 'status', 'converged',
                         'capped', 'iterations'):
                 if key in result:
@@ -5616,12 +6169,12 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         unavailable = OrderedDict(self.SWEEP_UNAVAILABLE)
         if 'observed_shots' not in res:
             unavailable['observed_shots'] = (
-                "declare the sweep with count_shots=True and pass soc= to read "
-                "the tProcessor's external shot counter")
+                "the completion counter cannot also count physical triggers; "
+                "measure acquisition timing and discarded shots separately")
         if 'retained_shots' not in res:
             unavailable['retained_shots'] = (
                 "the per-point shot counts are only recorded when the sweep "
-                "runs with dump_log (interrupt=True and an early-stopping calc)")
+                "runs with record_points=True and early_stop=True")
 
         return {
             'name': name,
@@ -5749,7 +6302,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             lines.append(row("threshold", "%.6g (encoded D=%d)"
                              % (res['threshold'], res['threshold_encoded'])))
         for key, label in (('retained_shots', 'retained shots'),
-                           ('accelerator_shots', 'shots folded'),
+                           ('retained_shots_total', 'retained across points'),
                            ('observed_shots', 'shots fired'),
                            ('n_used', 'n_used (last point)')):
             if key in res:
@@ -5774,13 +6327,13 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         """Resolve an optional sweep name, defaulting only when unambiguous."""
         if name is not None:
             return name
-        if not self._sweep_plans:
+        names = self.list_sweeps()
+        if not names:
             raise ValueError("this program declares no accelerated sweeps")
-        if len(self._sweep_plans) != 1:
+        if len(names) != 1:
             raise ValueError("this program declares %d sweeps (%s); say which "
-                             "one" % (len(self._sweep_plans),
-                                      sorted(self._sweep_plans)))
-        return next(iter(self._sweep_plans))
+                             "one" % (len(names), sorted(names)))
+        return names[0]
 
     def list_pulse_waveforms(self, pulsename, exclude_special=True):
         """Get the names of the waveforms in a given pulse.

@@ -16,6 +16,8 @@ module amplitude_calculator(
   input estop_en_i,
   input estop_hold_i,
   input [15:0] threshold_i,
+  input block_en_i,
+  input [31:0] block_tol_i,
   input [2:0] confirm_i,
 
   output warmup_done_o,
@@ -115,6 +117,8 @@ module amplitude_calculator(
     .warmup_shots_i(warmup_shots_i),
     .n_min_i(n_min_i),
     .threshold_i(threshold_i),
+    .block_en_i(block_en_i),
+    .block_tol_i(block_tol_i),
     .confirm_i(confirm_i),
     .hold_i(estop_hold_i),
     .sum_i_i(sum_i),
