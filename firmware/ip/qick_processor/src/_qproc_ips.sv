@@ -249,7 +249,9 @@ module BRAM_FIFO_DC_2 # (
    input  wire                   flush_i        ,
    output logic  [FIFO_DW - 1:0] data_o         ,
    output logic                  async_empty_o  ,
-   output logic                  async_full_o   
+   output logic                  async_full_o   ,
+   output wire                   wr_rst_busy_o  ,
+   output wire                   rd_rst_busy_o
 );
 
    // XPM_FIFO instantiation template for Asynchronous FIFO configurations
@@ -540,6 +542,8 @@ module BRAM_FIFO_DC_2 # (
    // +---------------------------------------------------------------------------------------------------------------------+
 
    logic rd_rst_busy, wr_rst_busy;
+   assign wr_rst_busy_o = wr_rst_busy;
+   assign rd_rst_busy_o = rd_rst_busy;
    logic wr_full, rd_empty;
    logic [FIFO_DW - 1:0] dout;
 
@@ -694,7 +698,9 @@ module BRAM_FIFO_DC_2 # (
    output wire  [FIFO_DW - 1:0]  data_o         ,
    input  wire                   flush_i        ,
    output wire                   async_empty_o  ,
-   output wire                   async_full_o   );
+   output wire                   async_full_o   ,
+   output wire                   wr_rst_busy_o  ,
+   output wire                   rd_rst_busy_o  );
 
 // The WRITE_POINTER is on the Last Empty Value
 // The READ_POINTER is on the Last Value
@@ -740,6 +746,8 @@ always_ff @(posedge wr_clk_i, negedge wr_rst_ni) begin
 end
 
 assign busy = clr_fifo_ack | clr_fifo_req ;
+assign wr_rst_busy_o = busy;
+assign rd_rst_busy_o = clr_rd;
 
 //SYNC with POP (RD_CLK)
 assign async_empty   = (rd_gptr == wr_gptr_r) ;   

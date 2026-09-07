@@ -4,6 +4,7 @@ Drivers for the QICK Timed Processor (tProc).
 """
 from pynq.buffer import allocate
 import numpy as np
+import time
 from qick.ip import SocIP
 
 class AxisTProc64x32_x8(SocIP):
@@ -510,12 +511,14 @@ class Axis_QICK_Proc(SocIP):
         self.logger.info('TIME_UPDATE')
         self.tproc_ctrl      = 2
     def start(self):
+        self._wait_ipc_ready()
         self.logger.info('PROCESSOR_START')
         self.tproc_ctrl      = 4
     def stop(self):
         self.logger.info('PROCESSOR_STOP')
         self.tproc_ctrl      = 8
     def core_start(self):
+        self._wait_ipc_ready()
         self.logger.info('CORE_START')
         self.tproc_ctrl      = 16
     def core_stop(self):
@@ -525,6 +528,7 @@ class Axis_QICK_Proc(SocIP):
         self.logger.info('PROCESSOR_RESET')
         self.tproc_ctrl      = 64
     def run(self):
+        self._wait_ipc_ready()
         self.logger.info('PROCESSOR_RUN')
         self.tproc_ctrl      = 128
     def proc_pause(self):
@@ -534,9 +538,11 @@ class Axis_QICK_Proc(SocIP):
         self.logger.info('PROCESSOR_FREEZE')
         self.tproc_ctrl      = 512
     def proc_step(self):
+        self._wait_ipc_ready()
         self.logger.info('PROCESSOR_STEP')
         self.tproc_ctrl      = 1024
     def core_step(self):
+        self._wait_ipc_ready()
         self.logger.info('CORE_STEP')
         self.tproc_ctrl      = 2048
     def time_step(self):
@@ -758,11 +764,25 @@ class Axis_QICK_Proc(SocIP):
         """
         Write the program to the tProc program memory.
         """
+        if self.cfg.get('revision', 0) >= 33:
+            self.stop()
         self.binprog = binprog
         self.load_mem('pmem', self.binprog['pmem'])
         # interrupt vector, 0 for programs that don't use the early-stop redirect
         self.tproc_ipc = self.binprog.get('ipc', 0)
+        self._wait_ipc_ready()
         if load_mem: self.reload_mem()
+
+    def _wait_ipc_ready(self, timeout=1.0):
+        if self.cfg.get('revision', 0) < 33:
+            return
+        deadline = time.monotonic() + timeout
+        while int(self.tproc_ipc) & (1 << 31):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "tProcessor interrupt-vector transfer did not complete; "
+                    "stop the core before updating TPROC_IPC.")
+            time.sleep(0.001)
 
     def print_axi_regs(self):
         print('---------------------------------------------')

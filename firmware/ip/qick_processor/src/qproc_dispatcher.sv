@@ -17,6 +17,7 @@ module qproc_dispatcher # (
    input  wire          core_rst       ,
    input  wire          trig_flush_i   , // discard queued triggers (interrupt abort)
    input  wire [OUT_TRIG_QTY-1:0] trig_flush_mask_i,
+   output wire          trig_flush_busy_o,
    input  wire          time_en        ,
    input  wire          time_rst       ,
    input  wire  [47:0]  c_time_ref_dt  ,
@@ -44,29 +45,82 @@ module qproc_dispatcher # (
 
 // FIFOS & DISPATCHER
 
-reg c_trig_flush_toggle;
-reg [OUT_TRIG_QTY-1:0] c_trig_flush_mask;
-always_ff @(posedge c_clk_i, negedge c_rst_ni) begin
-   if (!c_rst_ni) begin
+wire trig_flush_reset_ni = c_rst_ni & t_rst_ni;
+(* ASYNC_REG = "TRUE" *) reg [1:0] c_trig_reset_sync, t_trig_reset_sync;
+always_ff @(posedge c_clk_i, negedge trig_flush_reset_ni) begin
+   if (!trig_flush_reset_ni)
+      c_trig_reset_sync <= '0;
+   else
+      c_trig_reset_sync <= {c_trig_reset_sync[0], 1'b1};
+end
+always_ff @(posedge t_clk_i, negedge trig_flush_reset_ni) begin
+   if (!trig_flush_reset_ni)
+      t_trig_reset_sync <= '0;
+   else
+      t_trig_reset_sync <= {t_trig_reset_sync[0], 1'b1};
+end
+wire c_trig_reset_ni = c_trig_reset_sync[1];
+wire t_trig_reset_ni = t_trig_reset_sync[1];
+
+reg c_trig_flush_toggle, c_trig_flush_reset_done;
+reg [OUT_TRIG_QTY-1:0] c_trig_flush_mask, c_trig_flush_pending;
+reg [OUT_TRIG_QTY-1:0] c_trig_flush_reset_seen, c_trig_flush_reissue;
+reg c_trig_flush_pending_valid;
+reg t_trig_flush_ack;
+(* ASYNC_REG = "TRUE" *) reg [1:0] c_trig_ack_sync;
+wire [OUT_TRIG_QTY-1:0] c_fifo_trig_reset_busy, t_fifo_trig_reset_busy;
+wire c_trig_flush_inflight = c_trig_flush_toggle != c_trig_ack_sync[1];
+assign trig_flush_busy_o = !c_trig_reset_ni | c_trig_flush_inflight | c_trig_flush_pending_valid;
+
+always_ff @(posedge c_clk_i, negedge c_trig_reset_ni) begin
+   if (!c_trig_reset_ni) begin
+      c_trig_ack_sync <= '0;
       c_trig_flush_toggle <= 1'b0;
+      c_trig_flush_reset_done <= 1'b0;
       c_trig_flush_mask <= '0;
-   end else if (trig_flush_i) begin
-      c_trig_flush_toggle <= ~c_trig_flush_toggle;
-      c_trig_flush_mask <= trig_flush_mask_i;
+      c_trig_flush_pending <= '0;
+      c_trig_flush_pending_valid <= 1'b0;
+      c_trig_flush_reset_seen <= '0;
+      c_trig_flush_reissue <= '0;
+   end else begin
+      c_trig_ack_sync <= {c_trig_ack_sync[0], t_trig_flush_ack};
+      c_trig_flush_reissue <= '0;
+      if (!c_trig_flush_inflight) begin
+         if (c_trig_flush_pending_valid | trig_flush_i) begin
+            c_trig_flush_toggle <= ~c_trig_flush_toggle;
+            c_trig_flush_mask <= c_trig_flush_pending | (trig_flush_i ? trig_flush_mask_i : '0);
+            c_trig_flush_reissue <= c_trig_flush_pending;
+            c_trig_flush_pending <= '0;
+            c_trig_flush_pending_valid <= 1'b0;
+            c_trig_flush_reset_seen <= '0;
+         end
+      end else begin
+         if (trig_flush_i) begin
+            c_trig_flush_pending <= c_trig_flush_pending | trig_flush_mask_i;
+            c_trig_flush_pending_valid <= 1'b1;
+         end
+         c_trig_flush_reset_seen <= c_trig_flush_reset_seen | (c_fifo_trig_reset_busy & c_trig_flush_mask);
+         if (((c_trig_flush_reset_seen & c_trig_flush_mask) == c_trig_flush_mask) &&
+             !(|(c_fifo_trig_reset_busy & c_trig_flush_mask)))
+            c_trig_flush_reset_done <= c_trig_flush_toggle;
+      end
    end
 end
 
 (* ASYNC_REG = "TRUE" *) reg [2:0] t_trig_flush_sync;
+(* ASYNC_REG = "TRUE" *) reg [1:0] t_trig_reset_done_sync;
 (* ASYNC_REG = "TRUE" *) reg [OUT_TRIG_QTY-1:0] t_trig_mask_cdc, t_trig_mask_sync;
 reg t_trig_flush_seen;
-always_ff @(posedge t_clk_i, negedge t_rst_ni) begin
-   if (!t_rst_ni) begin
-      t_trig_flush_sync <= 3'b000;
+always_ff @(posedge t_clk_i, negedge t_trig_reset_ni) begin
+   if (!t_trig_reset_ni) begin
+      t_trig_flush_sync <= '0;
+      t_trig_reset_done_sync <= '0;
       t_trig_mask_cdc <= '0;
       t_trig_mask_sync <= '0;
       t_trig_flush_seen <= 1'b0;
    end else begin
       t_trig_flush_sync <= {t_trig_flush_sync[1:0], c_trig_flush_toggle};
+      t_trig_reset_done_sync <= {t_trig_reset_done_sync[0], c_trig_flush_reset_done};
       t_trig_mask_cdc <= c_trig_flush_mask;
       t_trig_mask_sync <= t_trig_mask_cdc;
       t_trig_flush_seen <= t_trig_flush_sync[2];
@@ -110,16 +164,25 @@ reg                        trig_pop_r[OUT_TRIG_QTY], trig_pop_r2[OUT_TRIG_QTY];
 wire [OUT_TRIG_QTY-1:0]    t_fifo_trig_empty, c_fifo_trig_full ;
 reg  [OUT_TRIG_QTY-1:0]    t_fifo_trig_empty_r;
 reg [OUT_TRIG_QTY-1:0] t_trig_flush_active;
-wire [OUT_TRIG_QTY-1:0] t_trig_abort = t_trig_flush | t_trig_flush_active;
+wire [OUT_TRIG_QTY-1:0] t_trig_abort = t_trig_flush | t_trig_flush_active | {OUT_TRIG_QTY{!t_trig_reset_ni}};
+always_ff @(posedge t_clk_i, negedge t_trig_reset_ni) begin
+   if (!t_trig_reset_ni)
+      t_trig_flush_ack <= 1'b0;
+   else if ((t_trig_flush_seen != t_trig_flush_ack) &&
+            (t_trig_reset_done_sync[1] == t_trig_flush_seen) &&
+            !(|(t_trig_mask_sync & (t_fifo_trig_reset_busy | ~t_fifo_trig_empty))))
+      t_trig_flush_ack <= t_trig_flush_seen;
+end
 integer ind_trig_flush;
-always_ff @(posedge t_clk_i, negedge t_rst_ni) begin
-   if (!t_rst_ni)
+always_ff @(posedge t_clk_i, negedge t_trig_reset_ni) begin
+   if (!t_trig_reset_ni)
       t_trig_flush_active <= '0;
    else
       for (ind_trig_flush=0; ind_trig_flush < OUT_TRIG_QTY; ind_trig_flush=ind_trig_flush+1)
          if (t_trig_flush[ind_trig_flush])
             t_trig_flush_active[ind_trig_flush] <= 1'b1;
-         else if (t_fifo_trig_empty[ind_trig_flush])
+         else if ((t_trig_reset_done_sync[1] == t_trig_flush_seen) &&
+                  !t_fifo_trig_reset_busy[ind_trig_flush] && t_fifo_trig_empty[ind_trig_flush])
             t_trig_flush_active[ind_trig_flush] <= 1'b0;
 end
 
@@ -263,14 +326,16 @@ generate
          .wr_en_i    ( 1'b1     ) ,
          .push_i     ( c_fifo_trig_push_s[ind_tfifo] ) ,
          .data_i     ( {c_fifo_data_in_r[0],c_fifo_time_in_r}  ) ,
-         .flush_i    ( core_rst | (trig_flush_i & trig_flush_mask_i[ind_tfifo]) ),
+         .flush_i    ( core_rst | (trig_flush_i & trig_flush_mask_i[ind_tfifo]) | c_trig_flush_reissue[ind_tfifo] ),
          .rd_clk_i   ( t_clk_i      ) ,
          .rd_rst_ni  ( t_rst_ni     ) ,
          .rd_en_i    ( time_en_r    ) ,
          .pop_i      ( trig_pop_r        [ind_tfifo] ) ,
          .data_o     ( {t_fifo_trig_dt[ind_tfifo], t_fifo_trig_time[ind_tfifo]} ) ,
          .async_empty_o ( t_fifo_trig_empty [ind_tfifo] ) , // SYNC with RD_CLK
-         .async_full_o  ( c_fifo_trig_full  [ind_tfifo] )   // SYNC with WR_CLK
+         .async_full_o  ( c_fifo_trig_full  [ind_tfifo] ) , // SYNC with WR_CLK
+         .wr_rst_busy_o ( c_fifo_trig_reset_busy[ind_tfifo] ),
+         .rd_rst_busy_o ( t_fifo_trig_reset_busy[ind_tfifo] )
       );
       // Time Comparator
       always @(posedge t_clk_i) begin

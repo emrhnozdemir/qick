@@ -6752,7 +6752,7 @@
       </xilinx:xpmLibraries>
       <xilinx:vendorDisplayName>Quantum Instrumentation Control Kit</xilinx:vendorDisplayName>
       <xilinx:vendorURL>https://github.com/openquantumhardware/qick/</xilinx:vendorURL>
-      <xilinx:coreRevision>32</xilinx:coreRevision>
+      <xilinx:coreRevision>33</xilinx:coreRevision>
       <xilinx:coreCreationDateTime>2026-09-06T10:26:30Z</xilinx:coreCreationDateTime>
     </xilinx:coreExtensions>
     <xilinx:packagingInfo>

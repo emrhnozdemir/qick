@@ -135,6 +135,11 @@ reg  [31:0]    xreg_TPROC_W_DT [2];
 wire [ 7:0]    xreg_CORE_CFG;
 wire [ 7:0]    xreg_READ_SEL ;
 wire [31:0]    xreg_TPROC_IPC ;
+wire           ipc_busy;
+wire           ipc_core_valid;
+wire [PMEM_AW-1:0] ipc_core;
+wire           trig_flush_busy;
+wire           core_exec_en;
 reg  [31:0]    xreg_TPROC_R_DT [2];
 
 // AXIS-INPUT
@@ -196,6 +201,20 @@ wire [31:0]    core_ds ;
 
 wire [2:0] time_st_ds, core_st_ds;
 wire [6:0] ctrl_t_ds, ctrl_c_ds;
+assign core_exec_en = core_en & ipc_core_valid & ~trig_flush_busy;
+
+(* KEEP_HIERARCHY = "TRUE" *) qproc_ipc_cdc # (.WIDTH(PMEM_AW)) IPC_CDC (
+   .ps_clk_i       ( ps_clk_i ),
+   .ps_rst_ni      ( ps_rst_ni ),
+   .c_clk_i        ( c_clk_i ),
+   .c_rst_ni       ( c_rst_ni ),
+   .ps_ipc_i       ( xreg_TPROC_IPC[PMEM_AW-1:0] ),
+   .c_halted_i     ( core_rst | (core_st_ds == 3'd4) ),
+   .ps_busy_o      ( ipc_busy ),
+   .c_valid_o      ( ipc_core_valid ),
+   .c_ipc_o        ( ipc_core )
+);
+
 qproc_ctrl # (
    .TIME_READ ( TIME_READ )
 ) QPROC_CTRL (
@@ -438,6 +457,7 @@ qproc_axi_reg QPROC_xREG (
    .CORE_CFG         ( xreg_CORE_CFG       ) ,
    .READ_SEL         ( xreg_READ_SEL       ) ,
    .TPROC_IPC        ( xreg_TPROC_IPC      ) ,
+   .TPROC_IPC_BUSY   ( ipc_busy            ) ,
    .MEM_DT_O         ( xreg_MEM_DT_O       ) ,
    .TPROC_R_DT1      ( xreg_TPROC_R_DT[0]  ) ,
    .TPROC_R_DT2      ( xreg_TPROC_R_DT[1]  ) ,
@@ -616,7 +636,7 @@ qproc_core # (
    .c_rst_ni         ( c_rst_ni          ) ,
    .ps_clk_i         ( ps_clk_i          ) ,
    .ps_rst_ni        ( ps_rst_ni         ) ,
-   .en_i             ( core_en           ) ,    
+   .en_i             ( core_exec_en      ) ,
    .restart_i        ( core_rst          ) ,    
 // CORE CTRL
    .lfsr_cfg_i       ( core0_lfsr_cfg    ) ,    
@@ -626,7 +646,7 @@ qproc_core # (
    .port_dt_i        ( in_port_dt_r      ) , //ALL The port Values
    .flag_i           ( flag_c0           ) ,
    .interrupt_i      ( interrupt_i       ) ,
-   .ipc_i            ( xreg_TPROC_IPC[PMEM_AW-1:0] ) ,
+   .ipc_i            ( ipc_core          ) ,
    .int_take_o       ( int_take          ) ,
    .sreg_cfg_o       ( core0_cfg         ) ,
    .sreg_ctrl_o      ( core0_ctrl        ) ,
@@ -686,7 +706,7 @@ generate
          .c_rst_ni         ( c_rst_ni          ) ,
          .ps_clk_i         ( ps_clk_i          ) ,
          .ps_rst_ni        ( ps_rst_ni         ) ,
-         .en_i             ( core_en           ) ,    
+         .en_i             ( core_exec_en      ) ,
          .restart_i        ( core_rst          ) ,
          .port_dt_i        ( in_port_dt_r      ) ,
          .interrupt_i      ( 1'b0              ) ,
@@ -741,10 +761,11 @@ qproc_dispatcher # (
    .t_clk_i        ( t_clk_i       ) ,
    .t_rst_ni       ( t_rst_ni      ) ,
    //Port
-   .core_en        ( core_en       ) ,  
+   .core_en        ( core_exec_en  ) ,
    .core_rst       ( core_rst      ) ,  
    .trig_flush_i   ( int_take_r    ) ,
    .trig_flush_mask_i ( interrupt_trig_mask[OUT_TRIG_QTY-1:0] ) ,
+   .trig_flush_busy_o ( trig_flush_busy ) ,
    .time_en        ( time_en       ) ,  
    .time_rst       ( time_rst      ) ,   
    .c_time_ref_dt  ( c_time_ref_dt ) ,
@@ -937,6 +958,104 @@ generate
    end
 endgenerate
 
+
+endmodule
+
+module qproc_ipc_cdc # (
+   parameter WIDTH = 12
+)(
+   input  wire             ps_clk_i,
+   input  wire             ps_rst_ni,
+   input  wire             c_clk_i,
+   input  wire             c_rst_ni,
+   input  wire [WIDTH-1:0] ps_ipc_i,
+   input  wire             c_halted_i,
+   output wire             ps_busy_o,
+   output wire             c_valid_o,
+   output wire [WIDTH-1:0] c_ipc_o
+);
+
+wire ipc_rst_n = ps_rst_ni & c_rst_ni;
+(* ASYNC_REG = "TRUE" *) reg [1:0] ps_reset_sync, c_reset_sync;
+always_ff @(posedge ps_clk_i, negedge ipc_rst_n) begin
+   if (!ipc_rst_n)
+      ps_reset_sync <= 2'b00;
+   else
+      ps_reset_sync <= {ps_reset_sync[0], 1'b1};
+end
+always_ff @(posedge c_clk_i, negedge ipc_rst_n) begin
+   if (!ipc_rst_n)
+      c_reset_sync <= 2'b00;
+   else
+      c_reset_sync <= {c_reset_sync[0], 1'b1};
+end
+
+reg [WIDTH-1:0] ps_payload;
+reg ps_request, ps_valid;
+reg [1:0] ps_state;
+reg c_ack, c_valid;
+reg [WIDTH-1:0] c_ipc;
+(* ASYNC_REG = "TRUE" *) reg [1:0] ps_ack_sync;
+(* ASYNC_REG = "TRUE" *) reg [2:0] c_request_sync;
+
+always_ff @(posedge ps_clk_i, negedge ps_reset_sync[1]) begin
+   if (!ps_reset_sync[1]) begin
+      ps_ack_sync <= 2'b00;
+      ps_payload <= '0;
+      ps_request <= 1'b0;
+      ps_valid <= 1'b0;
+      ps_state <= 2'd0;
+   end else begin
+      ps_ack_sync <= {ps_ack_sync[0], c_ack};
+      case (ps_state)
+         2'd0: begin
+            if (!ps_valid || (ps_payload != ps_ipc_i)) begin
+               ps_payload <= ps_ipc_i;
+               ps_request <= 1'b1;
+               ps_state <= 2'd1;
+            end
+         end
+         2'd1: begin
+            if (ps_ack_sync[1]) begin
+               ps_request <= 1'b0;
+               ps_valid <= 1'b1;
+               ps_state <= 2'd2;
+            end
+         end
+         2'd2: begin
+            if (!ps_ack_sync[1])
+               ps_state <= 2'd0;
+         end
+         default: begin
+            ps_request <= 1'b0;
+            ps_valid <= 1'b0;
+            ps_state <= 2'd2;
+         end
+      endcase
+   end
+end
+
+always_ff @(posedge c_clk_i, negedge c_reset_sync[1]) begin
+   if (!c_reset_sync[1]) begin
+      c_request_sync <= 3'b000;
+      c_ack <= 1'b0;
+      c_valid <= 1'b0;
+      c_ipc <= '0;
+   end else begin
+      c_request_sync <= {c_request_sync[1:0], ps_request};
+      if (!c_request_sync[2])
+         c_ack <= 1'b0;
+      else if (!c_ack && c_halted_i) begin
+         c_ipc <= ps_payload;
+         c_valid <= 1'b1;
+         c_ack <= 1'b1;
+      end
+   end
+end
+
+assign ps_busy_o = !ps_valid || (ps_state != 2'd0) || (ps_payload != ps_ipc_i);
+assign c_valid_o = c_valid;
+assign c_ipc_o = c_ipc;
 
 endmodule
 
