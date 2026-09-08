@@ -658,7 +658,7 @@ module BRAM_FIFO_DC_2 # (
                                                                                  // signal causes data (on dout) to be read from the FIFO. Must be held
                                                                                  // active-low when rd_rst_busy is active high.
 
-      .rst                       (~wr_rst_ni | flush_i),                         // 1-bit input: Reset: Must be synchronous to wr_clk. The clock(s) can be
+      .rst                       ((~wr_rst_ni | flush_i) & ~wr_rst_busy),          // 1-bit input: Reset: Must be synchronous to wr_clk. The clock(s) can be
                                                                                  // unstable at the time of applying reset, but reset must be released only
                                                                                  // after the clock(s) is/are stable.
 
@@ -668,7 +668,7 @@ module BRAM_FIFO_DC_2 # (
       .wr_clk                    (wr_clk_i),                                     // 1-bit input: Write clock: Used for write operation. wr_clk must be a
                                                                                  // free running clock.
 
-      .wr_en                     (~wr_rst_busy & wr_rst_ni & wr_en_i & push_i)   // 1-bit input: Write Enable: If the FIFO is not full, asserting this
+      .wr_en                     (~wr_rst_busy & wr_rst_ni & ~flush_i & wr_en_i & push_i) // 1-bit input: Write Enable: If the FIFO is not full, asserting this
                                                                                  // signal causes data (on din) to be written to the FIFO. Must be held
                                                                                  // active-low when rst or wr_rst_busy is active high.
    );
