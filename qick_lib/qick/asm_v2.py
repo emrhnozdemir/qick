@@ -177,8 +177,8 @@ class QP2Accel:
         Calc name -> the CTRL field values that select it.  ``adaptive_sweep``
         has ONE datapath, so a calc name is a CTRL preset, not an index.
         Since 2026-08-24 the RTL IGNORES ``reduce_sel`` (CTRL[3:1]) and
-        ``prescale_en`` (CTRL[5]): the only field that changes behaviour is
-        ``estop_en``, plus ``confirm``.  So "shift" and "welford" are the
+        ``prescale_en`` (CTRL[5]): early stopping is selected by ``estop_en``,
+        ``confirm``, ``block_en`` and ``short_confirm``. So "shift" and "welford" are the
         same hardware configuration -- the Welford running-mean pipeline was
         deleted, and "welford" is kept only as a deprecated alias -- and
         "split" differs from them by one bit.  The names are kept because
@@ -377,6 +377,7 @@ _AS_OPS = {
                     Field("prescale_en", 1, 5),
                     Field("estop_en", 1, 6),
                     Field("block_en", 1, 7),
+                    Field("short_confirm", 1, 8),
                     Field("confirm", 3, 17)),
             "dt3": _word("n0"),
             "dt4": _word("n_min"),
@@ -393,13 +394,18 @@ _AS_OPS = {
             "the odd/even test uses a reciprocal threshold: "
             "its threshold is not in this word - it lives in the IP's AXI "
             "register, written by the Adaptive_Sweep driver); "
-            "confirm (consecutive passing checkpoints required to stop; the "
-            "preset sends 2). The checkpoint grid is the doubling grid "
-            "4, 8, 16, ... and is not configurable - CTRL[16:14] held an "
+            "confirm (total consecutive passes required to stop); "
+            "short_confirm=0 checks the doubling grid 4, 8, 16, ... "
+            "and returns the final confirming estimate (default confirm=2). "
+            "short_confirm=1 checks at an eligible power-of-two N, then "
+            "N+2, N+4, ... and returns the saved first-N estimate "
+            "(default confirm=3); it cannot be combined with block_en. "
+            "CTRL[16:14] held an "
             "`nmul` field for the {1,3}/{1,3,5,7} grids until 2026-08-23 and "
             "is now reserved. dt3 = n0 "
             "(running-mean warmup), dt4 = n_min (eligibility floor, any "
-            "value, 0 makes every checkpoint eligible)",
+            "value, 0 makes every checkpoint eligible; short confirmation "
+            "requires its first candidate N to meet this floor)",
     ),
     "GET_STATUS": QP2Op(
         number=3, mnemonic="GET_STATUS", responds=True,
@@ -410,7 +416,8 @@ _AS_OPS = {
         number=4, mnemonic="GET_DIAG", responds=True,
         resp={"dt1": _word("n_used"), "dt2": _word("diag")},
         doc="diag read -> dt1 = n_used (shots folded into the last emitted "
-            "point); dt2 = {nconv_count[15:0], 6'd0, sat, conv, k[4:0], "
+            "estimate, excluding additional short-confirmation shots); "
+            "dt2 = {nconv_count[15:0], 6'd0, sat, conv, k[4:0], "
             "type[2:0]} - decode with AS_DIAG_FIELDS",
     ),
     "RUN_GD": QP2Op(
@@ -418,6 +425,7 @@ _AS_OPS = {
         args={
             "dt1": _word("x0", signed=True),
             "dt2": (Field("use_lut", 1, 0),
+                    Field("movement_guard", 1, 1),
                     Field("lambda", 5, 4),
                     Field("patience", 8, 16)),
             "dt3": _word("min_step"),
@@ -426,11 +434,16 @@ _AS_OPS = {
         resp={"dt1": _word("x_final", signed=True),
               "dt2": (Field("converged", 1, 0),
                       Field("capped", 1, 1),
+                      Field("stalled", 1, 2),
                       Field("iter", 16, 16))},
         doc="gradient-descent search, forward pair P(x+step) - P(x). In "
             "racing mode (use_lut=0) lambda must be >= 1: at 0 the "
             "certification |sum(dp)| > sum(|dp|) >> lambda can never pass "
-            "and x never moves",
+            "and x never moves. movement_guard enables step refinement and "
+            "bounded no-progress stopping in racing GD; stalled is distinct "
+            "from convergence and returns the winning measured probe of the "
+            "final certified race, or the measured current iterate for an "
+            "unresolved race",
     ),
     "RUN_KW": QP2Op(
         number=6, mnemonic="RUN_KW", blocking=True, responds=True,
@@ -521,12 +534,12 @@ AS_DIAG_FIELDS = (
 # status_word, built inline in adaptive_sweep.v (the status_word assign):
 #   {point_idx[15:0], eng_freq_valid, eng_busy, eng_converged, eng_capped,
 #    dest, estop_en, 1'b0, early_stop, warmup_done, 3'd0, mode,
-#    busy, finish_seen, 1'b0}
-# bit 0 was drift_suspect and is now hardwired 0: the drift monitor was the
-# ckdiff test running beside the split stopper, and ckdiff is gone.  Bits 6:4
+#    busy, finish_seen, eng_stalled}
+# Bit 0 reports a guarded GD stall. Bits 6:4
 # (reduce_sel) and 9 (prescale_en) are hardwired 0 as well since the
 # 2026-08-24 rebuild; their Fields stay so unpack_status keeps its keys.
 _AS_STATUS = (
+    Field("stalled", 1, 0),
     Field("finish_seen", 1, 1),
     Field("busy", 1, 2),
     Field("mode", 1, 3),
@@ -555,7 +568,7 @@ ADAPTIVE_SWEEP = QP2Accel(
     # One shared datapath (src/amplitude_calculator.v): 58-bit S and D
     # accumulators, one early_stop_checker, one square_summer.  A calc name is
     # a CTRL preset, not a hardware index -- and since the 2026-08-24 rebuild
-    # only estop_en/confirm survive as live fields (see calc_ctrl above).
+    # reduce_sel and prescale_en are ignored (see calc_ctrl above).
     calcs=("shift", "welford", "split"),
     calc_ctrl={
         "shift":   dict(reduce_sel=1, prescale_en=1, estop_en=0),
@@ -569,7 +582,7 @@ ADAPTIVE_SWEEP = QP2Accel(
         # rebuild.  2026-08-23: the "hsplit" and "quarter" presets (the
         # half- and quarter-octave checkpoint grids) were REMOVED with the
         # m = 3, 5, 7 reciprocal lookup they retired through.  The grid is
-        # the doubling grid, confirm 2, and there is nothing to select.
+        # the doubling grid with confirm 2 unless confirmation_policy='short'.
         "split":   dict(reduce_sel=3, prescale_en=0, estop_en=1, confirm=2),
     },
     # the whole result path is 64 bits wide now, sized for the mean32
@@ -912,6 +925,7 @@ CTRL_BITS = OrderedDict([
     ("estop_hold", (1, 4)),    # 0 emit immediately / 1 freeze and drain
     ("estop_en", (1, 6)),      # arm the split early stop
     ("block_en", (1, 7)),
+    ("short_confirm", (1, 8)), # 0 doubling confirmations / 1 N+2, N+4, ...
     ("confirm", (3, 17)),      # consecutive passing checkpoints needed
 ])
 
@@ -946,7 +960,7 @@ def _accel_contract(accel):
 
 
 #: Bumped whenever the exported shape changes (not when a value changes).
-CONTRACT_VERSION = 3
+CONTRACT_VERSION = 5
 
 
 def qp2_contract():
@@ -996,11 +1010,41 @@ def qp2_contract():
                 "units": "estop_thr is a dimensionless noise/signal ratio in (0, 1]",
             },
             "checkpoints": {
-                "grid": "n = 4, 8, 16, ... (shot_counter watches one rising bit "
-                        "at a time, starting at bit 2)",
-                "exponent_field": "k, the checkpoint log2, reported in "
+                "grid": "candidate n = 4, 8, 16, ...; short confirmation "
+                        "also checks cumulative N+2, N+4, ... after a passing candidate",
+                "exponent_field": "k, the returned estimate's sample-count log2, reported in "
                                   "GET_DIAG dt2 bits 7:3",
                 "cap": "1 << avg_shift shots, avg_shift clamped to 26",
+            },
+            "confirmation_policies": {
+                "enable": "CTRL bit 8 (short_confirm): 0 power_of_two, 1 short",
+                "confirm": "total passing checks required, 1 through 7",
+                "power_of_two": {
+                    "default_confirm": 2,
+                    "schedule": "N, 2N, 4N, ...",
+                    "estimate": "final confirming checkpoint",
+                    "n_min": "gates stopping; earlier passes contribute to the streak",
+                },
+                "short": {
+                    "default_confirm": 3,
+                    "schedule": "N, N+2, N+4, ...; a failed check cancels this candidate",
+                    "estimate": "saved first N samples; n_used and k describe this estimate",
+                    "n_min": "gates the first power-of-two candidate N",
+                    "block_stability": "unsupported; short_confirm and block_en cannot be combined",
+                },
+                "count_semantics": "n_used counts estimator samples, excluding extra short "
+                                   "confirmation acquisitions and discarded pipeline samples",
+            },
+            "gd_movement_guard": {
+                "enable": "RUN_GD dt2 bit 1; default disabled",
+                "supported": "racing GD only (use_lut=0); unsupported raw RTL modes ignore the bit",
+                "min_step": "minimum step and movement floor; certified moves equal to the floor are allowed",
+                "patience": "consecutive no-progress iterations at min_step; default 2, range 1 through 255",
+                "refinement": "halve the step on a reversal cycle, exhausted race, or clipped sub-floor move, down to min_step",
+                "stalled": "RUN_GD response dt2 bit 2 and GET_STATUS bit 0; not convergence",
+                "return": "winning measured probe of the final certified race; "
+                          "measured current iterate for an unresolved race",
+                "certainty": "stalled and capped runs are uncertain; no statistical local-optimum confirmation",
             },
             "block_stability": {
                 "register_bits": 32,
@@ -1104,6 +1148,7 @@ class SweepPlan:
     estop_thr: float = 0.0
     estop_d: int = 0
     confirm: int = 0
+    confirmation_policy: str = "power_of_two"
     block_tol: Optional[int] = None
     avg_requested: int = 0
     avg_rounded: int = 0
@@ -1118,6 +1163,7 @@ class SweepPlan:
     min_step: int = 0
     max_iter: int = 0
     patience: int = 0
+    movement_guard: bool = False
     use_lut: int = 0
     lam: int = 0
     m_min: int = 1
@@ -1334,12 +1380,14 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                n0=None, n_min=None, emit_mode=None,
                estop_thr=None, block_tol=None,
                x0=None, min_step=None, max_iter=None, patience=None,
+               movement_guard=False,
                a_table=None, c_table=None,
                use_lut=None, lambda_=None, m_min=2, m_max=8,
                f_lo=None, f_hi=None,
                result_addr=0, debug=False, count_shots=False,
                dump_log=None, log_addr=None, interrupt=None,
-               early_stop=None, confirm=None, record_points=None, points_addr=None):
+               early_stop=None, confirm=None, confirmation_policy=None,
+               record_points=None, points_addr=None):
     """Validate a sweep declaration and convert it to machine units.
 
     See :meth:`qick.asm_v2.QickProgramV2.adaptive_sweep` for the parameter
@@ -1403,9 +1451,30 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     _require(algorithm in accel.algorithms,
              "accelerator '%s' does not implement algorithm=%r; it implements "
              "%s" % (accel.name, algorithm, list(accel.algorithms)))
+    _require(isinstance(movement_guard, (bool, np.bool_)),
+             "movement_guard must be a boolean")
+    if movement_guard:
+        _require(algorithm == 'gd',
+                 "movement_guard only applies to algorithm='gd'")
+        _require(accel.has_op('RUN_GD')
+                 and 'movement_guard' in accel.op('RUN_GD').field_names(),
+                 "this accelerator does not support the GD movement guard")
     if calc is None:
         calc = accel.calcs[0] if len(accel.calcs) == 1 else "shift"
     calc_fields = accel.calc_fields(calc)
+    _require(confirmation_policy in (None, "power_of_two", "short"),
+             "confirmation_policy must be None, 'power_of_two', or 'short'")
+    confirmation_policy = confirmation_policy or "power_of_two"
+    if confirmation_policy == "short":
+        _require(early_stop,
+                 "confirmation_policy='short' only applies with early_stop=True")
+        _require(accel.has_op('CFG_ACQ')
+                 and 'short_confirm' in accel.op('CFG_ACQ').field_names(),
+                 "this accelerator does not support short confirmation")
+        _require(block_tol is None,
+                 "confirmation_policy='short' does not support block_tol")
+        calc_fields['short_confirm'] = 1
+        calc_fields['confirm'] = 3
     if block_tol is not None:
         _require(early_stop, "block_tol only applies with early_stop=True")
         _require(isinstance(block_tol, Integral) and not isinstance(block_tol, (bool, np.bool_))
@@ -1488,6 +1557,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     plan = SweepPlan(
         name=name, accel=accel, algorithm=algorithm, calc=calc,
         calc_fields=calc_fields, gen_ch=gen_ch, ro_ch=ro_ch, pulse=pulse,
+        confirmation_policy=confirmation_policy,
         ro_cfg=ro_cfg, gen_wave=gen_waves[0], ro_wave=ro_waves[0],
         avg=avg, nsamp=nsamp, mode=mode_bit,
         trig_time=trig_time, shot_period=shot_period,
@@ -1703,8 +1773,8 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                 % (req, d, plan.estop_thr,
                    100.0 * abs(plan.estop_thr - req) / req), stacklevel=3)
         # n_min is an eligibility floor, not an epoch index: any value is
-        # legal, and the first checkpoint at or above it is the first that
-        # may stop. 0 makes every checkpoint eligible.
+        # legal. It gates stopping in power_of_two mode, or the saved first
+        # candidate in short mode. 0 makes every checkpoint eligible.
         plan.n_min = 0 if n_min is None else int(n_min)
         _require(0 <= plan.n_min <= avg,
                  "n_min=%s exceeds avg=%d, so the early stop could never fire "
@@ -1744,6 +1814,9 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         use_lut = bool(a_table is not None or c_table is not None) \
             if use_lut is None else bool(use_lut)
         plan.use_lut = 1 if use_lut else 0
+        _require(not movement_guard or not plan.use_lut,
+                 "movement_guard requires use_lut=False (racing GD)")
+        plan.movement_guard = bool(movement_guard)
 
         f_lo = start if f_lo is None else f_lo
         f_hi = stop if f_hi is None else f_hi
@@ -1796,6 +1869,12 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                  "max_iter must be in [1, 65535], got %s" % (max_iter,))
         plan.max_iter = int(max_iter)
 
+        if plan.movement_guard:
+            patience = 2 if patience is None else patience
+            _require(isinstance(patience, Integral)
+                     and not isinstance(patience, (bool, np.bool_))
+                     and 1 <= patience <= 255,
+                     "movement_guard requires integer patience in [1, 255]")
         patience = 0 if patience is None else int(patience)
         _require(0 <= patience < (1 << 8),
                  "patience must be in [0, 255], got %s" % (patience,))
@@ -3175,9 +3254,10 @@ class AdaptiveSweep(Macro):
         self._seed_wave(asm, plan.ro_wave, plan.ro_x0)
 
         mnemonic = 'RUN_KW' if plan.algorithm == 'kw' else 'RUN_GD'
+        guard_args = {'movement_guard': 1} if plan.movement_guard else {}
         asm.qpb_send(accel, mnemonic, x0=plan.x0, use_lut=plan.use_lut,
                      min_step=plan.min_step, max_iter=plan.max_iter,
-                     patience=plan.patience, **{'lambda': plan.lam})
+                     patience=plan.patience, **{'lambda': plan.lam}, **guard_args)
         asm.qpb_wait_ready(invert=True)
 
         service = self._label(prog, 'service')
@@ -5415,11 +5495,12 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             enabled early stop), not separate pipelines.  ``split`` is the
             repetition-axis early stop: each point accumulates raw shot
             sums, the split test checks convergence at power-of-two
-            checkpoints (4, 8, 16, ...) with a default confirm depth of 2, and the
+            candidates (4, 8, 16, ...) with policy-specific confirmation, and the
             point retires as an exact 32-bit mean divided by the shot count
             it really used. Alternating samples can agree despite slow drift,
             so passing this test does not establish an unbiased mean or a
-            confidence interval. The checkpoint grid is fixed at 4, 8, 16, ...
+            confidence interval. See ``confirmation_policy`` for the check
+            schedule and which measurements contribute to the returned mean.
         gen_ch : int
             Generator channel carrying the drive, already declared.
         ro_ch : int
@@ -5492,10 +5573,10 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             Warmup shots, for the deprecated ``calc="welford"``; it only
             drives the ``warmup_done`` status bit.
         n_min : int
-            Eligibility floor for the split-family calcs - any value, and
-            the first checkpoint at or above it is the first that may stop
-            (0 makes every checkpoint eligible; it does NOT disable the
-            stop).
+            Eligibility floor for early stopping, from 0 through ``avg``.
+            In power-of-two mode the final confirming checkpoint must meet
+            this floor; in short mode the first candidate N must meet it.
+            Zero makes every candidate eligible; it does not disable stopping.
         emit_mode : str
             Early stopping uses ``"immediate"`` with its interrupt handler.
             It is selected automatically; ``"drain"`` is rejected when
@@ -5549,6 +5630,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             Starting frequency for gd/kw (MHz).  Defaults to ``start``.
         min_step : float
             Convergence threshold on the step size (MHz), for gd/kw.
+            With ``movement_guard=True``, this is the minimum step and the
+            movement floor. Certified moves equal to this floor are allowed.
         max_iter : int
             Iteration cap for gd/kw.
         patience : int
@@ -5557,6 +5640,22 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             gates the convergence flag on ``patience != 0``, so a gd/kw
             search left at the default always runs to ``max_iter`` and reports
             itself capped.  Give it 1 or more to let the search stop early.
+            With ``movement_guard=True``, requires an integer in [1, 255],
+            defaults to 2, and counts consecutive no-progress iterations at
+            ``min_step`` before reporting a stall rather than convergence.
+        movement_guard : bool
+            Enable bounded no-progress handling for racing GD only
+            (``algorithm='gd', use_lut=False``). Defaults to False.
+            Refine the step on a reversal cycle, exhausted race or clipped
+            sub-floor move, stop repeated movements below ``min_step``, and
+            avoid duplicate probes. Stalled and capped results are uncertain,
+            without a statistical claim of convergence. Return the winning
+            measured probe when the final race is certified, including when
+            movement is blocked or the step is refined. For an unresolved
+            race, return the measured current iterate. This adds no final
+            measurements and does not select a historical maximum. Requires
+            matching firmware supporting RUN_GD bit 1 and the stalled
+            response bit.
         a_table, c_table : list of float
             Step and probe-width schedules (MHz), for gd/kw in LUT mode.
             These load over AXI-Lite through the ``Adaptive_Sweep``
@@ -5602,10 +5701,24 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             Requires a dedicated readout trigger and matching firmware with
             PB15 selective trigger cancellation. Multiple stages share one
             interrupt vector, dispatched using the active stage's register.
+        confirmation_policy : str or None
+            ``None`` or ``"power_of_two"`` keeps the legacy policy: check at
+            N, 2N, 4N, ... and return the final confirming checkpoint's mean.
+            ``"short"`` checks at an eligible power-of-two N, then at N+2,
+            N+4, ... using cumulative measurements. Once all checks pass,
+            return the saved mean from the first N samples. A failed check
+            cancels that candidate; search resumes at later power-of-two
+            candidates. ``n_min`` gates the first candidate N in short mode.
+            Short confirmation requires ``early_stop=True`` and firmware
+            with CTRL bit 8 support; it cannot be combined with ``block_tol``.
         confirm : int
-            Consecutive passing checkpoints, from 1 through 7. ``n_min`` gates
-            stopping; earlier passing checkpoints contribute to the streak.
-            Only accepted with ``early_stop=True``; default 2.
+            Total consecutive passing checks, from 1 through 7, including
+            the first candidate. Only accepted with ``early_stop=True``.
+            Defaults to 2 for ``"power_of_two"`` and 3 for ``"short"``.
+            Thus short confirmation with confirm=3 requires N, N+2 and N+4,
+            while confirm=1 returns a passing candidate immediately.
+            In power-of-two mode ``n_min`` gates stopping and earlier passes
+            contribute to the streak. In short mode no pre-n_min passes count.
         block_tol : int or None
             Also require agreement between the first and second halves of
             the samples at each doubling checkpoint. The tolerance is the
@@ -5617,6 +5730,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             The first complete block comparison is at 8 shots, so confirm=2
             cannot stop before 16. Only accepted with ``early_stop=True``.
             Requires firmware with CTRL bit 7 and AXI target 4 support.
+            Not supported with ``confirmation_policy="short"``.
         interrupt : bool
             Deprecated compatibility alias for ``early_stop``.
         Raises
@@ -5725,17 +5839,23 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             ``threshold`` : float, ``threshold_encoded`` : int
                 Realized early-stop noise/signal ratio and the 16-bit
                 reciprocal D actually written to the IP (split calcs only).
+            ``confirmation_policy`` : str, ``n_used_semantics`` : str
+                Early-stop confirmation schedule and meaning of the retained
+                sample counts. Short confirmation returns the first candidate's
+                estimate; its additional confirmation acquisitions are excluded.
             ``status`` : int and its decoded flags
                 On accelerators with a status read.
             ``n_used`` : int
                 GET_DIAG shot count for the LAST point the accelerator
-                emitted, with ``debug=True``.  Not necessarily the winner.
+                emitted, with ``debug=True``. Not necessarily the winner.
+                Counts estimator samples, excluding extra short-confirmation shots.
             ``points`` : dict of arrays, ``retained_shots_total`` : int,
             ``retained_shots`` : int
                 With ``record_points``: the per-point verdicts, total samples
                 retained in estimates, and the winning point's retained count.
                 ``stop_log`` and ``accelerator_shots`` are compatibility aliases.
-                These counts exclude discarded in-flight samples and cannot
+                These counts exclude extra short-confirmation acquisitions and
+                discarded in-flight samples and cannot
                 measure wall time or physical triggers. Fixed grids return the
                 known full-schedule retained counts without point records.
             ``observed_shots`` : int
@@ -5781,8 +5901,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                                        start_word=words[RESULT_START])
             out['stop_log'] = log
             out['points'] = log
-            # the per-point log is the only place the *realized* shot counts
-            # are recorded, so these two are available only alongside it
+            # The per-point log records retained estimate counts, excluding
+            # additional short-confirmation shots and pipeline overshoot.
             out['accelerator_shots'] = int(log['n_used'].sum())
             out['retained_shots_total'] = out['accelerator_shots']
             idx = out.get('frequency_index')
@@ -5821,8 +5941,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         Returns
         -------
         dict of numpy arrays, one entry per grid point
-            ``n_used`` (shots actually averaged: the stop checkpoint 2**k,
-            or the averager cap), ``converged`` (the early stop fired),
+            ``n_used`` (shots in the returned estimate: 2**k, or the averager
+            cap; short confirmation uses the saved candidate's k and excludes
+            its additional confirmation acquisitions), ``converged`` (the early stop fired),
             ``capped`` (ran to the cap without converging), ``saturated``,
             and ``freq_mhz`` (the grid frequency of each entry).
         """
@@ -6006,7 +6127,11 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                 # for gd/kw the status slot carries the RUN response's second word
                 out['converged'] = bool(words[RESULT_STATUS] & 0x1)
                 out['capped'] = bool((words[RESULT_STATUS] >> 1) & 0x1)
+                out['stalled'] = bool((words[RESULT_STATUS] >> 2) & 0x1)
                 out['iterations'] = (words[RESULT_STATUS] >> 16) & 0xFFFF
+                if plan.movement_guard:
+                    out['uncertain'] = bool(out['done']
+                                            and (out['stalled'] or out['capped']))
             elif plan.accel.status_bits:
                 out.update(plan.accel.unpack_status(words[RESULT_STATUS]))
         if plan.writes_diag:
@@ -6023,13 +6148,19 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         if plan.estop_d:
             out['threshold'] = plan.estop_thr
             out['threshold_encoded'] = plan.estop_d
+            out['confirmation_policy'] = plan.confirmation_policy
+            out['n_used_semantics'] = (
+                "first_candidate_samples_on_convergence_else_cap"
+                if plan.confirmation_policy == 'short'
+                else "final_checkpoint_samples_or_cap")
             out['early_stop_method'] = ('odd_even_block' if plan.block_tol is not None
                                         else 'odd_even')
             out['block_tol'] = plan.block_tol
         if not out['done']:
             out['stop_reason'] = 'incomplete'
         elif plan.handshake:
-            out['stop_reason'] = ('converged' if out.get('converged')
+            out['stop_reason'] = ('stalled' if out.get('stalled')
+                                  else 'converged' if out.get('converged')
                                   else 'max_iterations' if out.get('capped')
                                   else 'finished')
         else:
@@ -6106,6 +6237,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             cfg['min_step_mhz'] = plan.min_step_mhz
             cfg['max_iter'] = plan.max_iter
             cfg['patience'] = plan.patience
+            cfg['movement_guard'] = plan.movement_guard
             cfg['use_lut'] = bool(plan.use_lut)
             if not plan.use_lut:
                 cfg['lambda'] = plan.lam
@@ -6130,6 +6262,11 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             cfg['estop_threshold_requested'] = plan.estop_thr_requested
             cfg['n_min'] = plan.n_min
             cfg['confirm'] = plan.confirm
+            cfg['confirmation_policy'] = plan.confirmation_policy
+            cfg['n_used_semantics'] = (
+                "first_candidate_samples_on_convergence_else_cap"
+                if plan.confirmation_policy == 'short'
+                else "final_checkpoint_samples_or_cap")
             cfg['early_stop_method'] = ('odd_even_block' if plan.block_tol is not None
                                         else 'odd_even')
             cfg['block_tol'] = plan.block_tol
@@ -6156,9 +6293,10 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         if result is not None:
             for key in ('freq', 'freq_word', 'frequency_index', 'done',
                         'stop_reason', 'threshold', 'threshold_encoded',
+                        'confirmation_policy', 'n_used_semantics',
                         'retained_shots', 'accelerator_shots', 'retained_shots_total',
                         'observed_shots', 'n_used', 'status', 'converged',
-                        'capped', 'iterations'):
+                        'capped', 'stalled', 'uncertain', 'iterations'):
                 if key in result:
                     res[key] = result[key]
             if 'stop_log' in result:
@@ -6247,6 +6385,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                              % (cfg['probe_step_mhz'], cfg['min_step_mhz'])))
             lines.append(row("iteration cap", "%d (patience %d)"
                              % (cfg['max_iter'], cfg['patience'])))
+            if cfg['movement_guard']:
+                lines.append(row("movement guard", "enabled; stalls are uncertain"))
 
         shots = "max %d per point (avg_shift %d)" % (
             cfg['max_shots_per_point'], cfg['avg_shift'])
@@ -6263,6 +6403,13 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                              % (cfg['estop_threshold'],
                                 cfg['estop_threshold_encoded'], cfg['n_min'],
                                 cfg['confirm'], cfg['emit_mode'])))
+            policy = cfg.get('confirmation_policy', 'power_of_two')
+            lines.append(row("confirmation policy", policy))
+            if policy == 'short':
+                lines.append(row("returned estimate",
+                                 "first passing candidate N; extra confirmation shots excluded"))
+            else:
+                lines.append(row("returned estimate", "final confirming checkpoint"))
         lines.append(row("redirect",
                          ("enabled -> %s" % (cfg['redirect_landing_label'],))
                          if cfg.get('redirect_landing_label')

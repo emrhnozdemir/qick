@@ -17,6 +17,7 @@ module amplitude_calculator(
   input estop_hold_i,
   input [15:0] threshold_i,
   input block_en_i,
+  input short_confirm_i,
   input [31:0] block_tol_i,
   input [2:0] confirm_i,
 
@@ -118,6 +119,7 @@ module amplitude_calculator(
     .n_min_i(n_min_i),
     .threshold_i(threshold_i),
     .block_en_i(block_en_i),
+    .short_confirm_i(short_confirm_i),
     .block_tol_i(block_tol_i),
     .confirm_i(confirm_i),
     .hold_i(estop_hold_i),

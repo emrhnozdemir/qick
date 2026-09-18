@@ -52,6 +52,7 @@ module tb_amplitude_calculator;
     .estop_hold_i     (estop_hold_i),
     .threshold_i      (threshold_i),
     .block_en_i       (block_en_i),
+    .short_confirm_i  (1'b0),
     .block_tol_i      (block_tol_i),
     .confirm_i        (confirm_i),
     .warmup_done_o    (warmup_done_o),

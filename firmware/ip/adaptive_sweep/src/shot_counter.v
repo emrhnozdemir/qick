@@ -20,6 +20,8 @@ module shot_counter(
 
   output check_o,
   output [4:0] check_exponent_o,
+  output short_check_o,
+  output [31:0] sample_count_o,
 
   output retire_o,
   output stopping_o,
@@ -62,6 +64,10 @@ module shot_counter(
 
   assign check_o = folding & watched_bit & ~previous_bit & ~at_cap & enable_i;
   assign check_exponent_o = check_bit;
+  // Speculative even checkpoints preserve N+2/N+4 while N is in flight.
+  assign short_check_o = folding & ~at_cap & enable_i &
+                         (shot_number >= 32'd4) & ~shot_number[0];
+  assign sample_count_o = shot_number;
 
   assign acc_first_o = (shot_count == 0);
   assign acc_enable_o = folding;

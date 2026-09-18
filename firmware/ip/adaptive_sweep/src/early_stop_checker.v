@@ -12,6 +12,7 @@ module early_stop_checker(
   input [31:0] n_min_i,
   input [15:0] threshold_i,
   input block_en_i,
+  input short_confirm_i,
   input [31:0] block_tol_i,
   input [2:0] confirm_i,
   input hold_i,
@@ -38,6 +39,8 @@ module early_stop_checker(
 
   wire check;
   wire [4:0] check_exponent;
+  wire short_check;
+  wire [31:0] sample_count;
   wire retire;
   wire stopping;
   wire [4:0] retire_shift;
@@ -45,6 +48,19 @@ module early_stop_checker(
   wire stop;
   wire [4:0] stop_exponent;
   wire saturated;
+  wire legacy_stop;
+  wire [4:0] legacy_exponent;
+  wire short_stop;
+  wire [4:0] short_exponent;
+  wire signed [57:0] short_snapshot_i;
+  wire signed [57:0] short_snapshot_q;
+  reg short_mode;
+  always @(posedge clk) begin
+    if (!rst_n) short_mode <= 0;
+    else if (arm_i) short_mode <= short_confirm_i;
+  end
+  assign stop = ~arm_i & (short_mode ? short_stop : legacy_stop);
+  assign stop_exponent = short_mode ? short_exponent : legacy_exponent;
 
   wire magnitude_valid;
   wire [58:0] signal_magnitude;
@@ -71,6 +87,8 @@ module early_stop_checker(
     .acc_subtract_o(acc_subtract_o),
     .check_o(check),
     .check_exponent_o(check_exponent),
+    .short_check_o(short_check),
+    .sample_count_o(sample_count),
     .retire_o(retire),
     .stopping_o(stopping),
     .emit_o(emit_o),
@@ -118,9 +136,21 @@ module early_stop_checker(
     .block_magnitude_i(block_magnitude),
     .block_valid_i(block_valid),
     .exponent_i(magnitude_exponent),
-    .stop_o(stop),
-    .stop_exponent_o(stop_exponent),
+    .stop_o(legacy_stop),
+    .stop_exponent_o(legacy_exponent),
     .saturated_o(saturated)
+  );
+
+  short_confirmation short_confirm(
+    .clk(clk), .rst_n(rst_n), .arm_i(arm_i),
+    .enable_i(enable_i & short_confirm_i), .block_en_i(block_en_i),
+    .threshold_i(threshold_i), .n_min_i(n_min_i), .confirm_i(confirm_i),
+    .check_i(short_check), .power_check_i(check),
+    .power_exponent_i(check_exponent), .sample_count_i(sample_count),
+    .sum_i_i(sum_i_i), .sum_q_i(sum_q_i),
+    .diff_i_i(diff_i_i), .diff_q_i(diff_q_i),
+    .stop_o(short_stop), .stop_exponent_o(short_exponent),
+    .snapshot_i_o(short_snapshot_i), .snapshot_q_o(short_snapshot_q)
   );
 
   reg signed [57:0] retire_num_i;
@@ -137,8 +167,8 @@ module early_stop_checker(
     end else begin
       retire_valid <= retire;
       if (retire) begin
-        retire_num_i <= stopping ? snapshot_i : sum_i_i;
-        retire_num_q <= stopping ? snapshot_q : sum_q_i;
+        retire_num_i <= stopping ? (short_mode ? short_snapshot_i : snapshot_i) : sum_i_i;
+        retire_num_q <= stopping ? (short_mode ? short_snapshot_q : snapshot_q) : sum_q_i;
         retire_window <= retire_shift;
       end
     end

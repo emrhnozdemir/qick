@@ -51,6 +51,7 @@ module register_bank(
   output estop_hold_o,
   output estop_en_o,
   output block_en_o,
+  output short_confirm_o,
   output [2:0] confirm_o,
 
   output step_lut_write_o,
@@ -238,6 +239,7 @@ module register_bank(
   assign estop_hold_o = ctrl[4];
   assign estop_en_o = ctrl[6];
   assign block_en_o = ctrl[7];
+  assign short_confirm_o = ctrl[8];
   assign confirm_o = ctrl[19:17];
 
   always @(posedge clk) begin

@@ -95,6 +95,7 @@ module adaptive_sweep (
   wire estop_hold;
   wire estop_en;
   wire block_en;
+  wire short_confirm;
   wire [2:0] cfg_confirm;
 
   register_bank registers(
@@ -144,6 +145,7 @@ module adaptive_sweep (
     .estop_hold_o(estop_hold),
     .estop_en_o(estop_en),
     .block_en_o(block_en),
+    .short_confirm_o(short_confirm),
     .confirm_o(cfg_confirm),
     .step_lut_write_o(step_lut_write),
     .step_lut_addr_o(step_lut_addr),
@@ -182,6 +184,7 @@ module adaptive_sweep (
   wire eng_done;
   wire eng_converged;
   wire eng_capped;
+  wire eng_stalled;
   wire [31:0] eng_x;
   wire [15:0] eng_iter;
   wire [15:0] eng_pairs;
@@ -230,7 +233,7 @@ module adaptive_sweep (
                         search_mode,
                         busy,
                         finish_seen,
-                        1'b0};
+                        (dest_r & eng_stalled)};
 
   (* MARK_DEBUG = "TRUE" *) reg res_pend;
 
@@ -258,7 +261,7 @@ module adaptive_sweep (
       qtag_vld_o <= 1'b1;
     end else if (eng_done) begin
       qtag_dt1_o <= eng_x;
-      qtag_dt2_o <= {eng_iter, 14'd0, eng_capped, eng_converged};
+      qtag_dt2_o <= {eng_iter, 13'd0, eng_stalled, eng_capped, eng_converged};
       qtag_vld_o <= 1'b1;
     end else if (clr_result) begin
       qtag_vld_o <= 1'b0;
@@ -375,6 +378,7 @@ module adaptive_sweep (
     .estop_hold_i      (estop_hold),
     .threshold_i       (threshold),
     .block_en_i        (block_en),
+    .short_confirm_i   (short_confirm),
     .block_tol_i       (block_tol),
     .confirm_i         (cfg_confirm),
     .warmup_done_o     (ac_warmup_done),
@@ -407,6 +411,7 @@ module adaptive_sweep (
     .start_i           (run_gdkw),
     .two_sided_i       (qtag_op_i == 5'd6),
     .scheduled_i       (qtag_dt2_i[0]),
+    .movement_guard_i  (qtag_dt2_i[1]),
     .dip_i             (search_mode),
     .x0_i              (qtag_dt1_i),
     .f_lo_i            (cfg_flo),
@@ -436,6 +441,7 @@ module adaptive_sweep (
     .done_o            (eng_done),
     .converged_o       (eng_converged),
     .capped_o          (eng_capped),
+    .stalled_o         (eng_stalled),
     .x_o               (eng_x),
     .iteration_o       (eng_iter),
     .pairs_o           (eng_pairs),

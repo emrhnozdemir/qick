@@ -7,6 +7,7 @@ module gradient_engine (
   input start_i,
   input two_sided_i,
   input scheduled_i,
+  input movement_guard_i,
   input dip_i,
   input [31:0] x0_i,
   input [31:0] f_lo_i,
@@ -39,6 +40,7 @@ module gradient_engine (
   (* MARK_DEBUG = "TRUE" *) output reg done_o,
   (* MARK_DEBUG = "TRUE" *) output reg converged_o,
   (* MARK_DEBUG = "TRUE" *) output reg capped_o,
+  output reg stalled_o,
   output [31:0] x_o,
   output [15:0] iteration_o,
   output [15:0] pairs_o,
@@ -46,12 +48,14 @@ module gradient_engine (
 );
 
   localparam [3:0] S_IDLE = 4'd0, S_PAIR_INIT = 4'd1, S_PRESENT_A = 4'd2, S_MEASURE_A = 4'd3, S_PRESENT_B = 4'd4, S_MEASURE_B = 4'd5, S_DECIDE = 4'd6, S_STEP = 4'd7, S_TIE = 4'd8, S_CONVERGE = 4'd9, S_DONE = 4'd10, S_DIFFERENCE = 4'd11, S_CERTIFY = 4'd12;
+  localparam [3:0] S_DUPLICATE = 4'd13;
 
   (* MARK_DEBUG = "TRUE" *) reg [3:0] state;
   reg [3:0] next_state;
 
   (* MARK_DEBUG = "TRUE" *) reg two_sided;
   (* MARK_DEBUG = "TRUE" *) reg scheduled;
+  reg movement_guard;
   (* MARK_DEBUG = "TRUE" *) reg dip;
   (* MARK_DEBUG = "TRUE" *) reg [31:0] f_lo;
   (* MARK_DEBUG = "TRUE" *) reg [31:0] f_hi;
@@ -64,6 +68,12 @@ module gradient_engine (
   (* MARK_DEBUG = "TRUE" *) reg [4:0] lambda;
 
   (* MARK_DEBUG = "TRUE" *) reg [31:0] x;
+  reg [31:0] measured_x;
+  reg [31:0] previous_x;
+  reg previous_valid;
+  reg [7:0] stall_streak;
+  wire guard_requested = movement_guard_i & ~scheduled_i & ~two_sided_i;
+  wire [31:0] initial_floor = (min_step_i == 0) ? 32'd1 : min_step_i;
   (* MARK_DEBUG = "TRUE" *) reg [63:0] power_a;
   (* MARK_DEBUG = "TRUE" *) reg [63:0] power_b;
 
@@ -76,13 +86,15 @@ module gradient_engine (
     .y_o(initial_x)
   );
 
-  assign x_o = x;
+  // Return a measured frequency, including the better measured endpoint when
+  // the guard suppresses a certified move. No extra result acquisition is needed.
+  assign x_o = movement_guard ? measured_x : x;
 
   wire [15:0] iteration;
   wire [15:0] pair_count;
 
   wire iteration_clear = (state == S_IDLE) & start_i;
-  wire iteration_enable = (state == S_STEP) | (state == S_TIE);
+  wire iteration_enable = (state == S_STEP) | (state == S_TIE) | (state == S_DUPLICATE);
   wire pair_clear = (state == S_PAIR_INIT);
   wire pair_enable = (state == S_CERTIFY);
 
@@ -153,6 +165,7 @@ module gradient_engine (
 
   wire [31:0] probe_first = (two_sided | (probe_high == x)) ? probe_low : x;
   wire [31:0] probe_second = probe_high;
+  wire duplicate_probes = movement_guard & (probe_first == probe_second);
 
   wire signed [64:0] power_delta;
   wire [64:0] power_delta_magnitude;
@@ -265,6 +278,21 @@ module gradient_engine (
 
   wire step_below_min = (step_size < min_step);
 
+  // Compare the movement after DDS-word quantization and range clipping.
+  // A certified move equal to the floor remains useful on a slope.
+  wire [31:0] move_distance = (next_x[31:0] >= x) ?
+                              (next_x[31:0] - x) : (x - next_x[31:0]);
+  wire tiny_move = (move_distance < min_step);
+  wire return_cycle = previous_valid & (next_x[31:0] == previous_x) & (next_x[31:0] != x);
+  wire guard_block_step = movement_guard & (tiny_move | return_cycle);
+  wire guard_no_progress = movement_guard & ((state == S_TIE) |
+                            ((state == S_STEP) & (tiny_move | return_cycle)));
+  wire guard_refine = guard_no_progress & (step > min_step);
+  wire guard_stall_hit = guard_no_progress & (step <= min_step);
+  wire [31:0] half_step = step >> 1;
+  wire [31:0] refined_step = (half_step < min_step) ? min_step : half_step;
+  wire [8:0] next_stall_streak = {1'b0, stall_streak} + 9'd1;
+
   wire patience_clear = (state == S_IDLE) & start_i;
   wire patience_step = (state == S_STEP) | (state == S_TIE);
   wire patience_hit = (state == S_TIE) ? 1'b1 : (scheduled & step_below_min);
@@ -299,7 +327,7 @@ module gradient_engine (
         next_state = freq_ack_i ? S_MEASURE_A : S_PRESENT_A;
 
       S_MEASURE_A:
-        next_state = amp_valid_i ? S_PRESENT_B : S_MEASURE_A;
+        next_state = amp_valid_i ? (duplicate_probes ? S_DUPLICATE : S_PRESENT_B) : S_MEASURE_A;
 
       S_PRESENT_B:
         next_state = freq_ack_i ? S_MEASURE_B : S_PRESENT_B;
@@ -330,8 +358,11 @@ module gradient_engine (
       S_TIE:
         next_state = S_CONVERGE;
 
+      S_DUPLICATE:
+        next_state = S_CONVERGE;
+
       S_CONVERGE: begin
-        if (patience_converged)
+        if (movement_guard ? stalled_o : patience_converged)
           next_state = S_DONE;
         else if (iteration >= max_iteration)
           next_state = S_DONE;
@@ -351,6 +382,7 @@ module gradient_engine (
     if (!rst_n) begin
       two_sided <= 0;
       scheduled <= 0;
+      movement_guard <= 0;
       dip <= 0;
       f_lo <= 0;
       f_hi <= 32'hFFFFFFFF;
@@ -364,16 +396,19 @@ module gradient_engine (
     end else if ((state == S_IDLE) & start_i) begin
       two_sided <= two_sided_i;
       scheduled <= scheduled_i;
+      movement_guard <= guard_requested;
       dip <= dip_i;
       f_lo <= f_lo_i;
       f_hi <= f_hi_i;
-      step <= step_i;
-      min_step <= min_step_i;
+      step <= (guard_requested & (step_i < initial_floor)) ? initial_floor : step_i;
+      min_step <= guard_requested ? initial_floor : min_step_i;
       max_iteration <= (max_iteration_i == 16'd0) ? 16'd1 : max_iteration_i;
       pair_min <= (pair_min_i == 16'd0) ? 16'd1 : (pair_min_i > 16'd255) ? 16'd255 : pair_min_i;
       pair_max <= (pair_max_i == 16'd0) ? 16'd1 : (pair_max_i > 16'd255) ? 16'd255 : pair_max_i;
-      patience <= patience_i;
+      patience <= (guard_requested & (patience_i == 0)) ? 8'd1 : patience_i;
       lambda <= lambda_i;
+    end else if (guard_refine) begin
+      step <= refined_step;
     end
   end
 
@@ -382,8 +417,45 @@ module gradient_engine (
       x <= 0;
     else if ((state == S_IDLE) & start_i)
       x <= initial_x;
-    else if (state == S_STEP)
+    else if ((state == S_STEP) & ~guard_block_step)
       x <= next_x[31:0];
+  end
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      measured_x <= 0;
+      previous_x <= 0;
+      previous_valid <= 0;
+      stall_streak <= 0;
+    end else if ((state == S_IDLE) & start_i) begin
+      measured_x <= initial_x;
+      previous_x <= initial_x;
+      previous_valid <= 0;
+      stall_streak <= 0;
+    end else if (movement_guard) begin
+      if (((state == S_MEASURE_A) & amp_valid_i & (probe_first == x)) |
+          ((state == S_MEASURE_B) & amp_valid_i & (probe_second == x)))
+        measured_x <= x;
+
+      // S_STEP in guarded mode is reached only by a certified race. Select
+      // its winning endpoint even if a tiny move or cycle keeps x unchanged.
+      // This avoids returning a known worse incumbent at a clipped boundary.
+      if (state == S_STEP)
+        measured_x <= step_positive ? probe_second : probe_first;
+
+      if (guard_refine) begin
+        previous_valid <= 0;
+        stall_streak <= 0;
+      end else if (guard_stall_hit) begin
+        // Keep cycle history while holding x, so the same return move is
+        // still recognized on the next independently measured iteration.
+        stall_streak <= next_stall_streak[7:0];
+      end else if (state == S_STEP) begin
+        previous_x <= x;
+        previous_valid <= 1;
+        stall_streak <= 0;
+      end
+    end
   end
 
   always @(posedge clk) begin
@@ -440,13 +512,18 @@ module gradient_engine (
     if (!rst_n) begin
       converged_o <= 0;
       capped_o <= 0;
+      stalled_o <= 0;
     end else if ((state == S_IDLE) & start_i) begin
       converged_o <= 0;
       capped_o <= 0;
+      stalled_o <= 0;
+    end else if (movement_guard & ((state == S_DUPLICATE) |
+                 (guard_stall_hit & (next_stall_streak >= {1'b0, patience})))) begin
+      stalled_o <= 1;
     end else if (state == S_CONVERGE) begin
-      if (patience_converged)
+      if (~movement_guard & patience_converged)
         converged_o <= 1;
-      else if (iteration >= max_iteration)
+      else if (~stalled_o & (iteration >= max_iteration))
         capped_o <= 1;
     end
   end

@@ -293,15 +293,18 @@ module tb_adaptive_sweep;
     end
   end
 
-  task automatic run_probes(input integer avg, input integer isum, input integer guardmax);
+  task automatic run_probes(input integer avg, input integer isum, input integer guardmax,
+                            input integer rearm = 0);
     integer g;
     begin
       g = 0;
       while (!qtag_rdy_o && (g < guardmax)) begin
         qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
-        if (!qtag_rdy_o && qtag_dt2_o[0])
+        if (!qtag_rdy_o && qtag_dt2_o[0]) begin
+          if (rearm)
+            qp2_op(5'd14, 0, 0, 0, 0);
           feed_point(avg, isum, 0);
-        else
+        end else
           g = g;
         g = g + 1;
       end
@@ -965,6 +968,118 @@ module tb_adaptive_sweep;
     check32("BC3 clearing bit7 restores checkpoint4", dut.ac_n_used, 4);
     check32("BC3 legacy emits one interrupt", block_irq_count - block_irq_before, 1);
     check32("BC3 legacy retains first-four mean", dut.ac_mean_i, 1000);
+
+    // CTRL[8] selects short confirmation through the actual QP register
+    // path. Three passes at 4/6/8 retain the first-four sample estimate,
+    // even while later paired samples have a very different mean.
+    qp2_op(5'd2, NSAMP, 32'h0006_0146, 0, 4);
+    check32("SC1 QP CTRL bit8 enables short confirmation", {31'd0, dut.short_confirm}, 1);
+    check32("SC1 QP CTRL configures three total passes", {29'd0, dut.cfg_confirm}, 3);
+    qp2_op(5'd14, 0, 0, 0, 0);
+    qp2_op(5'd0, START_FREQ, STEP, 1, 6);
+    block_irq_before = block_irq_count;
+    qp2_op(5'd1, 0, 0, 0, 0);
+    feed_block_step;
+    wait_finish;
+    check32("SC1 short returns saved N4 after checks6/8", dut.ac_n_used, 4);
+    check32("SC1 short emits one actual accelerator interrupt", block_irq_count - block_irq_before, 1);
+    check32("SC1 short retains first-four I mean", dut.ac_mean_i, 1000);
+    check32("SC1 short retains first-four Q mean", dut.ac_mean_q, -500);
+    check64("SC1 short computes power from saved mean", dut.u_peak_finder.best_amplitude, 64'd1250000);
+    qp2_op(5'd10, 0, 0, 0, 0);
+    qp2_op(5'd4, 0, 0, 0, 0);
+    check32("SC1 QP reports saved N", qtag_dt1_o, 4);
+    check32("SC1 QP reports candidate exponent", qtag_dt2_o, 32'h0000_0110);
+
+    // The same mode must be selectable through the asynchronous AXI
+    // target3 CTRL route, not just through the QP measurement operation.
+    qp2_op(5'd2, NSAMP, 32'h0006_0046, 0, 4);
+    check32("SC2 baseline CTRL clears short bit", {31'd0, dut.short_confirm}, 0);
+    axi_tbl_write(5'd3, 0, 32'h0006_0146, 0);
+    check32("SC2 AXI target3 sets short bit", {31'd0, dut.short_confirm}, 1);
+    check32("SC2 AXI target3 preserves three passes", {29'd0, dut.cfg_confirm}, 3);
+    qp2_op(5'd14, 0, 0, 0, 0);
+    qp2_op(5'd0, START_FREQ, STEP, 1, 6);
+    block_irq_before = block_irq_count;
+    qp2_op(5'd1, 0, 0, 0, 0);
+    feed_block_step;
+    wait_finish;
+    check32("SC2 AXI short returns saved N4", dut.ac_n_used, 4);
+    check32("SC2 AXI short emits one actual interrupt", block_irq_count - block_irq_before, 1);
+    check32("SC2 AXI short retains first-four I mean", dut.ac_mean_i, 1000);
+    check32("SC2 AXI short retains first-four Q mean", dut.ac_mean_q, -500);
+
+    // Movement guard uses RUN_GD bit1 and reports uncertainty in result bit2.
+    // A flat response refines STEP -> STEP/2 -> STEP/4, then requires two
+    // fresh exhausted races at the floor before stopping.
+    qp2_op(5'd10, 0, 0, 0, 0);
+    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 0, 0);
+    qp2_op(5'd0, START_FREQ, STEP, N_POINTS, 1);
+    qp2_op(5'd9, 0, 32'hffff_ffff, 1, 2);
+    search_before = search_valid_cnt;
+    qp2_op(5'd5, START_FREQ, 32'h0002_0012, STEP >> 2, 64);
+    run_probes(2, 100 * 128, 800);
+    check32("MG1 guarded flat result is measured seed", qtag_dt1_o, START_FREQ);
+    check32("MG1 stalled, not converged or capped", qtag_dt2_o, 32'h0004_0004);
+    check32("MG1 four iterations consume sixteen probes", search_valid_cnt - search_before, 16);
+    check32("MG1 floor is reached", dut.u_gradient_engine.step, STEP >> 2);
+    qp2_op(5'd7, 0, 0, 0, 0);
+    check32("MG1 late frequency poll preserves result", qtag_dt2_o, 32'h0004_0004);
+    qp2_op(5'd3, 0, 0, 0, 0);
+    check32("MG1 late status poll preserves result", qtag_dt2_o, 32'h0004_0004);
+    qp2_op(5'd10, 0, 0, 0, 0);
+    qp2_op(5'd3, 0, 0, 0, 0);
+    check32("MG1 live stalled status bit0", {31'd0, qtag_dt1_o[0]}, 1);
+    check32("MG1 deprecated status bit9 remains clear", {31'd0, qtag_dt1_o[9]}, 0);
+
+    // A cap after a negative update must return the sampled current iterate.
+    qp2_op(5'd10, 0, 0, 0, 0);
+    qp2_op(5'd9, 0, 32'hffff_ffff, 1, 2);
+    qp2_op(5'd5, START_FREQ, 32'h0002_0012, STEP >> 2, 1);
+    run_probes_ab(2, 200 * 128, 100 * 128, 400);
+    check32("MG2 cap returns measured frequency", qtag_dt1_o, START_FREQ);
+    check32("MG2 clears prior stalled flag and reports cap", qtag_dt2_o, 32'h0001_0002);
+
+    // A singleton range acquires one estimate, with no duplicate B request.
+    qp2_op(5'd10, 0, 0, 0, 0);
+    qp2_op(5'd9, START_FREQ, START_FREQ, 1, 2);
+    search_before = search_valid_cnt;
+    qp2_op(5'd5, START_FREQ, 32'h0002_0012, 1, 64);
+    run_probes(2, 100 * 128, 400);
+    check32("MG3 singleton measured result", qtag_dt1_o, START_FREQ);
+    check32("MG3 singleton is stalled after one iteration", qtag_dt2_o, 32'h0001_0004);
+    check32("MG3 singleton consumes one probe", search_valid_cnt - search_before, 1);
+
+    // A later grid run must not inherit the sticky engine's stalled status.
+    qp2_op(5'd10, 0, 0, 0, 0);
+    qp2_op(5'd0, START_FREQ, STEP, 1, 1);
+    qp2_op(5'd1, 0, 0, 0, 0);
+    feed_point(2, 100 * 128, 0);
+    wait_finish;
+    qp2_op(5'd10, 0, 0, 0, 0);
+    qp2_op(5'd3, 0, 0, 0, 0);
+    check32("MG3 grid status masks prior stalled engine", {31'd0, qtag_dt1_o[0]}, 0);
+
+    // Clearing the command bit restores the pre-guard tie policy.
+    qp2_op(5'd10, 0, 0, 0, 0);
+    qp2_op(5'd9, 0, 32'hffff_ffff, 1, 2);
+    qp2_op(5'd5, START_FREQ, 32'h0002_0010, STEP >> 2, 64);
+    run_probes(2, 100 * 128, 400);
+    check32("MG4 legacy tie behavior preserved", qtag_dt2_o, 32'h0002_0001);
+    check32("MG4 stale guard flag cleared", {31'd0, dut.eng_stalled}, 0);
+
+    // The movement guard also accepts early-stopped per-frequency estimates
+    // from the prior N/N+2/N+4 policy through the same acquisition interface.
+    qp2_op(5'd10, 0, 0, 0, 0);
+    qp2_op(5'd2, NSAMP, 32'h0006_0146, 0, 4);
+    qp2_op(5'd14, 0, 0, 0, 0);
+    qp2_op(5'd0, START_FREQ, STEP, 1, 6);
+    search_before = search_valid_cnt;
+    qp2_op(5'd5, START_FREQ, 32'h0002_0012, STEP, 64);
+    run_probes(64, 1000, 800, 1);
+    check32("MG5 short-confirmed probes produce stalled result", qtag_dt2_o, 32'h0002_0004);
+    check32("MG5 two fresh exhausted races consume eight estimates", search_valid_cnt - search_before, 8);
+    check32("MG5 short confirmation still returns saved N4", dut.ac_n_used, 4);
 
     if (errors == 0)
       $display("ALL TESTS PASSED");
