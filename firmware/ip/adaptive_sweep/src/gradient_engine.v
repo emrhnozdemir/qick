@@ -48,7 +48,7 @@ module gradient_engine (
 );
 
   localparam [3:0] S_IDLE = 4'd0, S_PAIR_INIT = 4'd1, S_PRESENT_A = 4'd2, S_MEASURE_A = 4'd3, S_PRESENT_B = 4'd4, S_MEASURE_B = 4'd5, S_DECIDE = 4'd6, S_STEP = 4'd7, S_TIE = 4'd8, S_CONVERGE = 4'd9, S_DONE = 4'd10, S_DIFFERENCE = 4'd11, S_CERTIFY = 4'd12;
-  localparam [3:0] S_DUPLICATE = 4'd13;
+  localparam [3:0] S_DUPLICATE = 4'd13, S_PREP_PROBES = 4'd14;
 
   (* MARK_DEBUG = "TRUE" *) reg [3:0] state;
   reg [3:0] next_state;
@@ -163,8 +163,21 @@ module gradient_engine (
     .x_minus_o(probe_low)
   );
 
-  wire [31:0] probe_first = (two_sided | (probe_high == x)) ? probe_low : x;
-  wire [31:0] probe_second = probe_high;
+  reg [31:0] held_probe_high;
+  reg [31:0] held_probe_low;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      held_probe_high <= 0;
+      held_probe_low <= 0;
+    end else if (state == S_PREP_PROBES) begin
+      held_probe_high <= probe_high;
+      held_probe_low <= probe_low;
+    end
+  end
+
+  wire [31:0] probe_first = (two_sided | (held_probe_high == x)) ? held_probe_low : x;
+  wire [31:0] probe_second = held_probe_high;
   wire duplicate_probes = movement_guard & (probe_first == probe_second);
 
   wire signed [64:0] power_delta;
@@ -276,14 +289,23 @@ module gradient_engine (
     .y_o(next_x)
   );
 
+  reg [31:0] held_next_x;
+
+  always @(posedge clk) begin
+    if (!rst_n)
+      held_next_x <= 0;
+    else if (state == S_DECIDE)
+      held_next_x <= next_x[31:0];
+  end
+
   wire step_below_min = (step_size < min_step);
 
   // Compare the movement after DDS-word quantization and range clipping.
   // A certified move equal to the floor remains useful on a slope.
-  wire [31:0] move_distance = (next_x[31:0] >= x) ?
-                              (next_x[31:0] - x) : (x - next_x[31:0]);
+  wire [31:0] move_distance = (held_next_x >= x) ?
+                              (held_next_x - x) : (x - held_next_x);
   wire tiny_move = (move_distance < min_step);
-  wire return_cycle = previous_valid & (next_x[31:0] == previous_x) & (next_x[31:0] != x);
+  wire return_cycle = previous_valid & (held_next_x == previous_x) & (held_next_x != x);
   wire guard_block_step = movement_guard & (tiny_move | return_cycle);
   wire guard_no_progress = movement_guard & ((state == S_TIE) |
                             ((state == S_STEP) & (tiny_move | return_cycle)));
@@ -321,6 +343,9 @@ module gradient_engine (
         next_state = start_i ? S_PAIR_INIT : S_IDLE;
 
       S_PAIR_INIT:
+        next_state = S_PREP_PROBES;
+
+      S_PREP_PROBES:
         next_state = S_PRESENT_A;
 
       S_PRESENT_A:
@@ -418,7 +443,7 @@ module gradient_engine (
     else if ((state == S_IDLE) & start_i)
       x <= initial_x;
     else if ((state == S_STEP) & ~guard_block_step)
-      x <= next_x[31:0];
+      x <= movement_guard ? held_next_x : next_x[31:0];
   end
 
   always @(posedge clk) begin
