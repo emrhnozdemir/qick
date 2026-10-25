@@ -915,13 +915,15 @@ class QICK_XTalk_Compensation(SocIP):
 
 class Adaptive_Sweep(SocIP):
     """
-    Adaptive_Sweep host-side write port.
+    Adaptive_Sweep host-side port.
 
-    The adaptive_sweep IP's AXI-Lite slave carries the settings the generated
-    tProc program does NOT itself send: the early-stop threshold and the gd/kw
-    a_k (step) and c_k (probe-width) schedules.  Call :meth:`load_tables` with
-    the sweep's plan (or the individual setters) before starting a program
-    that needs them.
+    Two jobs.  First, the settings the generated tProc program does NOT
+    itself send: the early-stop threshold and the block tolerance (and CTRL,
+    for retargeting a loaded program).  Call :meth:`load_tables` with the
+    sweep's plan (or the individual setters) before starting a program that
+    needs them.  Second, the debug views of the running IP:
+    :meth:`print_status`, :meth:`print_debug`, :meth:`read_view` and
+    :meth:`errors`.
 
     The early-stop threshold lives here rather than in the program image so a
     threshold sweep needs no rebuild - :meth:`set_estop_thr` retargets a
@@ -931,30 +933,56 @@ class Adaptive_Sweep(SocIP):
     comes out of reset at ``D=64``, so an unwritten register behaves as
     ``thr=1/64`` rather than disabling the early stop.
 
-    Protocol: REG0 carries the whole control word and the commit; REG1..REG7
-    are seven payload words, so one commit writes up to seven LUT entries.
+    Register map, in words: ``REG0`` (``tbl_ctrl``) is
+    ``{[31] toggle, [30:21] reserved, [20:16] target, [15:0] reserved}``,
+    with target 2 = early-stop threshold, 3 = CTRL, 4 = absolute block
+    tolerance; ``REG1`` (``tbl_d0``) is the payload word; ``REG2``
+    (``read_sel``) selects the debug view, a plain level; ``REG3`` is spare.
+    ``REG4`` (``status``) returns the GET_STATUS word, ``REG5``/``REG6``
+    (``dbg_dt1``/``dbg_dt2``) the selected view pair, and ``REG7``
+    (``ident``) ``{"AS", abi, reserved}``; those four are read-only.
 
-    ``REG0 = {[31] toggle, [30:24] len, [23:21] count-1, [20:16] target,
-    [15:8] addr, [7:0] reserved}``, with target 0 = a-LUT, 1 = c-LUT,
-    2 = early-stop threshold, 3 = CTRL, 4 = absolute block tolerance.
-
-    Payload registers are written first, then REG0 twice: once with the
-    control fields and the toggle UNCHANGED, once with REG0[31] FLIPPED.  The
-    toggle edge is synchronized into the fabric clock and commits exactly one
-    burst; writing the control fields a transaction earlier keeps them settled
-    before that edge crosses.  A 64-entry LUT costs 84 AXI writes this way
-    against 193 for the old one-entry-per-commit protocol.
+    Write protocol: the payload register is written first, then REG0 twice -
+    once with the target and the toggle UNCHANGED, once with REG0[31]
+    FLIPPED.  The toggle edge is synchronized into the fabric clock and
+    commits exactly one write; writing the target a transaction earlier keeps
+    it settled before that edge crosses.
     """
     bindto = ['emrhnozdemir:QICK:adaptive_sweep:1.0']
 
-    # REG1..REG7 are payload, so seven LUT entries commit per toggle flip
-    BURST = 7
+    #: The opcode-map ABI this driver and asm_v2's registry are written for.
+    #: The IP reports its own in ``ident`` bits 15:8 (:meth:`check_abi`).
+    ABI = 2
+
+    ENGINE_STATES = ['IDLE', 'PAIR_INIT', 'PRESENT_A', 'MEASURE_A', 'PRESENT_B',
+                     'MEASURE_B', 'DECIDE', 'STEP', 'TIE', 'CONVERGE', 'DONE',
+                     'DIFFERENCE', 'CERTIFY', 'DUPLICATE', 'PREP_PROBES']
+    FINDER_STATES = ['IDLE', 'SEND_FREQ', 'WAIT_MEAS']
+    #: Debug views, by REG2 value: each returns a (dt1, dt2) word pair.
+    VIEWS = ['top', 'engine', 'engine_x', 'engine_step', 'power', 'mean',
+             'diag', 'acq', 'cfg_window', 'cfg_grid', 'cfg_acq', 'cfg_band',
+             'cfg_pairs', 'cfg_tol', 'drain', 'response']
+    #: Sticky error bits of view 0 dt2, cleared by the next START/RUN_*.
+    ERROR_BITS = ['start_busy', 'unknown_op', 'read_held', 'bad_target',
+                  'stray_power']
+    _TOP_BITS = ['ac_armed', 'pf_freq_valid', 'eng_freq_valid', 'tvalid',
+                 'arm_pend', 'draining', 'int_en', 'finish_seen', 'busy',
+                 'dest', 'res_pend', 'vld', 'rdy']
+    _ENGINE_BITS = ['stalled', 'capped', 'converged', 'done', 'busy',
+                    'probe_arm', 'freq_valid', 'movement_guard', 'dip',
+                    'two_sided']
+    _ACQ_BITS = ['emit', 'short_mode', 'stopped_early', 'warmup_done',
+                 'stopped', 'armed']
 
     def _init_config(self, description):
         self.REGISTERS = {
             'tbl_ctrl': 0,
-            'tbl_d0': 1, 'tbl_d1': 2, 'tbl_d2': 3, 'tbl_d3': 4,
-            'tbl_d4': 5, 'tbl_d5': 6, 'tbl_d6': 7,
+            'tbl_d0': 1,
+            'read_sel': 2,
+            'status': 4,
+            'dbg_dt1': 5,
+            'dbg_dt2': 6,
+            'ident': 7,
         }
 
     def _init_firmware(self):
@@ -963,34 +991,13 @@ class Adaptive_Sweep(SocIP):
         # table write.
         self._toggle = (self.tbl_ctrl >> 31) & 1
 
-    def _tbl_commit(self, target, addr=0, count=1, length=0):
-        word = (((length & 0x7F) << 24) | (((count - 1) & 0x7) << 21)
-                | ((target & 0x1F) << 16) | ((addr & 0xFF) << 8))
-        # control fields first, with the toggle unchanged...
+    def _tbl_commit(self, target):
+        word = (target & 0x1F) << 16
+        # the target first, with the toggle unchanged...
         self.tbl_ctrl = (self._toggle << 31) | word
-        # ...then the flip commits the whole burst
+        # ...then the flip commits the write
         self._toggle ^= 1
         self.tbl_ctrl = (self._toggle << 31) | word
-
-    def _load_lut(self, target, values, what):
-        values = [int(v) & 0xFFFFFFFF for v in values]
-        if not 1 <= len(values) <= 64:
-            raise ValueError("%s must have 1..64 entries, got %d"
-                             % (what, len(values)))
-        n = len(values)
-        for base in range(0, n, self.BURST):
-            chunk = values[base:base + self.BURST]
-            for k, v in enumerate(chunk):
-                setattr(self, 'tbl_d%d' % (k,), v)
-            self._tbl_commit(target, addr=base, count=len(chunk), length=n)
-
-    def load_alut(self, values):
-        """Load the gd/kw a_k step-size schedule (frequency words)."""
-        self._load_lut(0, values, 'a_table')
-
-    def load_clut(self, values):
-        """Load the gd/kw c_k probe-width schedule (frequency words)."""
-        self._load_lut(1, values, 'c_table')
 
     def set_estop_d(self, d):
         """Write the raw early-stop reciprocal D (16-bit, 1..65535).
@@ -1046,7 +1053,7 @@ class Adaptive_Sweep(SocIP):
         CTRL drives ``search_mode`` (bit 0, 0 peak / 1 dip), ``estop_hold``
         (bit 4), ``estop_en`` (bit 6), ``block_en`` (bit 7), and ``confirm``
         (bits 19:17). The
-        generated program sets it at init over QP2 OP2; writing it here
+        generated program sets it at init over QP2 CFG_ACQ; writing it here
         afterwards retargets a LOADED program, so those four can be swept
         without a rebuild, exactly as the threshold can.
         """
@@ -1054,13 +1061,142 @@ class Adaptive_Sweep(SocIP):
         self._tbl_commit(3)
 
     def load_tables(self, plan):
-        """Load the plan's thresholds, a-LUT, and c-LUT before execution."""
+        """Load the plan's early-stop threshold and block tolerance."""
         if plan.estop_d:
             self.set_estop_d(plan.estop_d)
-
-
             self.set_block_tol(getattr(plan, 'block_tol', None) or 0)
-        if plan.a_words:
-            self.load_alut(plan.a_words)
-        if plan.c_words:
-            self.load_clut(plan.c_words)
+
+    # --- debug views -------------------------------------------------------
+
+    @property
+    def abi(self):
+        """The opcode-map ABI the loaded bitstream reports (``ident`` 15:8)."""
+        return (int(self.ident) >> 8) & 0xFF
+
+    def check_abi(self):
+        """Raise unless the bitstream's opcode map is the one this driver expects."""
+        ident = int(self.ident)
+        if (ident >> 16) != 0x4153:
+            raise RuntimeError(
+                "adaptive_sweep IDENT register reads 0x%08x: this bitstream "
+                "predates the IDENT register (opcode map ABI 1) and does not "
+                "match the ABI %d programs this software compiles"
+                % (ident, self.ABI))
+        if self.abi != self.ABI:
+            raise RuntimeError(
+                "adaptive_sweep bitstream carries opcode-map ABI %d, this "
+                "software expects ABI %d" % (self.abi, self.ABI))
+
+    def read_view(self, sel):
+        """Select a debug view (0..31, or a name from :attr:`VIEWS`).
+
+        Returns the ``(dt1, dt2)`` word pair.  The select is a level: it
+        crosses into the fabric clock and the view crosses back well within
+        one AXI read, so no wait is needed.
+        """
+        if isinstance(sel, str):
+            sel = self.VIEWS.index(sel)
+        self.read_sel = int(sel) & 0x1F
+        return int(self.dbg_dt1), int(self.dbg_dt2)
+
+    def errors(self):
+        """The sticky error bits of view 0, as a dict (cleared by START/RUN_*)."""
+        _, word = self.read_view(0)
+        out = {name: bool((word >> i) & 1) for i, name in enumerate(self.ERROR_BITS)}
+        out['getfreq_idle_count'] = word >> 16
+        return out
+
+    @staticmethod
+    def _show(name, value):
+        print('%-18s: %s' % (name, value))
+
+    def _state_name(self, names, index):
+        return names[index] if index < len(names) else 'UNDEFINED(%d)' % index
+
+    def print_status(self):
+        """Print the STATUS word, the handshake view and the error bits."""
+        from qick.asm_v2 import ADAPTIVE_SWEEP
+        word = int(self.status)
+        print('---------------------------------------------')
+        print('--- adaptive_sweep IDENT 0x%08x: abi %d' % (int(self.ident), self.abi))
+        print('--- STATUS (REG4) 0x%08x' % word)
+        for name, value in ADAPTIVE_SWEEP.unpack_status(word).items():
+            self._show(name, value)
+        top, _ = self.read_view('top')
+        print('--- handshake (view 0)')
+        self._show('op_count', top >> 24)
+        self._show('last_op', (top >> 19) & 0x1F)
+        self._show('engine_state', self._state_name(self.ENGINE_STATES, (top >> 15) & 0xF))
+        self._show('finder_state', self._state_name(self.FINDER_STATES, (top >> 13) & 0x3))
+        for i, name in enumerate(self._TOP_BITS):
+            self._show(name, (top >> i) & 1)
+        print('--- errors since the last START/RUN')
+        for name, value in self.errors().items():
+            self._show(name, value)
+
+    def print_debug(self):
+        """Print every debug view, decoded where the layout is fixed."""
+        from qick.asm_v2 import AS_DIAG_FIELDS
+        self.print_status()
+        flags, pairs_iter = self.read_view('engine')
+        print('--- engine (view 1)')
+        self._show('state', self._state_name(self.ENGINE_STATES, (flags >> 12) & 0xF))
+        self._show('stall_streak', flags >> 24)
+        self._show('lambda', (flags >> 19) & 0x1F)
+        for i, name in enumerate(self._ENGINE_BITS, start=2):
+            self._show(name, (flags >> i) & 1)
+        self._show('pairs', pairs_iter >> 16)
+        self._show('iter', pairs_iter & 0xFFFF)
+        freq_word, x = self.read_view('engine_x')
+        step, sd_hi = self.read_view('engine_step')
+        self._show('freq_word', freq_word)
+        self._show('x', x)
+        self._show('step', step)
+        self._show('sd_hi', int(np.int32(sd_hi)))
+        lo, hi = self.read_view('power')
+        mean_i, mean_q = self.read_view('mean')
+        print('--- last point (views 4..7)')
+        self._show('power', (hi << 32) | lo)
+        self._show('mean_i', int(np.int32(mean_i)))
+        self._show('mean_q', int(np.int32(mean_q)))
+        n_used, diag = self.read_view('diag')
+        self._show('n_used', n_used)
+        for f in AS_DIAG_FIELDS:
+            self._show('diag.' + f.name, f.unpack(diag))
+        acq, best = self.read_view('acq')
+        self._show('shot_count', acq >> 16)
+        self._show('check_bit', (acq >> 11) & 0x1F)
+        self._show('cap_exponent', (acq >> 6) & 0x1F)
+        for i, name in enumerate(self._ACQ_BITS):
+            self._show(name, (acq >> i) & 1)
+        self._show('best_freq', best)
+        print('--- configuration (views 8..13)')
+        start, step = self.read_view('cfg_window')
+        grid, acq_cfg = self.read_view('cfg_grid')
+        warmup, n_min = self.read_view('cfg_acq')
+        f_lo, f_hi = self.read_view('cfg_band')
+        pairs, ctrl = self.read_view('cfg_pairs')
+        block_tol, commits = self.read_view('cfg_tol')
+        self._show('start_freq', start)
+        self._show('step', step)
+        self._show('n_points', grid >> 16)
+        self._show('point_idx', grid & 0xFFFF)
+        self._show('threshold_d', acq_cfg >> 16)
+        self._show('confirm', (acq_cfg >> 13) & 0x7)
+        self._show('avg_shift', acq_cfg & 0x1F)
+        self._show('warmup_shots', warmup)
+        self._show('n_min', n_min)
+        self._show('f_lo', f_lo)
+        self._show('f_hi', f_hi)
+        self._show('pair_max', pairs >> 16)
+        self._show('pair_min', pairs & 0xFFFF)
+        self._show('ctrl', '0x%08x' % ctrl)
+        self._show('block_tol', block_tol)
+        self._show('axi_commits', commits >> 16)
+        self._show('axi_last_target', commits & 0x1F)
+        drops, _ = self.read_view('drain')
+        dt1, dt2 = self.read_view('response')
+        print('--- drain and last response (views 14, 15)')
+        self._show('drain_drop_cnt', drops)
+        self._show('response_dt1', '0x%08x' % dt1)
+        self._show('response_dt2', '0x%08x' % dt2)

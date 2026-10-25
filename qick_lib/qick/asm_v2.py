@@ -189,8 +189,10 @@ class QP2Accel:
         a 64-bit power (sized for the 32-bit-mean schemes); only a scheme
         whose power can exceed that (the raw 64-bit sum) is excluded, the
         router saturates it rather than wrapping, but it is still wrong.
-    lut_depth : int
-        Depth of the a/c schedule LUTs (0 if absent).
+    abi : int
+        Version of the opcode map.  ``adaptive_sweep`` reports the ABI it was
+        built with in its AXI IDENT register, so a bitstream compiled against
+        another map can be refused before a program is run (0 = none).
     """
 
     name: str
@@ -202,7 +204,7 @@ class QP2Accel:
     calcs: Tuple[str, ...] = ()
     calc_ctrl: Dict[str, Dict[str, int]] = field(default_factory=dict)
     gdkw_calcs: Tuple[str, ...] = ()
-    lut_depth: int = 0
+    abi: int = 0
 
     def op(self, mnemonic):
         """Look up an op by mnemonic, with a helpful error."""
@@ -331,7 +333,6 @@ FINE_TUNING_SWEEP = QP2Accel(
     calcs=("shift",),
     calc_ctrl={"shift": {}},
     gdkw_calcs=(),
-    lut_depth=0,
 )
 
 
@@ -342,6 +343,14 @@ FINE_TUNING_SWEEP = QP2Accel(
 # decode, field wiring and the status_word assign) and src/register_bank.v
 # (the CTRL word and the dt slices it latches).  The prose description of
 # every module is in personal_files/adaptive_sweep/MODULE_GUIDE.txt.
+#
+# Opcode map ABI 2 (2026-10-24): the top two bits of the 5-bit PB selector
+# are the class - 0 configure (0..7), 1 control (8..15), 2 read (16..23),
+# 3 debug (24..31).  15 is CFG_INTERRUPT, decoded by the processor and
+# ignored by the IP; 24 is reserved for GET_DEBUG and not decoded yet.
+# The IP reports the ABI it was built for in its AXI IDENT register
+# (Adaptive_Sweep.check_abi).  GET_GDKW_DIAG (old 8) was deleted: its two
+# words are debug view 1 of the Adaptive_Sweep driver.
 _AS_OPS = {
     "CFG_WINDOW": QP2Op(
         number=0, mnemonic="CFG_WINDOW",
@@ -363,14 +372,13 @@ _AS_OPS = {
             "would land as dt4[4:0]=0, a one-shot cap.",
     ),
     "START": QP2Op(
-        number=1, mnemonic="START", blocking=True, responds=True,
+        number=8, mnemonic="START", blocking=True, responds=True,
         resp={"dt1": _word("freq_at_best", signed=True), "dt2": _word("zero")},
         doc="start the grid sweep (peak_finder walks the grid)",
     ),
     "CFG_ACQ": QP2Op(
-        number=2, mnemonic="CFG_ACQ",
+        number=1, mnemonic="CFG_ACQ",
         args={
-            "dt1": _word("nsamp"),
             "dt2": (Field("mode", 1, 0),
                     Field("reduce_sel", 3, 1),
                     Field("estop_hold", 1, 4),
@@ -382,7 +390,8 @@ _AS_OPS = {
             "dt3": _word("n0"),
             "dt4": _word("n_min"),
         },
-        doc="nsamp and the CTRL word: mode (0 peak/1 dip); reduce_sel "
+        doc="the CTRL word in dt2 (dt1, once nsamp, is not read by the RTL): "
+            "mode (0 peak/1 dip); reduce_sel "
             "(IGNORED BY THE RTL since 2026-08-24 - there is one datapath; "
             "still set because reduce_sel==3 gates dump_log on the Python "
             "side); estop_hold (0 immediate emit / 1 "
@@ -408,12 +417,12 @@ _AS_OPS = {
             "requires its first candidate N to meet this floor)",
     ),
     "GET_STATUS": QP2Op(
-        number=3, mnemonic="GET_STATUS", responds=True,
+        number=17, mnemonic="GET_STATUS", responds=True,
         resp={"dt1": _word("status"), "dt2": _word("freq_at_max", signed=True)},
         doc="status read -> dt1_o = status word, dt2_o = freq_at_max",
     ),
     "GET_DIAG": QP2Op(
-        number=4, mnemonic="GET_DIAG", responds=True,
+        number=18, mnemonic="GET_DIAG", responds=True,
         resp={"dt1": _word("n_used"), "dt2": _word("diag")},
         doc="diag read -> dt1 = n_used (shots folded into the last emitted "
             "estimate, excluding additional short-confirmation shots); "
@@ -421,11 +430,10 @@ _AS_OPS = {
             "type[2:0]} - decode with AS_DIAG_FIELDS",
     ),
     "RUN_GD": QP2Op(
-        number=5, mnemonic="RUN_GD", blocking=True, responds=True,
+        number=9, mnemonic="RUN_GD", blocking=True, responds=True,
         args={
             "dt1": _word("x0", signed=True),
-            "dt2": (Field("use_lut", 1, 0),
-                    Field("movement_guard", 1, 1),
+            "dt2": (Field("movement_guard", 1, 1),
                     Field("lambda", 5, 4),
                     Field("patience", 8, 16)),
             "dt3": _word("min_step"),
@@ -436,21 +444,20 @@ _AS_OPS = {
                       Field("capped", 1, 1),
                       Field("stalled", 1, 2),
                       Field("iter", 16, 16))},
-        doc="gradient-descent search, forward pair P(x+step) - P(x). In "
-            "racing mode (use_lut=0) lambda must be >= 1: at 0 the "
+        doc="gradient-descent search, forward pair P(x+step) - P(x), repeated "
+            "until the race certifies a move. lambda must be >= 1: at 0 the "
             "certification |sum(dp)| > sum(|dp|) >> lambda can never pass "
             "and x never moves. movement_guard enables step refinement and "
-            "bounded no-progress stopping in racing GD; stalled is distinct "
+            "bounded no-progress stopping; stalled is distinct "
             "from convergence and returns the winning measured probe of the "
             "final certified race, or the measured current iterate for an "
             "unresolved race",
     ),
     "RUN_KW": QP2Op(
-        number=6, mnemonic="RUN_KW", blocking=True, responds=True,
+        number=10, mnemonic="RUN_KW", blocking=True, responds=True,
         args={
             "dt1": _word("x0", signed=True),
-            "dt2": (Field("use_lut", 1, 0),
-                    Field("lambda", 5, 4),
+            "dt2": (Field("lambda", 5, 4),
                     Field("patience", 8, 16)),
             "dt3": _word("min_step"),
             "dt4": (Field("max_iter", 16, 0),),
@@ -459,25 +466,19 @@ _AS_OPS = {
               "dt2": (Field("converged", 1, 0),
                       Field("capped", 1, 1),
                       Field("iter", 16, 16))},
-        doc="Kiefer-Wolfowitz search, symmetric pair P(x+c) - P(x-c). In "
-            "racing mode (use_lut=0) lambda must be >= 1, see RUN_GD",
+        doc="Kiefer-Wolfowitz search, symmetric pair P(x+c) - P(x-c), repeated "
+            "until the race certifies a move. lambda must be >= 1, see RUN_GD",
     ),
     "GET_FREQ": QP2Op(
-        number=7, mnemonic="GET_FREQ", responds=True,
+        number=16, mnemonic="GET_FREQ", responds=True,
         resp={"dt1": _word("freq_word", signed=True),
               "dt2": (Field("freq_pending", 1, 0),)},
         doc="GD/KW probe handshake: returns the probe word; reading it while "
             "pending acks the engine and arms the amp_calc for this probe's "
             "averager_value shots",
     ),
-    "GET_GDKW_DIAG": QP2Op(
-        number=8, mnemonic="GET_GDKW_DIAG", responds=True,
-        resp={"dt1": (Field("iter", 16, 0), Field("pairs", 16, 16)),
-              "dt2": _word("sd_hi")},
-        doc="GD/KW diag -> {pairs, iter} and the top 32 bits of S_d",
-    ),
     "CLR_RESULT": QP2Op(
-        number=10, mnemonic="CLR_RESULT",
+        number=11, mnemonic="CLR_RESULT",
         doc="release a finished job's answer and drop the response-valid bit. "
             "Between a job finishing and this op, every read is held off so it "
             "cannot overwrite the answer: READY reaches the tProc a couple of "
@@ -485,7 +486,7 @@ _AS_OPS = {
             "in after completion",
     ),
     "CFG_GDKW": QP2Op(
-        number=9, mnemonic="CFG_GDKW",
+        number=2, mnemonic="CFG_GDKW",
         args={
             "dt1": _word("f_lo", signed=True),
             "dt2": _word("f_hi", signed=True),
@@ -497,7 +498,7 @@ _AS_OPS = {
             "and plan_sweep enforces the same range",
     ),
     "GET_MEAN": QP2Op(
-        number=11, mnemonic="GET_MEAN", responds=True,
+        number=19, mnemonic="GET_MEAN", responds=True,
         resp={"dt1": _word("mean_i", signed=True),
               "dt2": _word("mean_q", signed=True)},
         doc="32-bit mean I/Q read-back: the winning grid point's means when "
@@ -505,7 +506,7 @@ _AS_OPS = {
             "truncating window sum[retire_shift +: 32], for every calc)",
     ),
     "REARM": QP2Op(
-        number=14, mnemonic="REARM",
+        number=12, mnemonic="REARM",
         doc="early-stop interrupt handshake. Sent once before START it enables "
             "the protocol: from then on an early stop raises interrupt_o and "
             "parks the IP, dropping every arrival, instead of arming the next "
@@ -588,7 +589,7 @@ ADAPTIVE_SWEEP = QP2Accel(
     # the whole result path is 64 bits wide now, sized for the mean32
     # calcs' 2^63 maximum power, so every calc can drive the gd/kw engine
     gdkw_calcs=("shift", "welford", "split"),
-    lut_depth=64,
+    abi=2,
 )
 
 
@@ -910,8 +911,7 @@ LOOP_IMM_MAX = (1 << 23) - 1
 #: What register_bank.v decodes cfg_target (reg0[20:16]) as, and what the
 #: Adaptive_Sweep driver writes for each.
 AXI_TABLE_TARGETS = OrderedDict([
-    ("step_lut", 0),        # gd/kw a_k step schedule
-    ("offset_lut", 1),      # gd/kw c_k probe-width schedule
+    # targets 0 and 1 belonged to the removed gd/kw schedule LUTs
     ("estop_threshold", 2), # the 16-bit reciprocal D
     ("ctrl", 3),            # the CTRL word, same bits CFG_ACQ dt2 carries
     ("block_tol", 4),
@@ -953,14 +953,14 @@ def _accel_contract(accel):
         "calcs": list(accel.calcs),
         "calc_ctrl": {k: dict(v) for k, v in accel.calc_ctrl.items()},
         "gdkw_calcs": list(accel.gdkw_calcs),
-        "lut_depth": accel.lut_depth,
+        "abi": accel.abi,
         "ops": {m: _op_contract(op) for m, op in accel.ops.items()},
         "status_bits": [_field_contract(f) for f in accel.status_bits],
     }
 
 
 #: Bumped whenever the exported shape changes (not when a value changes).
-CONTRACT_VERSION = 5
+CONTRACT_VERSION = 6
 
 
 def qp2_contract():
@@ -1037,7 +1037,7 @@ def qp2_contract():
             },
             "gd_movement_guard": {
                 "enable": "RUN_GD dt2 bit 1; default disabled",
-                "supported": "racing GD only (use_lut=0); unsupported raw RTL modes ignore the bit",
+                "supported": "GD only; RUN_KW ignores the bit",
                 "min_step": "minimum step and movement floor; certified moves equal to the floor are allowed",
                 "patience": "consecutive no-progress iterations at min_step; default 2, range 1 through 255",
                 "refinement": "halve the step on a reversal cycle, exhausted race, or clipped sub-floor move, down to min_step",
@@ -1068,7 +1068,7 @@ def qp2_contract():
                 "name": "early-stop acquisition-abort redirect",
                 "request": "adaptive_sweep.v interrupt_o, a one-cycle pulse "
                            "registered from ac_early_pulse AND int_en",
-                "arm_op": "REARM (opcode 14), sent once before START to arm and "
+                "arm_op": "REARM (opcode 12), sent once before START to arm and "
                           "again from the landing block to release the park",
                 "destination": "the tProcessor TPROC_IPC register "
                                "(qproc_axi_reg slv_reg9), loaded by the "
@@ -1164,7 +1164,6 @@ class SweepPlan:
     max_iter: int = 0
     patience: int = 0
     movement_guard: bool = False
-    use_lut: int = 0
     lam: int = 0
     m_min: int = 1
     m_max: int = 1
@@ -1172,8 +1171,6 @@ class SweepPlan:
     f_hi_mhz: float = 0.0
     f_lo: int = 0
     f_hi: int = 0
-    a_words: List[int] = field(default_factory=list)
-    c_words: List[int] = field(default_factory=list)
 
     # readout-word tracking for the handshake path
     ro_ratio: int = 0
@@ -1381,8 +1378,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                estop_thr=None, block_tol=None,
                x0=None, min_step=None, max_iter=None, patience=None,
                movement_guard=False,
-               a_table=None, c_table=None,
-               use_lut=None, lambda_=None, m_min=2, m_max=8,
+               lambda_=None, m_min=2, m_max=8,
                f_lo=None, f_hi=None,
                result_addr=0, debug=False, count_shots=False,
                dump_log=None, log_addr=None, interrupt=None,
@@ -1811,11 +1807,6 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     if plan.handshake:
         _require(accel.has_op("GET_FREQ"),
                  "accelerator '%s' has no GET_FREQ handshake" % (accel.name,))
-        use_lut = bool(a_table is not None or c_table is not None) \
-            if use_lut is None else bool(use_lut)
-        plan.use_lut = 1 if use_lut else 0
-        _require(not movement_guard or not plan.use_lut,
-                 "movement_guard requires use_lut=False (racing GD)")
         plan.movement_guard = bool(movement_guard)
 
         f_lo = start if f_lo is None else f_lo
@@ -1880,57 +1871,23 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                  "patience must be in [0, 255], got %s" % (patience,))
         plan.patience = patience
 
-        if plan.use_lut:
-            # the engine ignores lambda in scheduled mode (S_DECIDE goes
-            # straight to S_STEP), so only the field width is checked
-            plan.lam = 0 if lambda_ is None else int(lambda_)
-            _require(0 <= plan.lam < (1 << 5),
-                     "lambda_ must be in [0, 31], got %s" % (lambda_,))
-        else:
-            # |sum(dp)| <= sum(|dp|) always (triangle inequality), so at
-            # lambda 0 the race |sum(dp)| > sum(|dp|) >> lambda can never
-            # certify a move: every iteration exhausts m_max and ties, and
-            # the search sits at x0 until max_iter
-            plan.lam = 1 if lambda_ is None else int(lambda_)
-            _require(1 <= plan.lam < (1 << 5),
-                     "racing mode needs lambda_ in [1, 31], got %s: at 0 the "
-                     "certification test can never pass and x never moves"
-                     % (lambda_,))
+        # |sum(dp)| <= sum(|dp|) always (triangle inequality), so at
+        # lambda 0 the race |sum(dp)| > sum(|dp|) >> lambda can never
+        # certify a move: every iteration exhausts m_max and ties, and
+        # the search sits at x0 until max_iter
+        plan.lam = 1 if lambda_ is None else int(lambda_)
+        _require(1 <= plan.lam < (1 << 5),
+                 "lambda_ must be in [1, 31], got %s: at 0 the "
+                 "certification test can never pass and x never moves"
+                 % (lambda_,))
 
-        if plan.use_lut:
-            _require(a_table is not None and c_table is not None,
-                     "use_lut=True needs both a_table= and c_table= (step and "
-                     "probe-width schedules, in MHz)")
-            for label, table in (("a_table", a_table), ("c_table", c_table)):
-                _require(len(table) > 0, "%s is empty" % (label,))
-                _require(len(table) <= accel.lut_depth,
-                         "%s has %d entries but the schedule LUT is only %d "
-                         "deep" % (label, len(table), accel.lut_depth))
-            _require(all(np.isfinite(v) and v > 0 for v in a_table)
-                     and all(np.isfinite(v) and v > 0 for v in c_table),
-                     "a_table/c_table entries must be finite and positive")
-            plan.a_words = [_sweep_step_words(prog, v, gen_ch, ro_ch)[0]
-                            for v in a_table]
-            plan.c_words = [_sweep_step_words(prog, v, gen_ch, ro_ch)[0]
-                            for v in c_table]
-            for label, words, table in (("a_table", plan.a_words, a_table),
-                                        ("c_table", plan.c_words, c_table)):
-                for i, (w, v) in enumerate(zip(words, table)):
-                    _require(w > 0,
-                             "%s[%d]=%g MHz rounds to a zero drive-word step"
-                             % (label, i, v))
-            plan.m_min = plan.m_max = 1
-        else:
-            _require(a_table is None and c_table is None,
-                     "a_table/c_table are only used with use_lut=True; racing "
-                     "mode repeats the fixed step= pair instead")
-            # gradient_engine clamps pair_min and pair_max to 255 (its race
-            # accumulators are sized for 65 + 8 bits), so a larger request
-            # would be silently truncated - or, for m_min, made unreachable
-            _require(1 <= int(m_min) <= int(m_max) <= 255,
-                     "racing mode needs 1 <= m_min <= m_max <= 255, got "
-                     "m_min=%s m_max=%s" % (m_min, m_max))
-            plan.m_min, plan.m_max = int(m_min), int(m_max)
+        # gradient_engine clamps pair_min and pair_max to 255 (its race
+        # accumulators are sized for 65 + 8 bits), so a larger request
+        # would be silently truncated - or, for m_min, made unreachable
+        _require(1 <= int(m_min) <= int(m_max) <= 255,
+                 "1 <= m_min <= m_max <= 255 is required, got "
+                 "m_min=%s m_max=%s" % (m_min, m_max))
+        plan.m_min, plan.m_max = int(m_min), int(m_max)
 
         # Readout tracking: the engine reports only the drive word, so the
         # tProc derives the readout word from it.  Anchor at the middle of the
@@ -1964,9 +1921,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     else:
         for label, value in (("x0", x0), ("min_step", min_step),
                              ("max_iter", max_iter), ("patience", patience),
-                             ("a_table", a_table), ("c_table", c_table),
-                             ("use_lut", use_lut), ("f_lo", f_lo),
-                             ("f_hi", f_hi)):
+                             ("f_lo", f_lo), ("f_hi", f_hi)):
             _require(value is None,
                      "%s only applies to algorithm='gd' or 'kw'" % (label,))
 
@@ -2927,9 +2882,9 @@ class AdaptiveSweep(Macro):
 
     ``expand()`` produces the entire sequence: configuration ops, the
     waveform-memory seed, the RUN op, the service loop that fires shots, and the
-    result read-back into data memory. It does NOT load the threshold or
-    schedule tables, those reach the IP only over AXI-Lite, through the
-    ``Adaptive_Sweep`` driver's ``load_tables(plan)``.
+    result read-back into data memory. It does NOT load the early-stop
+    threshold or block tolerance, those reach the IP only over AXI-Lite,
+    through the ``Adaptive_Sweep`` driver's ``load_tables(plan)``.
 
     The child macros are built during ``preprocess()`` rather than ``expand()``
     because some of them are timed (``Pulse``, ``Trigger``, ``Delay``) and have
@@ -2964,7 +2919,9 @@ class AdaptiveSweep(Macro):
         """Point the bus at the peripheral and latch the acquisition setup."""
         accel = plan.accel
         asm.qpb_select()
-        cfg = dict(nsamp=plan.nsamp, mode=plan.mode)
+        cfg = dict(mode=plan.mode)
+        if 'nsamp' in accel.op('CFG_ACQ').field_names():
+            cfg['nsamp'] = plan.nsamp
         if 'reduce_sel' in accel.op('CFG_ACQ').field_names():
             cfg.update(plan.calc_fields)
             cfg.update(estop_hold=plan.emit_mode, n0=plan.n0, n_min=plan.n_min)
@@ -3039,7 +2996,7 @@ class AdaptiveSweep(Macro):
         # until the next arm - so it is readable anywhere in this block.  It
         # is read here because that is the earliest moment it is valid, and
         # because a capture should not be sitting behind a wait it does not
-        # depend on.  OP4's dt2 carries the whole verdict - {nconv_count,
+        # depend on.  GET_DIAG's dt2 carries the whole verdict - {nconv_count,
         # saturated, converged, k, type} - and the shot count is 1 << k, so
         # one word per point is the entire log.  It is filed under the grid
         # index the tProcessor is already holding, which is why no frequency
@@ -3255,7 +3212,7 @@ class AdaptiveSweep(Macro):
 
         mnemonic = 'RUN_KW' if plan.algorithm == 'kw' else 'RUN_GD'
         guard_args = {'movement_guard': 1} if plan.movement_guard else {}
-        asm.qpb_send(accel, mnemonic, x0=plan.x0, use_lut=plan.use_lut,
+        asm.qpb_send(accel, mnemonic, x0=plan.x0,
                      min_step=plan.min_step, max_iter=plan.max_iter,
                      patience=plan.patience, **{'lambda': plan.lam}, **guard_args)
         asm.qpb_wait_ready(invert=True)
@@ -5468,7 +5425,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         accelerator wants, and emits the configuration ops,
         run command, service loop, and result
         read-back into data memory.
-        :meth:`run_sweeps` loads AXI threshold and schedule settings on the host.
+        :meth:`run_sweeps` loads the AXI threshold settings on the host.
 
         A program that uses this is a *job* program, not a shot-averaged one.
         Call it from ``_initialize()``, leave ``_body()`` empty, and use
@@ -5527,7 +5484,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             Shots averaged per point, up to 2**26.  The cap is a power of
             two: ``shot_counter`` does not compare against a limit, it
             watches bit ``avg_shift`` of the shot number, so the cap is
-            exactly ``1 << avg_shift`` and OP0 dt4 carries the EXPONENT.
+            exactly ``1 << avg_shift`` and CFG_WINDOW dt4 carries the EXPONENT.
             A request that is not a power of two is rounded UP to the next
             one with a warning -- 1000 becomes 1024 -- and the plan records
             ``avg_requested`` / ``avg_rounded``.  ``plan.avg`` becomes the
@@ -5608,7 +5565,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             Record, per grid point, the shot count at which that point
             stopped early. Needs ``early_stop=True``,
             and defaults to True when both hold.  There is no log buffer in
-            the accelerator: the interrupt handler reads OP4's verdict word
+            the accelerator: the interrupt handler reads GET_DIAG's verdict word
             and stores it at ``dmem[log_addr + point]`` while it is already
             parked doing the rearm handshake, so it costs four instructions
             on a path that is already waiting microseconds for the last shot
@@ -5644,8 +5601,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             defaults to 2, and counts consecutive no-progress iterations at
             ``min_step`` before reporting a stall rather than convergence.
         movement_guard : bool
-            Enable bounded no-progress handling for racing GD only
-            (``algorithm='gd', use_lut=False``). Defaults to False.
+            Enable bounded no-progress handling for ``algorithm='gd'``.
+            Defaults to False.
             Refine the step on a reversal cycle, exhausted race or clipped
             sub-floor move, stop repeated movements below ``min_step``, and
             avoid duplicate probes. Stalled and capped results are uncertain,
@@ -5656,26 +5613,16 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             measurements and does not select a historical maximum. Requires
             matching firmware supporting RUN_GD bit 1 and the stalled
             response bit.
-        a_table, c_table : list of float
-            Step and probe-width schedules (MHz), for gd/kw in LUT mode.
-            These load over AXI-Lite through the ``Adaptive_Sweep``
-            driver's ``load_tables(plan)``, not from the generated
-            program.
-        use_lut : bool
-            True for the scheduled a/c tables, False for racing mode (repeat
-            the fixed-step pair until the accumulated difference beats its own
-            accumulated spread).  Inferred from whether tables were given.
         lambda_ : int
-            Racing-mode certainty shift: a move needs
-            ``|sum(dp)| > sum(|dp|) >> lambda_``.  Defaults to 1 and must be
-            in [1, 31] in racing mode: ``|sum(dp)| <= sum(|dp|)`` always, so
-            at 0 no pair count can ever certify a move and the search ties
-            at ``x0``.  Ignored by the engine (any value in [0, 31]) with
-            ``use_lut=True``.
+            Certainty shift of the race: the engine repeats the fixed-step
+            pair until ``|sum(dp)| > sum(|dp|) >> lambda_``, then moves by
+            ``step``.  Defaults to 1 and must be in [1, 31]:
+            ``|sum(dp)| <= sum(|dp|)`` always, so at 0 no pair count can
+            ever certify a move and the search ties at ``x0``.
         m_min, m_max : int
-            Racing-mode bounds on pairs per move, ``1 <= m_min <= m_max <=
-            255`` (the engine's pair counter and race accumulators are sized
-            for 255).  Defaults 2 and 8.
+            Bounds on pairs per move, ``1 <= m_min <= m_max <= 255`` (the
+            engine's pair counter and race accumulators are sized for 255).
+            Defaults 2 and 8.
         f_lo, f_hi : float
             Search window for gd/kw (MHz), contained within ``[start, stop]``.
             Defaults to the original band; overrides outside it are rejected.
@@ -5693,8 +5640,11 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             ``soc.start_readout(total_shots, counter_addr=1)`` can follow
             along.  Off by default, because that is the same counter
             ``acquire()`` and ``run_rounds()`` poll against ``reps``: with it
-            on, those would return after the sweep's first shot. Counter-based
-            sweep helpers reject this setting; use ``record_points`` instead.
+            on, those would return after the sweep's first shot. The
+            counter-based sweep helpers (:meth:`run_sweeps`,
+            :meth:`wait_for_sweep`) accept it only when the program completes
+            on the other counter (``COUNTER_ADDR = 2``); the result then
+            carries ``observed_shots``.
         early_stop : bool
             Enable the split test and its tProcessor interrupt together.
             Defaults to False unless a split/adaptive preset was requested.
@@ -5859,9 +5809,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                 measure wall time or physical triggers. Fixed grids return the
                 known full-schedule retained counts without point records.
             ``observed_shots`` : int
-                With ``count_shots=True``: the tProcessor's externally
-                readable counter, which counts one per shot the sweep fires
-                plus one per program repetition.
+                With ``count_shots=True``: externally readable counter 1,
+                which counts one per shot the sweep loops fired (every
+                count_shots sweep of the job, so far).
 
             ``i``, ``q``, ``power``, ``signal_magnitude``, ``noise_magnitude``
             and ``threshold_margin`` are NOT returned: this build's result
@@ -5913,10 +5863,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             out['accelerator_shots'] = plan.total_shots
             out['retained_shots'] = plan.avg
         if plan.count_shots:
-            # the tProcessor's externally readable counter: one increment per
-            # shot the sweep fires, plus one per program repetition
-            out['observed_shots'] = int(
-                soc.tproc.single_read(addr=getattr(self, 'COUNTER_ADDR', 1)))
+            # the shot loop increments external counter 1 (inc_ext_counter
+            # addr=1), whatever counter the program completes on
+            out['observed_shots'] = int(soc.get_tproc_counter(addr=1))
         return out
 
     def decode_stop_log(self, words, name=None, *, start_word=None):
@@ -6021,9 +5970,10 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                 "counter-based sweep completion needs an AveragerProgramV2 "
                 "(sweeps in _initialize, empty _body, reps=1), or an "
                 "AcquireProgramV2 with setup_counter() and matching increments")
-        if any(p.count_shots for p in self._sweep_plans.values()):
-            raise ValueError("count_shots=True reuses the completion counter; "
-                             "use record_points=True for retained-shot diagnostics")
+        if int(counter) == 1 and any(p.count_shots for p in self._sweep_plans.values()):
+            raise ValueError("count_shots=True increments counter 1, which is also this "
+                             "program's completion counter; complete on counter 2 "
+                             "(COUNTER_ADDR = 2) or use record_points=True")
         return int(counter), int(np.prod(dimensions))
 
     def _sweep_complete(self, soc):
@@ -6059,13 +6009,12 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         if self.binprog is None:
             self.compile()
         counter, _ = self._sweep_completion_spec()
-        settings = [p for p in self._sweep_plans.values()
-                    if p.estop_d or p.a_words or p.c_words]
+        settings = [p for p in self._sweep_plans.values() if p.estop_d]
         if settings:
             first = settings[0]
-            signature = lambda p: (p.estop_d, p.block_tol, tuple(p.a_words), tuple(p.c_words))
+            signature = lambda p: (p.estop_d, p.block_tol)
             _require(all(signature(p) == signature(first) for p in settings),
-                     "one run shares the AXI thresholds and schedules; use separate "
+                     "one run shares the AXI thresholds; use separate "
                      "runs when these settings differ")
             if accelerator is None:
                 accelerator = getattr(soc, 'adaptive_sweep_0', None)
@@ -6238,10 +6187,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             cfg['max_iter'] = plan.max_iter
             cfg['patience'] = plan.patience
             cfg['movement_guard'] = plan.movement_guard
-            cfg['use_lut'] = bool(plan.use_lut)
-            if not plan.use_lut:
-                cfg['lambda'] = plan.lam
-                cfg['pairs_per_move'] = (plan.m_min, plan.m_max)
+            cfg['lambda'] = plan.lam
+            cfg['pairs_per_move'] = (plan.m_min, plan.m_max)
         else:
             cfg['start_mhz'] = plan.start_mhz
             cfg['stop_mhz'] = plan.stop_mhz

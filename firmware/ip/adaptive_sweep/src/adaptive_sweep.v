@@ -10,12 +10,12 @@ module adaptive_sweep (
   input [31:0] qtag_dt2_i,
   input [31:0] qtag_dt3_i,
   input [31:0] qtag_dt4_i,
-  (* MARK_DEBUG = "TRUE" *) output reg qtag_rdy_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [31:0] qtag_dt1_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [31:0] qtag_dt2_o,
-  (* MARK_DEBUG = "TRUE" *) output reg qtag_vld_o,
+  output reg qtag_rdy_o,
+  output reg [31:0] qtag_dt1_o,
+  output reg [31:0] qtag_dt2_o,
+  output reg qtag_vld_o,
 
-  (* MARK_DEBUG = "TRUE" *) output interrupt_o,
+  output interrupt_o,
 
   input s_axis_tvalid,
   output s_axis_tready,
@@ -41,12 +41,37 @@ module adaptive_sweep (
   output [31:0] s_axi_rdata,
   output [1:0] s_axi_rresp,
   output s_axi_rvalid,
-  input s_axi_rready
+  input s_axi_rready,
+
+  output [31:0] c_debug_do,
+  output [31:0] c_data_do,
+  output [31:0] ps_debug_do
 );
+
+  // QP2 opcode map. op[4:3] is the class: 0 configure, 1 control, 2 read,
+  // 3 debug. 15 is CFG_INTERRUPT, decoded by the processor and ignored here;
+  // 24 is reserved for GET_DEBUG.
+  localparam [4:0] OP_CFG_WINDOW = 5'd0;
+  localparam [4:0] OP_CFG_ACQ = 5'd1;
+  localparam [4:0] OP_CFG_GDKW = 5'd2;
+  localparam [4:0] OP_START = 5'd8;
+  localparam [4:0] OP_RUN_GD = 5'd9;
+  localparam [4:0] OP_RUN_KW = 5'd10;
+  localparam [4:0] OP_CLR_RESULT = 5'd11;
+  localparam [4:0] OP_REARM = 5'd12;
+  localparam [4:0] OP_CFG_INTERRUPT = 5'd15;
+  localparam [4:0] OP_GET_FREQ = 5'd16;
+  localparam [4:0] OP_GET_STATUS = 5'd17;
+  localparam [4:0] OP_GET_DIAG = 5'd18;
+  localparam [4:0] OP_GET_MEAN = 5'd19;
+
+  // REG7 of the AXI slave: "AS", the opcode-map ABI, a reserved byte.
+  localparam [7:0] ABI = 8'd2;
+  localparam [31:0] IDENT = {16'h4153, ABI, 8'd0};
 
   assign s_axis_tready = 1'b1;
 
-  (* MARK_DEBUG = "TRUE" *) reg en_d;
+  reg en_d;
   wire en_rise = qtag_en_i & ~en_d;
 
   always @(posedge clk) begin
@@ -56,29 +81,24 @@ module adaptive_sweep (
       en_d <= qtag_en_i;
   end
 
-  (* MARK_DEBUG = "TRUE" *) wire cfg_sweep = en_rise & (qtag_op_i == 5'd0);
-  (* MARK_DEBUG = "TRUE" *) wire start_now = en_rise & (qtag_op_i == 5'd1);
-  (* MARK_DEBUG = "TRUE" *) wire cfg_meas = en_rise & (qtag_op_i == 5'd2);
-  (* MARK_DEBUG = "TRUE" *) wire status_rd = en_rise & (qtag_op_i == 5'd3);
-  (* MARK_DEBUG = "TRUE" *) wire diag_rd = en_rise & (qtag_op_i == 5'd4);
-  (* MARK_DEBUG = "TRUE" *) wire run_gdkw = en_rise & ((qtag_op_i == 5'd5) | (qtag_op_i == 5'd6));
-  (* MARK_DEBUG = "TRUE" *) wire getfreq_rd = en_rise & (qtag_op_i == 5'd7);
-  (* MARK_DEBUG = "TRUE" *) wire gdkw_diag_rd = en_rise & (qtag_op_i == 5'd8);
-  (* MARK_DEBUG = "TRUE" *) wire cfg_gdkw = en_rise & (qtag_op_i == 5'd9);
-  (* MARK_DEBUG = "TRUE" *) wire clr_result = en_rise & (qtag_op_i == 5'd10);
-  (* MARK_DEBUG = "TRUE" *) wire getmean_rd = en_rise & (qtag_op_i == 5'd11);
-  (* MARK_DEBUG = "TRUE" *) wire rearm_now = en_rise & (qtag_op_i == 5'd14);
+  wire cfg_sweep = en_rise & (qtag_op_i == OP_CFG_WINDOW);
+  wire cfg_meas = en_rise & (qtag_op_i == OP_CFG_ACQ);
+  wire cfg_gdkw = en_rise & (qtag_op_i == OP_CFG_GDKW);
+  wire start_now = en_rise & (qtag_op_i == OP_START);
+  wire run_gdkw = en_rise & ((qtag_op_i == OP_RUN_GD) | (qtag_op_i == OP_RUN_KW));
+  wire clr_result = en_rise & (qtag_op_i == OP_CLR_RESULT);
+  wire rearm_now = en_rise & (qtag_op_i == OP_REARM);
+  wire getfreq_rd = en_rise & (qtag_op_i == OP_GET_FREQ);
+  wire status_rd = en_rise & (qtag_op_i == OP_GET_STATUS);
+  wire diag_rd = en_rise & (qtag_op_i == OP_GET_DIAG);
+  wire getmean_rd = en_rise & (qtag_op_i == OP_GET_MEAN);
+  wire op_decoded = cfg_sweep | cfg_meas | cfg_gdkw | start_now | run_gdkw |
+                    clr_result | rearm_now | getfreq_rd | status_rd | diag_rd |
+                    getmean_rd;
+  wire op_unknown = en_rise & ~op_decoded & (qtag_op_i != OP_CFG_INTERRUPT);
 
   wire [15:0] threshold;
   wire [31:0] block_tol;
-  wire step_lut_write;
-  wire [5:0] step_lut_addr;
-  wire [31:0] step_lut_data;
-  wire [6:0] step_lut_len;
-  wire offset_lut_write;
-  wire [5:0] offset_lut_addr;
-  wire [31:0] offset_lut_data;
-  wire [6:0] offset_lut_len;
 
   wire [31:0] cfg_start;
   wire [31:0] cfg_step;
@@ -97,6 +117,16 @@ module adaptive_sweep (
   wire block_en;
   wire short_confirm;
   wire [2:0] cfg_confirm;
+  wire [31:0] ctrl_word;
+
+  wire [31:0] status_word;
+  wire [31:0] dbg_status;
+  wire [31:0] dbg_dt1;
+  wire [31:0] dbg_dt2;
+  wire [4:0] read_sel;
+  wire axi_commit;
+  wire [4:0] axi_target;
+  wire axi_bad_target;
 
   register_bank registers(
     .clk(clk),
@@ -129,6 +159,10 @@ module adaptive_sweep (
     .dt2_i(qtag_dt2_i),
     .dt3_i(qtag_dt3_i),
     .dt4_i(qtag_dt4_i),
+    .status_i(dbg_status),
+    .view_dt1_i(dbg_dt1),
+    .view_dt2_i(dbg_dt2),
+    .ident_i(IDENT),
     .start_freq_o(cfg_start),
     .step_o(cfg_step),
     .n_points_o(cfg_npoints),
@@ -147,20 +181,17 @@ module adaptive_sweep (
     .block_en_o(block_en),
     .short_confirm_o(short_confirm),
     .confirm_o(cfg_confirm),
-    .step_lut_write_o(step_lut_write),
-    .step_lut_addr_o(step_lut_addr),
-    .step_lut_data_o(step_lut_data),
-    .step_lut_len_o(step_lut_len),
-    .offset_lut_write_o(offset_lut_write),
-    .offset_lut_addr_o(offset_lut_addr),
-    .offset_lut_data_o(offset_lut_data),
-    .offset_lut_len_o(offset_lut_len)
+    .ctrl_o(ctrl_word),
+    .read_sel_o(read_sel),
+    .commit_o(axi_commit),
+    .target_o(axi_target),
+    .bad_target_o(axi_bad_target)
   );
-
-  wire [31:0] status_word;
 
   wire pf_freq_valid;
   wire pf_finish;
+  wire pf_waiting;
+  wire [1:0] pf_state;
   wire [31:0] best_freq;
   wire [31:0] pf_best_mean_i;
   wire [31:0] pf_best_mean_q;
@@ -175,6 +206,7 @@ module adaptive_sweep (
   wire [15:0] ac_log_entry;
   wire [63:0] ac_power;
   wire ac_power_valid;
+  wire [31:0] ac_flags;
   reg [15:0] nconv_cnt;
 
   wire [31:0] eng_freq_word;
@@ -189,11 +221,13 @@ module adaptive_sweep (
   wire [15:0] eng_iter;
   wire [15:0] eng_pairs;
   wire [31:0] eng_sd_hi;
+  wire [31:0] eng_step;
+  wire [31:0] eng_flags;
 
   wire eng_freq_ack = getfreq_rd & eng_freq_valid;
 
-  (* MARK_DEBUG = "TRUE" *) reg busy;
-  (* MARK_DEBUG = "TRUE" *) reg finish_seen;
+  reg busy;
+  reg finish_seen;
 
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -208,7 +242,7 @@ module adaptive_sweep (
     end
   end
 
-  (* MARK_DEBUG = "TRUE" *) reg dest_r;
+  reg dest_r;
 
   always @(posedge clk) begin
     if (!rst_n)
@@ -235,7 +269,7 @@ module adaptive_sweep (
                         finish_seen,
                         (dest_r & eng_stalled)};
 
-  (* MARK_DEBUG = "TRUE" *) reg res_pend;
+  reg res_pend;
 
   always @(posedge clk) begin
     if (!rst_n)
@@ -277,10 +311,6 @@ module adaptive_sweep (
       qtag_dt1_o <= eng_freq_word;
       qtag_dt2_o <= {31'd0, eng_freq_valid};
       qtag_vld_o <= 1'b1;
-    end else if (gdkw_diag_rd & ~res_pend) begin
-      qtag_dt1_o <= {eng_pairs, eng_iter};
-      qtag_dt2_o <= eng_sd_hi;
-      qtag_vld_o <= 1'b1;
     end else if (getmean_rd & ~res_pend) begin
       qtag_dt1_o <= dest_r ? ac_mean_i : pf_best_mean_i;
       qtag_dt2_o <= dest_r ? ac_mean_q : pf_best_mean_q;
@@ -297,11 +327,11 @@ module adaptive_sweep (
       qtag_rdy_o <= 1'b1;
   end
 
-  (* MARK_DEBUG = "TRUE" *) reg int_en;
-  (* MARK_DEBUG = "TRUE" *) reg int_pulse;
-  (* MARK_DEBUG = "TRUE" *) reg draining;
-  (* MARK_DEBUG = "TRUE" *) reg arm_pend;
-  (* MARK_DEBUG = "TRUE" *) reg [31:0] drain_drop_cnt;
+  reg int_en;
+  reg int_pulse;
+  reg draining;
+  reg arm_pend;
+  reg [31:0] drain_drop_cnt;
 
   wire ac_early_pulse;
   wire drain_set = ac_early_pulse & int_en;
@@ -390,7 +420,8 @@ module adaptive_sweep (
     .log_wr_o          (ac_log_wr),
     .log_entry_o       (ac_log_entry),
     .power_o           (ac_power),
-    .power_valid_o     (ac_power_valid)
+    .power_valid_o     (ac_power_valid),
+    .debug_o           (ac_flags)
   );
 
   always @(posedge clk) begin
@@ -402,15 +433,14 @@ module adaptive_sweep (
       nconv_cnt <= nconv_cnt + 16'd1;
   end
 
-  (* MARK_DEBUG = "TRUE" *) wire grid_valid = ac_power_valid & ~dest_r;
-  (* MARK_DEBUG = "TRUE" *) wire search_valid = ac_power_valid & dest_r;
+  wire grid_valid = ac_power_valid & ~dest_r;
+  wire search_valid = ac_power_valid & dest_r;
 
   gradient_engine u_gradient_engine (
     .clk               (clk),
     .rst_n             (rst_n),
     .start_i           (run_gdkw),
-    .two_sided_i       (qtag_op_i == 5'd6),
-    .scheduled_i       (qtag_dt2_i[0]),
+    .two_sided_i       (qtag_op_i == OP_RUN_KW),
     .movement_guard_i  (qtag_dt2_i[1]),
     .dip_i             (search_mode),
     .x0_i              (qtag_dt1_i),
@@ -423,14 +453,6 @@ module adaptive_sweep (
     .lambda_i          (qtag_dt2_i[8:4]),
     .pair_min_i        (cfg_pair_min),
     .pair_max_i        (cfg_pair_max),
-    .step_lut_write_i  (step_lut_write),
-    .step_lut_addr_i   (step_lut_addr),
-    .step_lut_data_i   (step_lut_data),
-    .step_lut_len_i    (step_lut_len),
-    .offset_lut_write_i(offset_lut_write),
-    .offset_lut_addr_i (offset_lut_addr),
-    .offset_lut_data_i (offset_lut_data),
-    .offset_lut_len_i  (offset_lut_len),
     .freq_word_o       (eng_freq_word),
     .freq_valid_o      (eng_freq_valid),
     .freq_ack_i        (eng_freq_ack),
@@ -445,7 +467,9 @@ module adaptive_sweep (
     .x_o               (eng_x),
     .iteration_o       (eng_iter),
     .pairs_o           (eng_pairs),
-    .signed_sum_high_o (eng_sd_hi)
+    .signed_sum_high_o (eng_sd_hi),
+    .step_o            (eng_step),
+    .debug_o           (eng_flags)
   );
 
   peak_finder u_peak_finder (
@@ -465,7 +489,88 @@ module adaptive_sweep (
     .best_freq_o    (best_freq),
     .best_mean_i_o  (pf_best_mean_i),
     .best_mean_q_o  (pf_best_mean_q),
-    .point_idx_o    (pf_point_idx)
+    .point_idx_o    (pf_point_idx),
+    .state_o        (pf_state),
+    .waiting_o      (pf_waiting)
   );
+
+  // Debug: the AXI views (REG4..REG6 through register_bank) and the ILA
+  // vectors, always built. sweep_debug registers everything it observes.
+  sweep_debug monitor (
+    .clk              (clk),
+    .rst_n            (rst_n),
+    .read_sel_i       (read_sel),
+    .job_start_i      (start_now | run_gdkw),
+    .op_strobe_i      (en_rise),
+    .op_i             (qtag_op_i),
+    .op_unknown_i     (op_unknown),
+    .read_held_i      ((status_rd | diag_rd | getfreq_rd | getmean_rd) & res_pend),
+    .getfreq_idle_i   (getfreq_rd & ~eng_freq_valid),
+    .rdy_i            (qtag_rdy_o),
+    .vld_i            (qtag_vld_o),
+    .res_pend_i       (res_pend),
+    .dest_i           (dest_r),
+    .busy_i           (busy),
+    .finish_seen_i    (finish_seen),
+    .int_en_i         (int_en),
+    .draining_i       (draining),
+    .arm_pend_i       (arm_pend),
+    .tvalid_i         (s_axis_tvalid),
+    .drain_drop_cnt_i (drain_drop_cnt),
+    .nconv_i          (nconv_cnt),
+    .best_freq_i      (best_freq),
+    .resp_dt1_i       (qtag_dt1_o),
+    .resp_dt2_i       (qtag_dt2_o),
+    .pf_state_i       (pf_state),
+    .pf_waiting_i     (pf_waiting),
+    .pf_freq_valid_i  (pf_freq_valid),
+    .pf_point_idx_i   (pf_point_idx),
+    .eng_flags_i      (eng_flags),
+    .eng_step_i       (eng_step),
+    .eng_freq_word_i  (eng_freq_word),
+    .eng_x_i          (eng_x),
+    .eng_iter_i       (eng_iter),
+    .eng_pairs_i      (eng_pairs),
+    .eng_sd_hi_i      (eng_sd_hi),
+    .ac_flags_i       (ac_flags),
+    .ac_power_i       (ac_power),
+    .ac_power_valid_i (ac_power_valid),
+    .ac_mean_i_i      (ac_mean_i),
+    .ac_mean_q_i      (ac_mean_q),
+    .ac_n_used_i      (ac_n_used),
+    .ac_log_entry_i   (ac_log_entry),
+    .cfg_start_i      (cfg_start),
+    .cfg_step_i       (cfg_step),
+    .cfg_npoints_i    (cfg_npoints),
+    .cfg_avg_shift_i  (cfg_avg_shift),
+    .cfg_warmup_i     (cfg_warmup_shots),
+    .cfg_nmin_i       (cfg_nmin),
+    .cfg_flo_i        (cfg_flo),
+    .cfg_fhi_i        (cfg_fhi),
+    .cfg_pair_min_i   (cfg_pair_min),
+    .cfg_pair_max_i   (cfg_pair_max),
+    .threshold_i      (threshold),
+    .block_tol_i      (block_tol),
+    .ctrl_i           (ctrl_word),
+    .confirm_i        (cfg_confirm),
+    .axi_commit_i     (axi_commit),
+    .axi_target_i     (axi_target),
+    .axi_bad_target_i (axi_bad_target),
+    .view_dt1_o       (dbg_dt1),
+    .view_dt2_o       (dbg_dt2)
+  );
+  assign dbg_status = status_word;
+
+  assign c_debug_do = {en_rise, qtag_op_i,
+                       qtag_rdy_o, qtag_vld_o, res_pend, dest_r, busy, finish_seen,
+                       pf_state, eng_flags[15:12],
+                       eng_freq_valid, eng_probe_arm, eng_done, pf_freq_valid, pf_finish,
+                       ac_flags[5], ac_flags[4], ac_flags[0], ac_power_valid, ac_early_pulse,
+                       int_pulse, draining, arm_pend, s_axis_tvalid};
+  assign c_data_do = dbg_dt1;
+  assign ps_debug_do = {s_axi_arready, s_axi_rready, s_axi_awready, s_axi_wready,
+                        s_axi_arvalid, s_axi_rvalid, s_axi_awvalid, s_axi_wvalid,
+                        s_axi_araddr[5:0], s_axi_awaddr[5:0],
+                        s_axi_rdata[5:0], s_axi_wdata[5:0]};
 
 endmodule

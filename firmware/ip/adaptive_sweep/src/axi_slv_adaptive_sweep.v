@@ -32,16 +32,16 @@ module axi_slv_adaptive_sweep
       output   wire              s_axi_rvalid   ,
       input    wire              s_axi_rready   ,
 
-      // Registers (placeholder map -- rename once the AXI-Lite register
-      // list for adaptive_sweep is defined).
+      // REG0..REG3 are written by the host and read back; REG4..REG7 are
+      // read-only and return whatever register_bank drives on the *_IN ports.
       output   wire  [31:0]      REG0_REG       ,
       output   wire  [31:0]      REG1_REG       ,
       output   wire  [31:0]      REG2_REG       ,
       output   wire  [31:0]      REG3_REG       ,
-      output   wire  [31:0]      REG4_REG       ,
-      output   wire  [31:0]      REG5_REG       ,
-      output   wire  [31:0]      REG6_REG       ,
-      output   wire  [31:0]      REG7_REG
+      input    wire  [31:0]      REG4_IN        ,
+      input    wire  [31:0]      REG5_IN        ,
+      input    wire  [31:0]      REG6_IN        ,
+      input    wire  [31:0]      REG7_IN
 );
 
 // Width of S_AXI data bus
@@ -69,7 +69,8 @@ reg   axi_rvalid;
 localparam integer ADDR_LSB = (C_S_AXI_DATA_WIDTH/32) + 1;
 localparam integer OPT_MEM_ADDR_BITS = 2;
 
-//-- Number of Slave Registers 8
+//-- Number of Slave Registers 8: four writable (REG0..REG3) and four
+//-- read-only (REG4..REG7, driven by the *_IN ports since 2026-10-24).
 //-- Trimmed from the template's 64 on 2026-08-23: only REG0..REG7
 //-- leave this module, so the other 56 were unreachable flops plus a
 //-- 64-way read mux.  Word addresses above 0x1C now alias down into
@@ -79,10 +80,6 @@ reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg0;
 reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg1;
 reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg2;
 reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg3;
-reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg4;
-reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg5;
-reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg6;
-reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg7;
 wire   slv_reg_rden;
 wire   slv_reg_wren;
 reg [C_S_AXI_DATA_WIDTH-1:0]   reg_data_out;
@@ -199,10 +196,6 @@ begin
       slv_reg1 <= 0;
       slv_reg2 <= 0;
       slv_reg3 <= 0;
-      slv_reg4 <= 0;
-      slv_reg5 <= 0;
-      slv_reg6 <= 0;
-      slv_reg7 <= 0;
     end
   else begin
     if (slv_reg_wren)
@@ -235,34 +228,6 @@ begin
                 // Respective byte enables are asserted as per write strobes
                 // Slave register 3
                 slv_reg3[(byte_index*8) +: 8] <= s_axi_wdata[(byte_index*8) +: 8];
-              end
-          3'h4:
-            for ( byte_index = 0; byte_index <= (C_S_AXI_DATA_WIDTH/8)-1; byte_index = byte_index+1 )
-              if ( s_axi_wstrb[byte_index] == 1 ) begin
-                // Respective byte enables are asserted as per write strobes
-                // Slave register 4
-                slv_reg4[(byte_index*8) +: 8] <= s_axi_wdata[(byte_index*8) +: 8];
-              end
-          3'h5:
-            for ( byte_index = 0; byte_index <= (C_S_AXI_DATA_WIDTH/8)-1; byte_index = byte_index+1 )
-              if ( s_axi_wstrb[byte_index] == 1 ) begin
-                // Respective byte enables are asserted as per write strobes
-                // Slave register 5
-                slv_reg5[(byte_index*8) +: 8] <= s_axi_wdata[(byte_index*8) +: 8];
-              end
-          3'h6:
-            for ( byte_index = 0; byte_index <= (C_S_AXI_DATA_WIDTH/8)-1; byte_index = byte_index+1 )
-              if ( s_axi_wstrb[byte_index] == 1 ) begin
-                // Respective byte enables are asserted as per write strobes
-                // Slave register 6
-                slv_reg6[(byte_index*8) +: 8] <= s_axi_wdata[(byte_index*8) +: 8];
-              end
-          3'h7:
-            for ( byte_index = 0; byte_index <= (C_S_AXI_DATA_WIDTH/8)-1; byte_index = byte_index+1 )
-              if ( s_axi_wstrb[byte_index] == 1 ) begin
-                // Respective byte enables are asserted as per write strobes
-                // Slave register 7
-                slv_reg7[(byte_index*8) +: 8] <= s_axi_wdata[(byte_index*8) +: 8];
               end
           default : begin
                     end
@@ -377,10 +342,10 @@ begin
         3'h1   : reg_data_out <= slv_reg1;
         3'h2   : reg_data_out <= slv_reg2;
         3'h3   : reg_data_out <= slv_reg3;
-        3'h4   : reg_data_out <= slv_reg4;
-        3'h5   : reg_data_out <= slv_reg5;
-        3'h6   : reg_data_out <= slv_reg6;
-        3'h7   : reg_data_out <= slv_reg7;
+        3'h4   : reg_data_out <= REG4_IN;
+        3'h5   : reg_data_out <= REG5_IN;
+        3'h6   : reg_data_out <= REG6_IN;
+        3'h7   : reg_data_out <= REG7_IN;
         default : reg_data_out <= 0;
       endcase
 end
@@ -408,9 +373,5 @@ assign REG0_REG = slv_reg0 [31:0];
 assign REG1_REG = slv_reg1 [31:0];
 assign REG2_REG = slv_reg2 [31:0];
 assign REG3_REG = slv_reg3 [31:0];
-assign REG4_REG = slv_reg4 [31:0];
-assign REG5_REG = slv_reg5 [31:0];
-assign REG6_REG = slv_reg6 [31:0];
-assign REG7_REG = slv_reg7 [31:0];
 
 endmodule

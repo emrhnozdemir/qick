@@ -8,12 +8,12 @@ module square_summer(
   input signed [31:0] i_i,
   input signed [31:0] q_i,
 
-  (* MARK_DEBUG = "TRUE" *) output reg [63:0] power_o,
-  (* MARK_DEBUG = "TRUE" *) output reg valid_o
+  output reg [63:0] power_o,
+  output reg valid_o
 );
 
-  (* MARK_DEBUG = "TRUE" *) wire [63:0] i_squared;
-  (* MARK_DEBUG = "TRUE" *) wire [63:0] q_squared;
+  wire [63:0] i_squared;
+  wire [63:0] q_squared;
 
   squarer square_of_i(
     .clk(clk),

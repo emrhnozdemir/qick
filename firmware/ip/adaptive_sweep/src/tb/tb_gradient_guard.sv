@@ -8,13 +8,11 @@ module tb_gradient_guard;
   always #2.5 clk = ~clk;
   reg rst_n = 0;
   reg start_i = 0;
-  reg movement_guard_i, two_sided_i, scheduled_i, dip_i;
+  reg movement_guard_i, two_sided_i, dip_i;
   reg [31:0] x0_i, f_lo_i, f_hi_i, step_i, min_step_i;
   reg [15:0] max_iteration_i, pair_min_i, pair_max_i;
   reg [7:0] patience_i;
   reg [4:0] lambda_i;
-  reg step_lut_write_i = 0;
-  reg [31:0] step_lut_data_i = 0;
   wire [31:0] freq_word_o, x_o, signed_sum_high_o;
   wire freq_valid_o, probe_arm_o, busy_o, done_o;
   wire converged_o, capped_o, stalled_o;
@@ -26,15 +24,11 @@ module tb_gradient_guard;
   gradient_engine dut (
     .clk(clk), .rst_n(rst_n), .start_i(start_i),
     .movement_guard_i(movement_guard_i), .two_sided_i(two_sided_i),
-    .scheduled_i(scheduled_i), .dip_i(dip_i),
+    .dip_i(dip_i),
     .x0_i(x0_i), .f_lo_i(f_lo_i), .f_hi_i(f_hi_i),
     .step_i(step_i), .min_step_i(min_step_i),
     .max_iteration_i(max_iteration_i), .patience_i(patience_i),
     .lambda_i(lambda_i), .pair_min_i(pair_min_i), .pair_max_i(pair_max_i),
-    .step_lut_write_i(step_lut_write_i), .step_lut_addr_i(6'd0),
-    .step_lut_data_i(step_lut_data_i), .step_lut_len_i(7'd1),
-    .offset_lut_write_i(1'b0), .offset_lut_addr_i(6'd0),
-    .offset_lut_data_i(32'd0), .offset_lut_len_i(7'd1),
     .freq_word_o(freq_word_o), .freq_valid_o(freq_valid_o),
     .freq_ack_i(freq_ack_i), .probe_arm_o(probe_arm_o),
     .amp_valid_i(amp_valid_i), .amp_data_i(amp_data_i),
@@ -136,7 +130,6 @@ module tb_gradient_guard;
     begin
       movement_guard_i = 1;
       two_sided_i = 0;
-      scheduled_i = 0;
       dip_i = 0;
       x0_i = 8;
       f_lo_i = 0;
@@ -212,11 +205,6 @@ module tb_gradient_guard;
     defaults();
     repeat (5) @(posedge clk);
     #1 rst_n = 1;
-    // A zero scheduled movement tests that the raw guard flag is ignored by
-    // scheduled GD, without requiring a populated multi-entry schedule.
-    step_lut_data_i = 0;
-    step_lut_write_i = 1;
-    @(posedge clk); #1 step_lut_write_i = 0;
     repeat (3) @(posedge clk);
 
     defaults(); x0_i = 16;
@@ -314,9 +302,6 @@ module tb_gradient_guard;
 
     defaults(); movement_guard_i = 0; mode = 3;
     run_case("disabled guard preserves legacy tie convergence", 8, 2, 4, 1, 0, 0, 1);
-
-    defaults(); scheduled_i = 1; step_i = 1;
-    run_case("raw guard ignored for scheduled GD", 8, 2, 4, 1, 0, 0, 1);
 
     defaults(); two_sided_i = 1; step_i = 0;
     run_case("raw guard ignored for two-sided KW", 8, 2, 4, 1, 0, 0, 1);

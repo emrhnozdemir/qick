@@ -15,29 +15,31 @@ module peak_finder(
   input [31:0] mean_i_i,
   input [31:0] mean_q_i,
 
-  (* MARK_DEBUG = "TRUE" *) output reg freq_valid_o,
-  (* MARK_DEBUG = "TRUE" *) output reg finish_o,
+  output reg freq_valid_o,
+  output reg finish_o,
 
-  (* MARK_DEBUG = "TRUE" *) output reg [31:0] best_freq_o,
+  output reg [31:0] best_freq_o,
   output reg [31:0] best_mean_i_o,
   output reg [31:0] best_mean_q_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [15:0] point_idx_o
+  output reg [15:0] point_idx_o,
+  output [1:0] state_o,
+  output waiting_o
 );
 
   localparam [1:0] S_IDLE = 2'd0, S_SEND_FREQ = 2'd1, S_WAIT_MEAS = 2'd2;
 
-  (* MARK_DEBUG = "TRUE" *) reg [1:0] state;
+  reg [1:0] state;
   reg [1:0] next_state;
 
-  (* MARK_DEBUG = "TRUE" *) reg [31:0] frequency;
-  (* MARK_DEBUG = "TRUE" *) reg [31:0] step;
-  (* MARK_DEBUG = "TRUE" *) reg [15:0] last_index;
-  (* MARK_DEBUG = "TRUE" *) reg [63:0] best_amplitude;
-  (* MARK_DEBUG = "TRUE" *) reg last_point;
-  (* MARK_DEBUG = "TRUE" *) reg dip;
+  reg [31:0] frequency;
+  reg [31:0] step;
+  reg [15:0] last_index;
+  reg [63:0] best_amplitude;
+  reg last_point;
+  reg dip;
   reg best_valid;
 
-  (* MARK_DEBUG = "TRUE" *) wire is_better = dip ? (amp_data_i < best_amplitude) : (amp_data_i > best_amplitude);
+  wire is_better = dip ? (amp_data_i < best_amplitude) : (amp_data_i > best_amplitude);
   wire take_point = is_better | ~best_valid;
   wire [15:0] next_index = point_idx_o + 16'd1;
 
@@ -144,5 +146,8 @@ module peak_finder(
       endcase
     end
   end
+
+  assign state_o = state;
+  assign waiting_o = (state == S_WAIT_MEAS);
 
 endmodule

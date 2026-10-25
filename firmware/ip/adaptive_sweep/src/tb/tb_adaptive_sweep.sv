@@ -16,6 +16,12 @@ module tb_adaptive_sweep;
   localparam [31:0] CTRL_SPLIT = 32'h0004_0046;
   localparam [31:0] CTRL_SPLIT_HOLD = 32'h0004_0056;
 
+  localparam [4:0] OP_CFG_WINDOW = 5'd0, OP_CFG_ACQ = 5'd1, OP_CFG_GDKW = 5'd2,
+                   OP_START = 5'd8, OP_RUN_GD = 5'd9, OP_RUN_KW = 5'd10,
+                   OP_CLR_RESULT = 5'd11, OP_REARM = 5'd12,
+                   OP_GET_FREQ = 5'd16, OP_GET_STATUS = 5'd17,
+                   OP_GET_DIAG = 5'd18, OP_GET_MEAN = 5'd19;
+
   reg clk;
   reg s_axi_aclk;
   reg rst_n;
@@ -46,6 +52,11 @@ module tb_adaptive_sweep;
   wire interrupt_o;
   wire [31:0] s_axi_rdata;
   wire s_axi_arready;
+  reg [7:0] s_axi_araddr;
+  reg s_axi_arvalid;
+  wire [31:0] c_debug_do;
+  wire [31:0] c_data_do;
+  wire [31:0] ps_debug_do;
 
   integer errors;
   integer block_irq_count = 0;
@@ -95,15 +106,18 @@ module tb_adaptive_sweep;
     .s_axi_bresp   (s_axi_bresp),
     .s_axi_bvalid  (s_axi_bvalid),
     .s_axi_bready  (1'b1),
-    .s_axi_araddr  (8'd0),
+    .s_axi_araddr  (s_axi_araddr),
     .s_axi_arprot  (3'd0),
-    .s_axi_arvalid (1'b0),
+    .s_axi_arvalid (s_axi_arvalid),
     .s_axi_arready (s_axi_arready),
     .s_axi_rdata   (s_axi_rdata),
     .s_axi_rresp   (s_axi_rresp),
     .s_axi_rvalid  (s_axi_rvalid),
     .s_axi_rready  (1'b1),
-    .interrupt_o   (interrupt_o)
+    .interrupt_o   (interrupt_o),
+    .c_debug_do    (c_debug_do),
+    .c_data_do     (c_data_do),
+    .ps_debug_do   (ps_debug_do)
   );
 
 
@@ -129,8 +143,17 @@ module tb_adaptive_sweep;
     end
   endtask
 
+  integer op_calls = 0;
+  integer op_pulses = 0;
+
+  always @(posedge clk) begin
+    if (rst_n && c_debug_do[31])
+      op_pulses <= op_pulses + 1;
+  end
+
   task automatic qp2_op(input [4:0] op, input [31:0] d1, input [31:0] d2, input [31:0] d3, input [31:0] d4);
     begin
+      op_calls = op_calls + 1;
       @(posedge clk);
       qtag_op_i <= op;
       qtag_dt1_i <= d1;
@@ -163,38 +186,49 @@ module tb_adaptive_sweep;
     end
   endtask
 
-  reg axi_tog;
-
-  // REG0 = {[31] toggle, [30:24] len, [23:21] count-1, [20:16] target,
-  //         [15:8] addr, [7:0] reserved}; REG1..REG7 = seven payload words.
-  task automatic axi_tbl_write(input [4:0] target, input [7:0] addr, input [31:0] data, input [6:0] len);
+  task automatic axi_read(input [7:0] addr, output [31:0] data);
     begin
-      axi_write(8'h04, data);
-      axi_write(8'h00, {axi_tog, len, 3'd0, target, addr, 8'd0});
-      axi_tog = ~axi_tog;
-      axi_write(8'h00, {axi_tog, len, 3'd0, target, addr, 8'd0});
+      @(posedge s_axi_aclk);
+      s_axi_araddr <= addr;
+      s_axi_arvalid <= 1'b1;
+      do
+        @(posedge s_axi_aclk);
+      while (!s_axi_arready);
+      s_axi_arvalid <= 1'b0;
+      do
+        @(posedge s_axi_aclk);
+      while (!s_axi_rvalid);
+      data = s_axi_rdata;
+      repeat (2) @(posedge s_axi_aclk);
+    end
+  endtask
+
+  // REG2 is the debug read select, a level: write it, let it cross into clk
+  // and the selected view cross back into s_axi_aclk.
+  task automatic axi_select_view(input [4:0] sel);
+    begin
+      axi_write(8'h08, {27'd0, sel});
       repeat (10) @(posedge clk);
     end
   endtask
 
-  task automatic axi_lut_burst4(input [4:0] target, input [7:0] addr,
-                                input [31:0] d0, input [31:0] d1,
-                                input [31:0] d2, input [31:0] d3, input [6:0] len);
+  reg axi_tog;
+
+  // REG0 = {[31] toggle, [30:21] reserved, [20:16] target, [15:0] reserved};
+  // REG1 = the payload word.
+  task automatic axi_tbl_write(input [4:0] target, input [31:0] data);
     begin
-      axi_write(8'h04, d0);
-      axi_write(8'h08, d1);
-      axi_write(8'h0C, d2);
-      axi_write(8'h10, d3);
-      axi_write(8'h00, {axi_tog, len, 3'd3, target, addr, 8'd0});
+      axi_write(8'h04, data);
+      axi_write(8'h00, {axi_tog, 10'd0, target, 16'd0});
       axi_tog = ~axi_tog;
-      axi_write(8'h00, {axi_tog, len, 3'd3, target, addr, 8'd0});
+      axi_write(8'h00, {axi_tog, 10'd0, target, 16'd0});
       repeat (10) @(posedge clk);
     end
   endtask
 
   task automatic axi_estop_thr(input [15:0] d);
     begin
-      axi_tbl_write(5'd2, 8'd0, {16'd0, d}, 7'd0);
+      axi_tbl_write(5'd2, {16'd0, d});
       repeat (40) @(posedge clk);
     end
   endtask
@@ -299,10 +333,10 @@ module tb_adaptive_sweep;
     begin
       g = 0;
       while (!qtag_rdy_o && (g < guardmax)) begin
-        qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
+        qp2_op(OP_GET_FREQ, 32'd0, 32'd0, 32'd0, 32'd0);
         if (!qtag_rdy_o && qtag_dt2_o[0]) begin
           if (rearm)
-            qp2_op(5'd14, 0, 0, 0, 0);
+            qp2_op(OP_REARM, 0, 0, 0, 0);
           feed_point(avg, isum, 0);
         end else
           g = g;
@@ -322,7 +356,7 @@ module tb_adaptive_sweep;
       g = 0;
       k = 0;
       while (!qtag_rdy_o && (g < guardmax)) begin
-        qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
+        qp2_op(OP_GET_FREQ, 32'd0, 32'd0, 32'd0, 32'd0);
         if (!qtag_rdy_o && qtag_dt2_o[0]) begin
           feed_point(avg, ((k % 2) == 0) ? isum_a : isum_b, 0);
           k = k + 1;
@@ -348,7 +382,7 @@ module tb_adaptive_sweep;
       g = 0;
       k = 0;
       while (!qtag_rdy_o && (g < 400)) begin
-        qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
+        qp2_op(OP_GET_FREQ, 32'd0, 32'd0, 32'd0, 32'd0);
         if (!qtag_rdy_o && qtag_dt2_o[0]) begin
           case (k)
             0: ii = reverse ? 30 : 0;
@@ -381,7 +415,7 @@ module tb_adaptive_sweep;
       g = 0;
       k = 0;
       while (!qtag_rdy_o && (g < 400)) begin
-        qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
+        qp2_op(OP_GET_FREQ, 32'd0, 32'd0, 32'd0, 32'd0);
         if (!qtag_rdy_o && qtag_dt2_o[0]) begin
           check32($sformatf("boundary probe %0d frequency", k), qtag_dt1_o,
                   (k == 0) ? (upper - STEP) : upper);
@@ -411,7 +445,7 @@ module tb_adaptive_sweep;
       g = 0;
       k = 0;
       while (!qtag_rdy_o && (g < 400)) begin
-        qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
+        qp2_op(OP_GET_FREQ, 32'd0, 32'd0, 32'd0, 32'd0);
         if (!qtag_rdy_o && qtag_dt2_o[0]) begin
           check32($sformatf("%s probe %0d", name, k), qtag_dt1_o,
                   (k == 0) ? expected_a : expected_b);
@@ -457,12 +491,11 @@ module tb_adaptive_sweep;
   integer p;
   reg [31:0] amp_of_point [0:4];
   reg [31:0] status_t0;
+  reg [31:0] axi_rd;
+  reg [31:0] commit_before;
   reg [31:0] n_used_t1, n_used_t2;
   reg [31:0] status_t1, status_t2;
   integer grid_before, search_before;
-  reg [31:0] tl_probes [0:9];
-  integer tl_i;
-  integer tl_g;
 
   initial begin
     errors = 0;
@@ -483,6 +516,8 @@ module tb_adaptive_sweep;
     s_axi_wdata = 32'd0;
     s_axi_wstrb = 4'd0;
     s_axi_wvalid = 1'b0;
+    s_axi_araddr = 8'd0;
+    s_axi_arvalid = 1'b0;
 
     amp_of_point[0] = 100 * 128;
     amp_of_point[1] = 200 * 128;
@@ -498,9 +533,9 @@ module tb_adaptive_sweep;
     check32("BC0 block tolerance reset", dut.block_tol, 0);
     check32("BC0 block guard reset disabled", {31'd0, dut.block_en}, 0);
 
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
-    qp2_op(5'd0, START_FREQ, STEP, N_POINTS, AVG_T0_SH);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, N_POINTS, AVG_T0_SH);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
 
     for (p = 0; p < 5; p = p + 1)
       feed_point(AVG_T0, amp_of_point[p], 0);
@@ -514,24 +549,24 @@ module tb_adaptive_sweep;
     //      which is the exact boundary of the (next_index == last_index)
     //      test that replaced (point_idx + 2 >= n_pts).  n_points 1 and 5
     //      are covered elsewhere; 2 was the gap.
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
-    qp2_op(5'd0, START_FREQ, STEP, 32'd2, AVG_T0_SH);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd2, AVG_T0_SH);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
     feed_point(AVG_T0, 32'd100, 0);
     feed_point(AVG_T0, 32'd900, 0);
     wait_finish;
     check32("T0c two-point sweep picks point 1", qtag_dt1_o, START_FREQ + STEP);
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_STATUS, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T0c point_idx reached 1 (status[31:16], now lossless)",
             {16'd0, qtag_dt1_o[31:16]}, 32'd1);
 
     // T0z  ALL-ZERO GRID, peak mode. Every point has power 0, so the strict
     //      is_better never fires; the first measurement is taken anyway
     //      (best_valid) and the answer is the first grid frequency, not 0.
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
-    qp2_op(5'd0, START_FREQ, STEP, 32'd3, AVG_T0_SH);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd3, AVG_T0_SH);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
     feed_point(AVG_T0, 0, 0);
     feed_point(AVG_T0, 0, 0);
     feed_point(AVG_T0, 0, 0);
@@ -540,39 +575,39 @@ module tb_adaptive_sweep;
     check64("T0z all-zero grid power", dut.u_peak_finder.best_amplitude, 64'd0);
 
     // T0t  TIES: three equal points, the first occurrence wins.
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
-    qp2_op(5'd0, START_FREQ, STEP, 32'd3, AVG_T0_SH);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd3, AVG_T0_SH);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
     feed_point(AVG_T0, 100 * 128, 0);
     feed_point(AVG_T0, 100 * 128, 0);
     feed_point(AVG_T0, 100 * 128, 0);
     wait_finish;
     check32("T0t tie keeps the first frequency", qtag_dt1_o, START_FREQ);
 
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
-    qp2_op(5'd0, START_FREQ, STEP, N_POINTS, AVG_T0_SH);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, N_POINTS, AVG_T0_SH);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
     for (p = 0; p < 5; p = p + 1)
       feed_point(AVG_T0, amp_of_point[p], 0);
     wait_finish;
 
-    qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
-    check32("T0 result survives a late OP10", qtag_dt1_o,
+    qp2_op(OP_GET_FREQ, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T0 result survives a late GET_FREQ", qtag_dt1_o,
             START_FREQ + 2 * STEP);
-    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
-    check32("T0 result survives a late OP3", qtag_dt1_o,
+    qp2_op(OP_GET_STATUS, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T0 result survives a late GET_STATUS", qtag_dt1_o,
             START_FREQ + 2 * STEP);
-    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
-    check32("T0 result survives a late OP5", qtag_dt1_o,
+    qp2_op(OP_GET_DIAG, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T0 result survives a late GET_DIAG", qtag_dt1_o,
             START_FREQ + 2 * STEP);
-    qp2_op(5'd8, 32'd0, 32'd0, 32'd0, 32'd0);
-    check32("T0 result survives a late OP11", qtag_dt1_o,
+    qp2_op(OP_GET_MEAN, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T0 result survives a late GET_MEAN", qtag_dt1_o,
             START_FREQ + 2 * STEP);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    check32("T0 vld cleared by OP13", {31'd0, qtag_vld_o}, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    check32("T0 vld cleared by CLR_RESULT", {31'd0, qtag_vld_o}, 32'd0);
 
-    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_STATUS, 32'd0, 32'd0, 32'd0, 32'd0);
     status_t0 = qtag_dt1_o;
     check32("T0 status point_idx", {16'd0, status_t0[31:16]}, 32'd4);
     check32("T0 status estop_en", {31'd0, status_t0[10]}, 32'd0);
@@ -581,17 +616,17 @@ module tb_adaptive_sweep;
     check32("T0 status finish_seen", {31'd0, status_t0[1]}, 32'd1);
     check32("T0 status freq_at_max", qtag_dt2_o, START_FREQ + 2 * STEP);
 
-    qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
-    qp2_op(5'd0, START_FREQ, STEP, 32'd1, AVG_THR_SH);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd1, AVG_THR_SH);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
 
     feed_alternating(AVG_THR, 100 * 128, 102 * 128);
     wait_finish;
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_DIAG, 32'd0, 32'd0, 32'd0, 32'd0);
     n_used_t1 = qtag_dt1_o;
-    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_STATUS, 32'd0, 32'd0, 32'd0, 32'd0);
     status_t1 = qtag_dt1_o;
     check32("T1 n_used (reset default D=64)", n_used_t1, 32'd8);
     check32("T1 early_stop (reset default D=64)", {31'd0, status_t1[8]}, 32'd1);
@@ -599,26 +634,26 @@ module tb_adaptive_sweep;
 
     axi_estop_thr(16'd101);
 
-    qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
-    qp2_op(5'd0, START_FREQ, STEP, 32'd1, AVG_THR_SH);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd1, AVG_THR_SH);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
 
     feed_alternating(AVG_THR, 100 * 128, 102 * 128);
     wait_finish;
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_DIAG, 32'd0, 32'd0, 32'd0, 32'd0);
     n_used_t2 = qtag_dt1_o;
-    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_STATUS, 32'd0, 32'd0, 32'd0, 32'd0);
     status_t2 = qtag_dt1_o;
     check32("T2 n_used (D=101, boundary pass)", n_used_t2, 32'd8);
     check32("T2 early_stop (D=101, boundary pass)", {31'd0, status_t2[8]}, 32'd1);
-    qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_MEAN, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T2 mean I at stop", qtag_dt1_o, 32'd12928);
     check32("T2 mean Q at stop", qtag_dt2_o, 32'd0);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_DIAG, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T2 diag converged", {31'd0, qtag_dt2_o[8]}, 32'd1);
     check32("T2 diag k (stop at 2^3)", {27'd0, qtag_dt2_o[7:3]}, 32'd3);
     check32("T2 diag type (0 = converged)", {29'd0, qtag_dt2_o[2:0]}, 32'd0);
@@ -626,30 +661,30 @@ module tb_adaptive_sweep;
 
     axi_estop_thr(16'd102);
 
-    qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
-    qp2_op(5'd0, START_FREQ, STEP, 32'd1, AVG_THR_SH);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd1, AVG_THR_SH);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
 
     feed_alternating(AVG_THR, 100 * 128, 102 * 128);
     wait_finish;
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_DIAG, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T2b n_used (D=102, boundary fail)", qtag_dt1_o, AVG_THR);
-    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_STATUS, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T2b early_stop (D=102, boundary fail)", {31'd0, qtag_dt1_o[8]}, 32'd0);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_DIAG, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T2b diag converged (capped, so 0)", {31'd0, qtag_dt2_o[8]}, 32'd0);
     check32("T2b diag type (4 = ran to the cap)", {29'd0, qtag_dt2_o[2:0]}, 32'd4);
     check32("T2b diag nconv_count", {16'd0, qtag_dt2_o[31:16]}, 32'd1);
 
     axi_estop_thr(16'd102);
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
-    qp2_op(5'd0, START_FREQ, STEP, 32'd2, AVG_THR_SH);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd2, AVG_THR_SH);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
 
     feed_alternating(AVG_THR, 100 * 128, 102 * 128);
     feed_point(AVG_THR, 1000, 500);
@@ -659,8 +694,8 @@ module tb_adaptive_sweep;
     // retired last, and the interrupt handler is what files it under a grid
     // index.  Point 0 here runs to the cap, point 1 converges at 8, so the
     // verdict is point 1's and nconv_count has counted point 0.
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_DIAG, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("TDIAG n_used of the last point", qtag_dt1_o, 32'd8);
     check32("TDIAG last point converged", {31'd0, qtag_dt2_o[8]}, 32'd1);
     check32("TDIAG last point k (stop at 2^3)", {27'd0, qtag_dt2_o[7:3]}, 32'd3);
@@ -669,27 +704,27 @@ module tb_adaptive_sweep;
 
     axi_estop_thr(16'd96);
 
-    qp2_op(5'd2, NSAMP, CTRL_MEAN32, 32'd0, 32'd0);
-    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd0);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_MEAN32, 32'd0, 32'd0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd1, 32'd0);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
 
     feed_point(1, 32'h7FFF_FFFF, 32'h8000_0000);
 
     wait_finish;
     check32("T3 rail peak freq_word", qtag_dt1_o, START_FREQ);
     check64("T3 int32 rail power", dut.u_peak_finder.best_amplitude, 64'h7FFF_FFFF_0000_0001);
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_STATUS, 32'd0, 32'd0, 32'd0, 32'd0);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
-    qp2_op(5'd0, START_FREQ, STEP, N_POINTS, 32'd1);
-    qp2_op(5'd9, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd2);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, N_POINTS, 32'd1);
+    qp2_op(OP_CFG_GDKW, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd2);
 
     grid_before = grid_valid_cnt;
     search_before = search_valid_cnt;
 
-    qp2_op(5'd5, START_FREQ, 32'h0002_0000, 32'd0, 32'd4);
+    qp2_op(OP_RUN_GD, START_FREQ, 32'h0002_0000, 32'd0, 32'd4);
     run_probes(2, 100 * 128, 400);
 
     check32("T5 gd result x", qtag_dt1_o, START_FREQ);
@@ -697,272 +732,203 @@ module tb_adaptive_sweep;
     check32("T5 grid path stayed idle", grid_valid_cnt - grid_before, 32'd0);
     check32("T5 search path saw every probe", search_valid_cnt - search_before, 32'd8);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_STATUS, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T5 status dest", {31'd0, qtag_dt1_o[11]}, 32'd1);
 
     // TR1  RACING MODE MOVES. lambda 1, m_min 1, m_max 2, patience 0,
     //      max_iter 3. Probe B (x + step) is served louder than probe A (x),
     //      so every pair certifies on its own (|dp| > |dp| >> 1) and x steps
     //      up by cfg_step each iteration: 3 iterations, 6 probes, capped.
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
-    qp2_op(5'd0, START_FREQ, STEP, N_POINTS, 32'd1);
-    qp2_op(5'd9, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd2);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, N_POINTS, 32'd1);
+    qp2_op(OP_CFG_GDKW, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd2);
     search_before = search_valid_cnt;
-    qp2_op(5'd5, START_FREQ, 32'h0000_0010, 32'd0, 32'd3);
+    qp2_op(OP_RUN_GD, START_FREQ, 32'h0000_0010, 32'd0, 32'd3);
     run_probes_ab(2, 100 * 128, 200 * 128, 400);
     check32("TR1 racing gd moved +3 steps", qtag_dt1_o, START_FREQ + 3 * STEP);
     check32("TR1 racing gd done word (capped, iter 3)", qtag_dt2_o, 32'h0003_0002);
     check32("TR1 racing gd served 6 probes", search_valid_cnt - search_before, 32'd6);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd9, 32'd0, 32'hFFFF_FFFF, 32'd2, 32'd2);
-    qp2_op(5'd5, START_FREQ, 32'h0000_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_GDKW, 32'd0, 32'hFFFF_FFFF, 32'd2, 32'd2);
+    qp2_op(OP_RUN_GD, START_FREQ, 32'h0000_0010, 32'd0, 32'd1);
     run_probes_mixed(0);
     check32("TR2 racing follows positive accumulated sign", qtag_dt1_o, START_FREQ + STEP);
     check32("TR2 one iteration capped", qtag_dt2_o, 32'h0001_0002);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd5, START_FREQ, 32'h0000_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_RUN_GD, START_FREQ, 32'h0000_0010, 32'd0, 32'd1);
     run_probes_mixed(1);
     check32("TR3 racing follows negative accumulated sign", qtag_dt1_o, START_FREQ - STEP);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT | 32'd1, 32'd0, 32'd0);
-    qp2_op(5'd6, START_FREQ, 32'h0000_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT | 32'd1, 32'd0, 32'd0);
+    qp2_op(OP_RUN_KW, START_FREQ, 32'h0000_0010, 32'd0, 32'd1);
     run_probes_mixed(0);
     check32("TR4 KW dip follows accumulated sign", qtag_dt1_o, START_FREQ - STEP);
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
-    qp2_op(5'd9, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd2);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(OP_CFG_GDKW, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd2);
 
     // TR0  lambda 0 IS DEGENERATE. Same response, lambda 0: |sum(dp)| can
     //      never exceed sum(|dp|), so no pair count certifies; every
     //      iteration exhausts m_max = 2 and ties, and x never leaves x0.
     //      This is the case plan_sweep rejects (lambda_ >= 1 in racing mode).
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
     search_before = search_valid_cnt;
-    qp2_op(5'd5, START_FREQ, 32'h0000_0000, 32'd0, 32'd3);
+    qp2_op(OP_RUN_GD, START_FREQ, 32'h0000_0000, 32'd0, 32'd3);
     run_probes_ab(2, 100 * 128, 200 * 128, 400);
     check32("TR0 lambda 0 never moves", qtag_dt1_o, START_FREQ);
     check32("TR0 lambda 0 done word (capped, iter 3)", qtag_dt2_o, 32'h0003_0002);
     check32("TR0 lambda 0 served 12 probes", search_valid_cnt - search_before, 32'd12);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
-    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd6);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SPLIT, 32'd0, 32'd8);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd1, 32'd6);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
 
     feed_point(64, 1000, 500);
     wait_finish;
 
     check32("T6 split freq", qtag_dt1_o, START_FREQ);
     check64("T6 split power", dut.u_peak_finder.best_amplitude, 64'd1250000);
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_DIAG, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T6 n_used", qtag_dt1_o, 32'd8);
     check32("T6 diag word", qtag_dt2_o, 32'h0000_0118);
-    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_STATUS, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T6 status early_stop", {31'd0, qtag_dt1_o[8]}, 32'd1);
-    qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_MEAN, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T6 mean I", qtag_dt1_o, 32'd1000);
     check32("T6 mean Q", qtag_dt2_o, 32'd500);
 
-    qp2_op(5'd2, NSAMP, CTRL_SPLIT_HOLD, 32'd0, 32'd8);
-    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd6);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SPLIT_HOLD, 32'd0, 32'd8);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd1, 32'd6);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
 
     feed_point(64, 1000, 500);
     wait_finish;
 
     check64("T6b drain power", dut.u_peak_finder.best_amplitude, 64'd1250000);
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_DIAG, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T6b n_used", qtag_dt1_o, 32'd8);
     check32("T6b diag word", qtag_dt2_o, 32'h0000_0118);
 
-    qp2_op(5'd2, NSAMP, CTRL_SPLIT, 32'd0, 32'd4);
-    qp2_op(5'd0, START_FREQ, STEP, 32'd1, 32'd7);
-    qp2_op(5'd1, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SPLIT, 32'd0, 32'd4);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd1, 32'd7);
+    qp2_op(OP_START, 32'd0, 32'd0, 32'd0, 32'd0);
 
     feed_alternating(128, 128000, 64000);
     wait_finish;
 
     check64("T9 cap power", dut.u_peak_finder.best_amplitude, 64'd9216000000);
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd4, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_DIAG, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T9 n_used", qtag_dt1_o, 32'd128);
     check32("T9 diag word", qtag_dt2_o, 32'h0001_0204);
-    qp2_op(5'd3, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_STATUS, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T9 status early_stop", {31'd0, qtag_dt1_o[8]}, 32'd0);
-    qp2_op(5'd11, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_GET_MEAN, 32'd0, 32'd0, 32'd0, 32'd0);
     check32("T9 mean I", qtag_dt1_o, 32'd96000);
     check32("T9 mean Q", qtag_dt2_o, 32'd0);
 
-    // one commit each, four entries per burst - the TL1 probe checks below
-    // are what verifies the burst engine wrote them to the right addresses
-    axi_lut_burst4(5'd0, 8'd0, 32'd64, 32'd32, 32'd8, 32'd2, 7'd4);
-    axi_lut_burst4(5'd1, 8'd0, 32'd100, 32'd50, 32'd20, 32'd10, 7'd4);
-
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
-    qp2_op(5'd0, START_FREQ, STEP, N_POINTS, 32'd1);
-    qp2_op(5'd9, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd1);
-
-    tl_probes[0] = 32'd268435356;
-    tl_probes[1] = 32'd268435556;
-    tl_probes[2] = 32'd268435470;
-    tl_probes[3] = 32'd268435570;
-    tl_probes[4] = 32'd268435532;
-    tl_probes[5] = 32'd268435572;
-    tl_probes[6] = 32'd268435550;
-    tl_probes[7] = 32'd268435570;
-    tl_probes[8] = 32'd268435552;
-    tl_probes[9] = 32'd268435572;
-
-    grid_before = grid_valid_cnt;
-    search_before = search_valid_cnt;
-
-    qp2_op(5'd6, 32'h1000_0000, 32'h0003_0001, 32'd16, 32'd10);
-
-    tl_i = 0;
-    tl_g = 0;
-    while (!qtag_rdy_o && (tl_g < 400)) begin
-      qp2_op(5'd7, 32'd0, 32'd0, 32'd0, 32'd0);
-      if (!qtag_rdy_o && qtag_dt2_o[0]) begin
-        if (tl_i < 10) begin
-          check32($sformatf("TL1 probe %0d freq", tl_i), qtag_dt1_o, tl_probes[tl_i]);
-        end else begin
-          $display("FAIL TL1: more than 10 probes");
-          errors = errors + 1;
-        end
-        feed_point(2, ((tl_i % 2) == 0) ? 100 * 128 : 200 * 128, 0);
-        tl_i = tl_i + 1;
-      end else begin
-        tl_i = tl_i;
-      end
-      tl_g = tl_g + 1;
-    end
-    if (tl_g >= 400) begin
-      $display("FAIL TL1: timed out serving schedule-mode probes");
-      errors = errors + 1;
-    end else begin
-      tl_g = tl_g;
-    end
-
-    check32("TL1 probes served", tl_i, 32'd10);
-    check32("TL1 kw result x", qtag_dt1_o, 32'h1000_006C);
-    check32("TL1 kw done word", qtag_dt2_o, 32'h0005_0001);
-    check32("TL1 grid path stayed idle", grid_valid_cnt - grid_before, 32'd0);
-    check32("TL1 search path saw every probe", search_valid_cnt - search_before, 32'd10);
-
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
-    qp2_op(5'd0, START_FREQ, STEP, 32'd0, 32'd1);
-    qp2_op(5'd9, START_FREQ, START_FREQ + 4 * STEP, 32'd1, 32'd1);
-    qp2_op(5'd5, START_FREQ + 4 * STEP, 32'h0001_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd0, 32'd1);
+    qp2_op(OP_CFG_GDKW, START_FREQ, START_FREQ + 4 * STEP, 32'd1, 32'd1);
+    qp2_op(OP_RUN_GD, START_FREQ + 4 * STEP, 32'h0001_0010, 32'd0, 32'd1);
     run_boundary_probes(0);
     check32("TB1 GD peak moves inward from upper bound", qtag_dt1_o, START_FREQ + 3 * STEP);
     check32("TB1 GD avoids false tie convergence", qtag_dt2_o, 32'h0001_0002);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT | 32'd1, 32'd0, 32'd0);
-    qp2_op(5'd5, START_FREQ + 4 * STEP, 32'h0001_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT | 32'd1, 32'd0, 32'd0);
+    qp2_op(OP_RUN_GD, START_FREQ + 4 * STEP, 32'h0001_0010, 32'd0, 32'd1);
     run_boundary_probes(1);
     check32("TB2 GD dip moves inward from upper bound", qtag_dt1_o, START_FREQ + 3 * STEP);
     check32("TB2 GD dip avoids false tie convergence", qtag_dt2_o, 32'h0001_0002);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
-    qp2_op(5'd5, START_FREQ + 4 * STEP, 32'h0001_0011, 32'd0, 32'd1);
-    run_boundary_probes(0);
-    check32("TB3 scheduled GD moves by LUT step at upper bound", qtag_dt1_o, START_FREQ + 4 * STEP - 32'd64);
-
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd6, START_FREQ + 4 * STEP, 32'h0001_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT, 32'd0, 32'd0);
+    qp2_op(OP_RUN_KW, START_FREQ + 4 * STEP, 32'h0001_0010, 32'd0, 32'd1);
     run_boundary_probes(0);
     check32("TB4 KW upper-bound behavior unchanged", qtag_dt1_o, START_FREQ + 3 * STEP);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd0, 32'd100, 32'd5, 32'd0, 32'd1);
-    qp2_op(5'd9, 32'd100, 32'd120, 32'd1, 32'd1);
-    qp2_op(5'd5, 32'd80, 32'h0001_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_WINDOW, 32'd100, 32'd5, 32'd0, 32'd1);
+    qp2_op(OP_CFG_GDKW, 32'd100, 32'd120, 32'd1, 32'd1);
+    qp2_op(OP_RUN_GD, 32'd80, 32'h0001_0010, 32'd0, 32'd1);
     run_range_probes("BR1 GD below-range seed", 100, 120, 100, 105, 100, 100, 100);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd6, 32'd140, 32'h0001_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_RUN_KW, 32'd140, 32'h0001_0010, 32'd0, 32'd1);
     run_range_probes("BR2 KW above-range seed", 100, 120, 115, 120, 100, 100, 120);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd0, 32'h8000_0000, 32'd16, 32'd0, 32'd1);
-    qp2_op(5'd9, 32'h8000_0000, 32'h8000_0020, 32'd1, 32'd1);
-    qp2_op(5'd5, 32'hffff_ffff, 32'h0001_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_WINDOW, 32'h8000_0000, 32'd16, 32'd0, 32'd1);
+    qp2_op(OP_CFG_GDKW, 32'h8000_0000, 32'h8000_0020, 32'd1, 32'd1);
+    qp2_op(OP_RUN_GD, 32'hffff_ffff, 32'h0001_0010, 32'd0, 32'd1);
     run_range_probes("BR3 GD unsigned upper seed", 32'h8000_0000, 32'h8000_0020,
                      32'h8000_0010, 32'h8000_0020, 100, 100, 32'h8000_0020);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd0, 32'h8000_0000, 32'hffff_ffff, 32'd0, 32'd1);
-    qp2_op(5'd6, 32'h7fff_fff0, 32'h0001_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_WINDOW, 32'h8000_0000, 32'hffff_ffff, 32'd0, 32'd1);
+    qp2_op(OP_RUN_KW, 32'h7fff_fff0, 32'h0001_0010, 32'd0, 32'd1);
     run_range_probes("BR4 KW unsigned lower seed", 32'h8000_0000, 32'h8000_0020,
                      32'h8000_0000, 32'h8000_0020, 100, 100, 32'h8000_0000);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd9, 32'hffff_fff0, 32'hffff_ffff, 32'd1, 32'd1);
-    qp2_op(5'd5, 32'hffff_fff8, 32'h0000_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_GDKW, 32'hffff_fff0, 32'hffff_ffff, 32'd1, 32'd1);
+    qp2_op(OP_RUN_GD, 32'hffff_fff8, 32'h0000_0010, 32'd0, 32'd1);
     run_range_probes("BR5 positive step cannot wrap", 32'hffff_fff0, 32'hffff_ffff,
                      32'hffff_fff8, 32'hffff_ffff, 100, 200, 32'hffff_ffff);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd9, 32'd0, 32'd32, 32'd1, 32'd1);
-    qp2_op(5'd6, 32'd16, 32'h0000_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_GDKW, 32'd0, 32'd32, 32'd1, 32'd1);
+    qp2_op(OP_RUN_KW, 32'd16, 32'h0000_0010, 32'd0, 32'd1);
     run_range_probes("BR6 negative step cannot wrap", 0, 32, 0, 32, 200, 100, 0);
 
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    axi_tbl_write(5'd0, 7'd0, 32'hffff_ffff, 7'd1);
-    axi_tbl_write(5'd1, 7'd0, 32'hffff_ffff, 7'd1);
-    qp2_op(5'd9, 32'h8000_0000, 32'h8000_0020, 32'd1, 32'd1);
-    qp2_op(5'd6, 32'h8000_0010, 32'h0000_0011, 32'd0, 32'd1);
-    run_range_probes("BR7 scheduled LUT step clamps", 32'h8000_0000, 32'h8000_0020,
-                     32'h8000_0000, 32'h8000_0020, 100, 200, 32'h8000_0020);
-
-    qp2_op(5'd10, 32'd0, 32'd0, 32'd0, 32'd0);
-    qp2_op(5'd9, 32'h9000_0000, 32'h9000_0000, 32'd1, 32'd1);
-    qp2_op(5'd6, 32'hffff_ffff, 32'h0001_0010, 32'd0, 32'd1);
+    qp2_op(OP_CLR_RESULT, 32'd0, 32'd0, 32'd0, 32'd0);
+    qp2_op(OP_CFG_GDKW, 32'h9000_0000, 32'h9000_0000, 32'd1, 32'd1);
+    qp2_op(OP_RUN_KW, 32'hffff_ffff, 32'h0001_0010, 32'd0, 32'd1);
     run_range_probes("BR8 singleton range retains bound", 32'h9000_0000, 32'h9000_0000,
                      32'h9000_0000, 32'h9000_0000, 100, 100, 32'h9000_0000);
 
     status_t0 = {16'd0, dut.threshold};
-    axi_tbl_write(5'd4, 0, 32'hffff_ffff, 0);
+    axi_tbl_write(5'd4, 32'hffff_ffff);
     check32("BC1 AXI target4 retains unsigned32 tolerance", dut.block_tol, 32'hffff_ffff);
     check32("BC1 target4 leaves relative threshold unchanged", {16'd0, dut.threshold}, status_t0);
-    axi_tbl_write(5'd4, 0, 0, 0);
-    qp2_op(5'd2, NSAMP, 32'h0002_00c6, 0, 4);
+    axi_tbl_write(5'd4, 0);
+    qp2_op(OP_CFG_ACQ, NSAMP, 32'h0002_00c6, 0, 4);
     check32("BC1 CTRL bit7 enables block guard", {31'd0, dut.block_en}, 1);
-    qp2_op(5'd14, 0, 0, 0, 0);
-    qp2_op(5'd0, START_FREQ, STEP, 1, 6);
+    qp2_op(OP_REARM, 0, 0, 0, 0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 1, 6);
     block_irq_before = block_irq_count;
-    qp2_op(5'd1, 0, 0, 0, 0);
+    qp2_op(OP_START, 0, 0, 0, 0);
     feed_point(64, 1000, -500);
     wait_finish;
     check32("BC1 stable block stops at8", dut.ac_n_used, 8);
     check32("BC1 emits one actual accelerator interrupt", block_irq_count - block_irq_before, 1);
     check32("BC1 retains stable signed mean Q", dut.ac_mean_q, -500);
 
-    qp2_op(5'd2, NSAMP, 32'h0002_00c6, 0, 4);
-    qp2_op(5'd14, 0, 0, 0, 0);
-    qp2_op(5'd0, START_FREQ, STEP, 1, 6);
+    qp2_op(OP_CFG_ACQ, NSAMP, 32'h0002_00c6, 0, 4);
+    qp2_op(OP_REARM, 0, 0, 0, 0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 1, 6);
     block_irq_before = block_irq_count;
-    qp2_op(5'd1, 0, 0, 0, 0);
+    qp2_op(OP_START, 0, 0, 0, 0);
     feed_block_step;
     wait_finish;
     check32("BC2 step drift runs tocap", dut.ac_n_used, 64);
     check32("BC2 rejected block emits no interrupt", block_irq_count - block_irq_before, 0);
     check32("BC2 cap mean I", dut.ac_mean_i, 93812);
 
-    qp2_op(5'd2, NSAMP, 32'h0002_0046, 0, 4);
-    qp2_op(5'd14, 0, 0, 0, 0);
-    qp2_op(5'd0, START_FREQ, STEP, 1, 6);
+    qp2_op(OP_CFG_ACQ, NSAMP, 32'h0002_0046, 0, 4);
+    qp2_op(OP_REARM, 0, 0, 0, 0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 1, 6);
     block_irq_before = block_irq_count;
-    qp2_op(5'd1, 0, 0, 0, 0);
+    qp2_op(OP_START, 0, 0, 0, 0);
     feed_block_step;
     wait_finish;
     check32("BC3 clearing bit7 restores checkpoint4", dut.ac_n_used, 4);
@@ -972,13 +938,13 @@ module tb_adaptive_sweep;
     // CTRL[8] selects short confirmation through the actual QP register
     // path. Three passes at 4/6/8 retain the first-four sample estimate,
     // even while later paired samples have a very different mean.
-    qp2_op(5'd2, NSAMP, 32'h0006_0146, 0, 4);
+    qp2_op(OP_CFG_ACQ, NSAMP, 32'h0006_0146, 0, 4);
     check32("SC1 QP CTRL bit8 enables short confirmation", {31'd0, dut.short_confirm}, 1);
     check32("SC1 QP CTRL configures three total passes", {29'd0, dut.cfg_confirm}, 3);
-    qp2_op(5'd14, 0, 0, 0, 0);
-    qp2_op(5'd0, START_FREQ, STEP, 1, 6);
+    qp2_op(OP_REARM, 0, 0, 0, 0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 1, 6);
     block_irq_before = block_irq_count;
-    qp2_op(5'd1, 0, 0, 0, 0);
+    qp2_op(OP_START, 0, 0, 0, 0);
     feed_block_step;
     wait_finish;
     check32("SC1 short returns saved N4 after checks6/8", dut.ac_n_used, 4);
@@ -986,22 +952,22 @@ module tb_adaptive_sweep;
     check32("SC1 short retains first-four I mean", dut.ac_mean_i, 1000);
     check32("SC1 short retains first-four Q mean", dut.ac_mean_q, -500);
     check64("SC1 short computes power from saved mean", dut.u_peak_finder.best_amplitude, 64'd1250000);
-    qp2_op(5'd10, 0, 0, 0, 0);
-    qp2_op(5'd4, 0, 0, 0, 0);
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_GET_DIAG, 0, 0, 0, 0);
     check32("SC1 QP reports saved N", qtag_dt1_o, 4);
     check32("SC1 QP reports candidate exponent", qtag_dt2_o, 32'h0000_0110);
 
     // The same mode must be selectable through the asynchronous AXI
     // target3 CTRL route, not just through the QP measurement operation.
-    qp2_op(5'd2, NSAMP, 32'h0006_0046, 0, 4);
+    qp2_op(OP_CFG_ACQ, NSAMP, 32'h0006_0046, 0, 4);
     check32("SC2 baseline CTRL clears short bit", {31'd0, dut.short_confirm}, 0);
-    axi_tbl_write(5'd3, 0, 32'h0006_0146, 0);
+    axi_tbl_write(5'd3, 32'h0006_0146);
     check32("SC2 AXI target3 sets short bit", {31'd0, dut.short_confirm}, 1);
     check32("SC2 AXI target3 preserves three passes", {29'd0, dut.cfg_confirm}, 3);
-    qp2_op(5'd14, 0, 0, 0, 0);
-    qp2_op(5'd0, START_FREQ, STEP, 1, 6);
+    qp2_op(OP_REARM, 0, 0, 0, 0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 1, 6);
     block_irq_before = block_irq_count;
-    qp2_op(5'd1, 0, 0, 0, 0);
+    qp2_op(OP_START, 0, 0, 0, 0);
     feed_block_step;
     wait_finish;
     check32("SC2 AXI short returns saved N4", dut.ac_n_used, 4);
@@ -1012,74 +978,194 @@ module tb_adaptive_sweep;
     // Movement guard uses RUN_GD bit1 and reports uncertainty in result bit2.
     // A flat response refines STEP -> STEP/2 -> STEP/4, then requires two
     // fresh exhausted races at the floor before stopping.
-    qp2_op(5'd10, 0, 0, 0, 0);
-    qp2_op(5'd2, NSAMP, CTRL_SHIFT, 0, 0);
-    qp2_op(5'd0, START_FREQ, STEP, N_POINTS, 1);
-    qp2_op(5'd9, 0, 32'hffff_ffff, 1, 2);
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_CFG_ACQ, NSAMP, CTRL_SHIFT, 0, 0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, N_POINTS, 1);
+    qp2_op(OP_CFG_GDKW, 0, 32'hffff_ffff, 1, 2);
     search_before = search_valid_cnt;
-    qp2_op(5'd5, START_FREQ, 32'h0002_0012, STEP >> 2, 64);
+    qp2_op(OP_RUN_GD, START_FREQ, 32'h0002_0012, STEP >> 2, 64);
     run_probes(2, 100 * 128, 800);
     check32("MG1 guarded flat result is measured seed", qtag_dt1_o, START_FREQ);
     check32("MG1 stalled, not converged or capped", qtag_dt2_o, 32'h0004_0004);
     check32("MG1 four iterations consume sixteen probes", search_valid_cnt - search_before, 16);
     check32("MG1 floor is reached", dut.u_gradient_engine.step, STEP >> 2);
-    qp2_op(5'd7, 0, 0, 0, 0);
+    qp2_op(OP_GET_FREQ, 0, 0, 0, 0);
     check32("MG1 late frequency poll preserves result", qtag_dt2_o, 32'h0004_0004);
-    qp2_op(5'd3, 0, 0, 0, 0);
+    qp2_op(OP_GET_STATUS, 0, 0, 0, 0);
     check32("MG1 late status poll preserves result", qtag_dt2_o, 32'h0004_0004);
-    qp2_op(5'd10, 0, 0, 0, 0);
-    qp2_op(5'd3, 0, 0, 0, 0);
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_GET_STATUS, 0, 0, 0, 0);
     check32("MG1 live stalled status bit0", {31'd0, qtag_dt1_o[0]}, 1);
     check32("MG1 deprecated status bit9 remains clear", {31'd0, qtag_dt1_o[9]}, 0);
 
     // A cap after a negative update must return the sampled current iterate.
-    qp2_op(5'd10, 0, 0, 0, 0);
-    qp2_op(5'd9, 0, 32'hffff_ffff, 1, 2);
-    qp2_op(5'd5, START_FREQ, 32'h0002_0012, STEP >> 2, 1);
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_CFG_GDKW, 0, 32'hffff_ffff, 1, 2);
+    qp2_op(OP_RUN_GD, START_FREQ, 32'h0002_0012, STEP >> 2, 1);
     run_probes_ab(2, 200 * 128, 100 * 128, 400);
     check32("MG2 cap returns measured frequency", qtag_dt1_o, START_FREQ);
     check32("MG2 clears prior stalled flag and reports cap", qtag_dt2_o, 32'h0001_0002);
 
     // A singleton range acquires one estimate, with no duplicate B request.
-    qp2_op(5'd10, 0, 0, 0, 0);
-    qp2_op(5'd9, START_FREQ, START_FREQ, 1, 2);
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_CFG_GDKW, START_FREQ, START_FREQ, 1, 2);
     search_before = search_valid_cnt;
-    qp2_op(5'd5, START_FREQ, 32'h0002_0012, 1, 64);
+    qp2_op(OP_RUN_GD, START_FREQ, 32'h0002_0012, 1, 64);
     run_probes(2, 100 * 128, 400);
     check32("MG3 singleton measured result", qtag_dt1_o, START_FREQ);
     check32("MG3 singleton is stalled after one iteration", qtag_dt2_o, 32'h0001_0004);
     check32("MG3 singleton consumes one probe", search_valid_cnt - search_before, 1);
 
     // A later grid run must not inherit the sticky engine's stalled status.
-    qp2_op(5'd10, 0, 0, 0, 0);
-    qp2_op(5'd0, START_FREQ, STEP, 1, 1);
-    qp2_op(5'd1, 0, 0, 0, 0);
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 1, 1);
+    qp2_op(OP_START, 0, 0, 0, 0);
     feed_point(2, 100 * 128, 0);
     wait_finish;
-    qp2_op(5'd10, 0, 0, 0, 0);
-    qp2_op(5'd3, 0, 0, 0, 0);
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_GET_STATUS, 0, 0, 0, 0);
     check32("MG3 grid status masks prior stalled engine", {31'd0, qtag_dt1_o[0]}, 0);
 
     // Clearing the command bit restores the pre-guard tie policy.
-    qp2_op(5'd10, 0, 0, 0, 0);
-    qp2_op(5'd9, 0, 32'hffff_ffff, 1, 2);
-    qp2_op(5'd5, START_FREQ, 32'h0002_0010, STEP >> 2, 64);
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_CFG_GDKW, 0, 32'hffff_ffff, 1, 2);
+    qp2_op(OP_RUN_GD, START_FREQ, 32'h0002_0010, STEP >> 2, 64);
     run_probes(2, 100 * 128, 400);
     check32("MG4 legacy tie behavior preserved", qtag_dt2_o, 32'h0002_0001);
     check32("MG4 stale guard flag cleared", {31'd0, dut.eng_stalled}, 0);
 
     // The movement guard also accepts early-stopped per-frequency estimates
     // from the prior N/N+2/N+4 policy through the same acquisition interface.
-    qp2_op(5'd10, 0, 0, 0, 0);
-    qp2_op(5'd2, NSAMP, 32'h0006_0146, 0, 4);
-    qp2_op(5'd14, 0, 0, 0, 0);
-    qp2_op(5'd0, START_FREQ, STEP, 1, 6);
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_CFG_ACQ, NSAMP, 32'h0006_0146, 0, 4);
+    qp2_op(OP_REARM, 0, 0, 0, 0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 1, 6);
     search_before = search_valid_cnt;
-    qp2_op(5'd5, START_FREQ, 32'h0002_0012, STEP, 64);
+    qp2_op(OP_RUN_GD, START_FREQ, 32'h0002_0012, STEP, 64);
     run_probes(64, 1000, 800, 1);
     check32("MG5 short-confirmed probes produce stalled result", qtag_dt2_o, 32'h0002_0004);
     check32("MG5 two fresh exhausted races consume eight estimates", search_valid_cnt - search_before, 8);
     check32("MG5 short confirmation still returns saved N4", dut.ac_n_used, 4);
+
+    // DEBUG VIEWS. REG4 mirrors the GET_STATUS word, REG5/REG6 are the view
+    // pair chosen by REG2, REG7 is the IDENT word; the error bits are sticky
+    // until the next START/RUN_*. The last job above was a gd run.
+    axi_read(8'h1C, axi_rd);
+    check32("D0 IDENT register", axi_rd, 32'h4153_0200);
+
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_CFG_ACQ, 0, CTRL_SHIFT, 0, 0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd3, AVG_T0_SH);
+    qp2_op(OP_START, 0, 0, 0, 0);
+    feed_point(AVG_T0, 100, 0);
+    feed_point(AVG_T0, 200, 0);
+    feed_point(AVG_T0, 300, 0);
+    wait_finish;
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_GET_STATUS, 0, 0, 0, 0);
+    status_t0 = qtag_dt1_o;
+    axi_read(8'h10, axi_rd);
+    check32("D1 AXI STATUS equals the GET_STATUS word", axi_rd, status_t0);
+    check32("D1 STATUS point_idx", {16'd0, axi_rd[31:16]}, 32'd2);
+
+    axi_select_view(5'd6);
+    qp2_op(OP_GET_DIAG, 0, 0, 0, 0);
+    axi_read(8'h14, axi_rd);
+    check32("D2 view 6 DT1 is GET_DIAG n_used", axi_rd, qtag_dt1_o);
+    axi_read(8'h18, axi_rd);
+    check32("D2 view 6 DT2 is the GET_DIAG verdict", axi_rd, qtag_dt2_o);
+    axi_select_view(5'd5);
+    qp2_op(OP_GET_MEAN, 0, 0, 0, 0);
+    axi_read(8'h14, axi_rd);
+    check32("D2 view 5 DT1 is the live mean I", axi_rd, qtag_dt1_o);
+    axi_read(8'h18, axi_rd);
+    check32("D2 view 5 DT2 is the live mean Q", axi_rd, qtag_dt2_o);
+    axi_select_view(5'd15);
+    axi_read(8'h14, axi_rd);
+    check32("D2 view 15 DT1 is the last response", axi_rd, qtag_dt1_o);
+    axi_read(8'h18, axi_rd);
+    check32("D2 view 15 DT2 is the last response", axi_rd, qtag_dt2_o);
+
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, N_POINTS, 32'd1);
+    qp2_op(OP_CFG_GDKW, 32'd0, 32'hFFFF_FFFF, 32'd1, 32'd2);
+    qp2_op(OP_RUN_GD, START_FREQ, 32'h0000_0010, 32'd0, 32'd3);
+    run_probes_ab(2, 100 * 128, 200 * 128, 400);
+    check32("D3 gd moved +3 steps", qtag_dt1_o, START_FREQ + 3 * STEP);
+    axi_select_view(5'd1);
+    axi_read(8'h14, axi_rd);
+    check32("D3 view 1 engine state idle", {28'd0, axi_rd[15:12]}, 32'd0);
+    check32("D3 view 1 capped flag", {31'd0, axi_rd[3]}, 32'd1);
+    check32("D3 view 1 lambda", {27'd0, axi_rd[23:19]}, 32'd1);
+    axi_read(8'h18, axi_rd);
+    check32("D3 view 1 DT2 is {pairs, iter}", axi_rd, {dut.eng_pairs, dut.eng_iter});
+    axi_select_view(5'd2);
+    axi_read(8'h18, axi_rd);
+    check32("D3 view 2 DT2 is x", axi_rd, dut.eng_x);
+    axi_select_view(5'd3);
+    axi_read(8'h14, axi_rd);
+    check32("D3 view 3 DT1 is the live step", axi_rd, dut.u_gradient_engine.step);
+
+    axi_select_view(5'd8);
+    axi_read(8'h14, axi_rd);
+    check32("D4 view 8 DT1 start_freq", axi_rd, START_FREQ);
+    axi_read(8'h18, axi_rd);
+    check32("D4 view 8 DT2 step", axi_rd, STEP);
+    axi_select_view(5'd11);
+    axi_read(8'h18, axi_rd);
+    check32("D4 view 11 DT2 f_hi", axi_rd, 32'hFFFF_FFFF);
+    axi_select_view(5'd12);
+    axi_read(8'h14, axi_rd);
+    check32("D4 view 12 DT1 {pair_max, pair_min}", axi_rd, 32'h0002_0001);
+    axi_read(8'h18, axi_rd);
+    check32("D4 view 12 DT2 CTRL", axi_rd, CTRL_SHIFT);
+    axi_tbl_write(5'd4, 32'd77);
+    axi_select_view(5'd13);
+    axi_read(8'h14, axi_rd);
+    check32("D4 view 13 DT1 block_tol", axi_rd, 32'd77);
+    axi_read(8'h18, axi_rd);
+    check32("D4 view 13 DT2 last target", {27'd0, axi_rd[4:0]}, 32'd4);
+    commit_before = {16'd0, axi_rd[31:16]};
+    axi_tbl_write(5'd4, 32'd0);
+    axi_read(8'h18, axi_rd);
+    check32("D4 view 13 commit count advanced by one", {16'd0, axi_rd[31:16]}, commit_before + 1);
+
+    axi_select_view(5'd0);
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd1, AVG_T0_SH);
+    qp2_op(OP_START, 0, 0, 0, 0);
+    axi_read(8'h18, axi_rd);
+    check32("D5 errors clear at START", {27'd0, axi_rd[4:0]}, 32'd0);
+    qp2_op(OP_START, 0, 0, 0, 0);
+    axi_read(8'h18, axi_rd);
+    check32("D5 START while busy", {27'd0, axi_rd[4:0]}, 32'b00001);
+    qp2_op(5'd24, 0, 0, 0, 0);
+    qp2_op(5'd15, 0, 0, 0, 0);
+    axi_read(8'h18, axi_rd);
+    check32("D5 unknown op flagged, CFG_INTERRUPT ignored", {27'd0, axi_rd[4:0]}, 32'b00011);
+    axi_tbl_write(5'd7, 32'd1);
+    axi_read(8'h18, axi_rd);
+    check32("D5 bad AXI target", {27'd0, axi_rd[4:0]}, 32'b01011);
+    feed_point(AVG_T0, 100, 0);
+    wait_finish;
+    qp2_op(OP_GET_STATUS, 0, 0, 0, 0);
+    axi_read(8'h18, axi_rd);
+    check32("D5 read while the result is held", {27'd0, axi_rd[4:0]}, 32'b01111);
+    check32("D5 no stray power", {31'd0, axi_rd[4]}, 32'd0);
+    qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
+    axi_read(8'h14, axi_rd);
+    check32("D5 view 0 last op is CLR_RESULT", {27'd0, axi_rd[23:19]}, {27'd0, OP_CLR_RESULT});
+    check32("D5 view 0 finish_seen", {31'd0, axi_rd[7]}, 32'd1);
+    check32("D5 view 0 ready", {31'd0, axi_rd[12]}, 32'd1);
+
+    axi_select_view(5'd31);
+    axi_read(8'h14, axi_rd);
+    check32("D6 view 31 reads zero", axi_rd, 32'd0);
+    axi_select_view(5'd0);
+
+    check32("D7 c_debug_do counted every opcode strobe", op_pulses, op_calls);
+    check32("D7 c_data_do follows the selected view", c_data_do, dut.dbg_dt1);
+    check32("D7 c_debug_do idle handshake bits", {28'd0, c_debug_do[25:22]}, 32'b1000);
 
     if (errors == 0)
       $display("ALL TESTS PASSED");

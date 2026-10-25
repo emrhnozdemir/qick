@@ -33,8 +33,9 @@ module early_stop_checker(
   output [31:0] shots_used_o,
 
   output [15:0] log_entry_o,
-  (* MARK_DEBUG = "TRUE" *) output reg signed [31:0] point_i_o,
-  (* MARK_DEBUG = "TRUE" *) output reg signed [31:0] point_q_o
+  output reg signed [31:0] point_i_o,
+  output reg signed [31:0] point_q_o,
+  output [31:0] debug_o
 );
 
   wire check;
@@ -44,6 +45,7 @@ module early_stop_checker(
   wire retire;
   wire stopping;
   wire [4:0] retire_shift;
+  wire [31:0] counter_debug;
 
   wire stop;
   wire [4:0] stop_exponent;
@@ -96,7 +98,8 @@ module early_stop_checker(
     .warmup_done_o(warmup_done_o),
     .retire_shift_o(retire_shift),
     .stopped_early_o(stopped_early_o),
-    .shots_used_o(shots_used_o)
+    .shots_used_o(shots_used_o),
+    .debug_o(counter_debug)
   );
 
   magnitude_calculator magnitude(
@@ -204,5 +207,6 @@ module early_stop_checker(
 
   assign log_entry_o = {6'd0, saturated_latched, converged, retire_exponent,
                         converged ? 3'd0 : 3'd4};
+  assign debug_o = {counter_debug[31:2], short_mode, counter_debug[0]};
 
 endmodule

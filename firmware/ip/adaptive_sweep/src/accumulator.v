@@ -16,8 +16,8 @@ module accumulator(
   wire signed [57:0] shot_i_w = {{26{i_i[31]}}, i_i};
   wire signed [57:0] shot_q_w = {{26{q_i[31]}}, q_i};
 
-  (* MARK_DEBUG = "TRUE" *) reg signed [57:0] total_i;
-  (* MARK_DEBUG = "TRUE" *) reg signed [57:0] total_q;
+  reg signed [57:0] total_i;
+  reg signed [57:0] total_q;
 
   wire signed [57:0] base_i = first_i ? 58'sd0 : total_i;
   wire signed [57:0] base_q = first_i ? 58'sd0 : total_q;

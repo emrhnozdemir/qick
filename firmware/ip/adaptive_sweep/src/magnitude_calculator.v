@@ -18,9 +18,9 @@ module magnitude_calculator(
   output signed [57:0] snapshot_q_o,
 
   output reg valid_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [58:0] signal_magnitude_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [58:0] noise_magnitude_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [59:0] block_magnitude_o,
+  output reg [58:0] signal_magnitude_o,
+  output reg [58:0] noise_magnitude_o,
+  output reg [59:0] block_magnitude_o,
   output reg block_valid_o,
   output reg [4:0] exponent_o
 );

@@ -19,14 +19,14 @@ module threshold_compare(
   input block_valid_i,
   input [4:0] exponent_i,
 
-  (* MARK_DEBUG = "TRUE" *) output reg stop_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [4:0] stop_exponent_o,
-  (* MARK_DEBUG = "TRUE" *) output reg saturated_o,
+  output reg stop_o,
+  output reg [4:0] stop_exponent_o,
+  output reg saturated_o,
   output verdict_valid_o,
   output verdict_passed_o
 );
 
-  (* MARK_DEBUG = "TRUE" *) reg [15:0] threshold;
+  reg [15:0] threshold;
   reg [31:0] n_min;
   reg [2:0] confirm;
   reg block_en;
@@ -127,7 +127,7 @@ module threshold_compare(
                          + {19'd0, product1, 20'd0}
                          + {product2, 40'd0};
 
-  (* MARK_DEBUG = "TRUE" *) reg [74:0] scaled_noise;
+  reg [74:0] scaled_noise;
   reg [58:0] stage3_signal;
   reg [4:0] stage3_exponent;
 
@@ -151,7 +151,7 @@ module threshold_compare(
                                  - $signed({1'b0, scaled_noise});
 
   reg stage4_valid;
-  (* MARK_DEBUG = "TRUE" *) reg signed [75:0] margin;
+  reg signed [75:0] margin;
   reg [4:0] stage4_exponent;
 
   always @(posedge clk) begin
@@ -169,12 +169,12 @@ module threshold_compare(
   end
 
   wire odd_even_pass = ~margin[75];
-  (* MARK_DEBUG = "TRUE" *) wire passed = odd_even_pass & (~block_en | stage4_block_pass);
+  wire passed = odd_even_pass & (~block_en | stage4_block_pass);
   assign verdict_valid_o = stage4_valid & ~arm_i;
   assign verdict_passed_o = passed;
   wire eligible = ((32'd1 << stage4_exponent) >= n_min);
 
-  (* MARK_DEBUG = "TRUE" *) reg [2:0] pass_streak;
+  reg [2:0] pass_streak;
 
   wire [2:0] confirm_minus_one = (confirm == 0) ? 3'd0 : (confirm - 3'd1);
   wire confirmed = passed & (pass_streak >= confirm_minus_one);

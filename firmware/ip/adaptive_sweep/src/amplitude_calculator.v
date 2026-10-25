@@ -32,13 +32,14 @@ module amplitude_calculator(
   output [15:0] log_entry_o,
 
   output [63:0] power_o,
-  output power_valid_o
+  output power_valid_o,
+  output [31:0] debug_o
 );
 
-  (* MARK_DEBUG = "TRUE" *) reg signed [31:0] input_i;
-  (* MARK_DEBUG = "TRUE" *) reg signed [31:0] input_q;
-  (* MARK_DEBUG = "TRUE" *) reg input_valid;
-  (* MARK_DEBUG = "TRUE" *) reg input_ready;
+  reg signed [31:0] input_i;
+  reg signed [31:0] input_q;
+  reg input_valid;
+  reg input_ready;
 
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -56,9 +57,9 @@ module amplitude_calculator(
 
   wire shot_accepted = input_valid & input_ready;
 
-  (* MARK_DEBUG = "TRUE" *) reg signed [31:0] shot_data_i;
-  (* MARK_DEBUG = "TRUE" *) reg signed [31:0] shot_data_q;
-  (* MARK_DEBUG = "TRUE" *) reg shot_valid;
+  reg signed [31:0] shot_data_i;
+  reg signed [31:0] shot_data_q;
+  reg shot_valid;
 
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -75,15 +76,15 @@ module amplitude_calculator(
   (* max_fanout = 64 *) wire acc_first;
   (* max_fanout = 64 *) wire acc_enable;
   wire acc_subtract;
-  (* MARK_DEBUG = "TRUE" *) wire emit;
+  wire emit;
 
-  (* MARK_DEBUG = "TRUE" *) wire signed [57:0] sum_i;
-  (* MARK_DEBUG = "TRUE" *) wire signed [57:0] sum_q;
-  (* MARK_DEBUG = "TRUE" *) wire signed [57:0] diff_i;
-  (* MARK_DEBUG = "TRUE" *) wire signed [57:0] diff_q;
+  wire signed [57:0] sum_i;
+  wire signed [57:0] sum_q;
+  wire signed [57:0] diff_i;
+  wire signed [57:0] diff_q;
 
-  (* MARK_DEBUG = "TRUE" *) wire signed [31:0] point_i;
-  (* MARK_DEBUG = "TRUE" *) wire signed [31:0] point_q;
+  wire signed [31:0] point_i;
+  wire signed [31:0] point_q;
 
   accumulator acc(
     .clk(clk),
@@ -137,7 +138,8 @@ module amplitude_calculator(
     .shots_used_o(n_used_o),
     .log_entry_o(log_entry_o),
     .point_i_o(point_i),
-    .point_q_o(point_q)
+    .point_q_o(point_q),
+    .debug_o(debug_o)
   );
 
   assign mean_i_o = point_i;
@@ -152,7 +154,7 @@ module amplitude_calculator(
       emit_pipe <= {emit_pipe[0], emit};
   end
 
-  (* MARK_DEBUG = "TRUE" *) wire emit_ready = emit_pipe[1];
+  wire emit_ready = emit_pipe[1];
 
   assign log_wr_o = emit_ready;
 

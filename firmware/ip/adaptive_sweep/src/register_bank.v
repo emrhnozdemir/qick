@@ -34,18 +34,23 @@ module register_bank(
   input [31:0] dt3_i,
   input [31:0] dt4_i,
 
-  (* MARK_DEBUG = "TRUE" *) output reg [31:0] start_freq_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [31:0] step_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [15:0] n_points_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [4:0] avg_shift_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [31:0] warmup_shots_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [31:0] n_min_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [31:0] f_lo_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [31:0] f_hi_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [15:0] pair_min_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [15:0] pair_max_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [15:0] threshold_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [31:0] block_tol_o,
+  input [31:0] status_i,
+  input [31:0] view_dt1_i,
+  input [31:0] view_dt2_i,
+  input [31:0] ident_i,
+
+  output reg [31:0] start_freq_o,
+  output reg [31:0] step_o,
+  output reg [15:0] n_points_o,
+  output reg [4:0] avg_shift_o,
+  output reg [31:0] warmup_shots_o,
+  output reg [31:0] n_min_o,
+  output reg [31:0] f_lo_o,
+  output reg [31:0] f_hi_o,
+  output reg [15:0] pair_min_o,
+  output reg [15:0] pair_max_o,
+  output reg [15:0] threshold_o,
+  output reg [31:0] block_tol_o,
 
   output search_mode_o,
   output estop_hold_o,
@@ -53,26 +58,24 @@ module register_bank(
   output block_en_o,
   output short_confirm_o,
   output [2:0] confirm_o,
+  output [31:0] ctrl_o,
 
-  output step_lut_write_o,
-  output [5:0] step_lut_addr_o,
-  output [31:0] step_lut_data_o,
-  output reg [6:0] step_lut_len_o,
-
-  output offset_lut_write_o,
-  output [5:0] offset_lut_addr_o,
-  output [31:0] offset_lut_data_o,
-  output reg [6:0] offset_lut_len_o
+  output [4:0] read_sel_o,
+  output commit_o,
+  output [4:0] target_o,
+  output bad_target_o
 );
 
+  // REG0 carries the commit toggle and the target, REG1 is the payload word,
+  // REG2 the debug read select, REG3 is spare. REG4..REG7 are read-only:
+  // status, the selected view pair, and the IDENT word.
   wire [31:0] reg0;
   wire [31:0] reg1;
   wire [31:0] reg2;
-  wire [31:0] reg3;
-  wire [31:0] reg4;
-  wire [31:0] reg5;
-  wire [31:0] reg6;
-  wire [31:0] reg7;
+
+  reg [31:0] dbg_status_axi;
+  reg [31:0] dbg_dt1_axi;
+  reg [31:0] dbg_dt2_axi;
 
   axi_slv_adaptive_sweep axi_slave(
     .s_axi_aclk(s_axi_aclk),
@@ -99,16 +102,45 @@ module register_bank(
     .REG0_REG(reg0),
     .REG1_REG(reg1),
     .REG2_REG(reg2),
-    .REG3_REG(reg3),
-    .REG4_REG(reg4),
-    .REG5_REG(reg5),
-    .REG6_REG(reg6),
-    .REG7_REG(reg7)
+    .REG3_REG(),
+    .REG4_IN(dbg_status_axi),
+    .REG5_IN(dbg_dt1_axi),
+    .REG6_IN(dbg_dt2_axi),
+    .REG7_IN(ident_i)
   );
 
-  (* MARK_DEBUG = "TRUE" *) reg toggle_s0;
-  (* MARK_DEBUG = "TRUE" *) reg toggle_s1;
-  (* MARK_DEBUG = "TRUE" *) reg toggle_s2;
+  // The views are clk-domain registers captured here into s_axi_aclk;
+  // adaptive_sweep.xdc declares these capture flops a false path.
+  always @(posedge s_axi_aclk) begin
+    if (!s_axi_aresetn) begin
+      dbg_status_axi <= 32'd0;
+      dbg_dt1_axi <= 32'd0;
+      dbg_dt2_axi <= 32'd0;
+    end else begin
+      dbg_status_axi <= status_i;
+      dbg_dt1_axi <= view_dt1_i;
+      dbg_dt2_axi <= view_dt2_i;
+    end
+  end
+
+  (* ASYNC_REG = "TRUE" *) reg [4:0] read_sel_s0;
+  (* ASYNC_REG = "TRUE" *) reg [4:0] read_sel_s1;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      read_sel_s0 <= 5'd0;
+      read_sel_s1 <= 5'd0;
+    end else begin
+      read_sel_s0 <= reg2[4:0];
+      read_sel_s1 <= read_sel_s0;
+    end
+  end
+
+  assign read_sel_o = read_sel_s1;
+
+  reg toggle_s0;
+  reg toggle_s1;
+  reg toggle_s2;
 
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -122,85 +154,17 @@ module register_bank(
     end
   end
 
-  (* MARK_DEBUG = "TRUE" *) wire write_pulse = toggle_s1 ^ toggle_s2;
+  wire write_pulse = toggle_s1 ^ toggle_s2;
 
-  wire [6:0] cfg_len = reg0[30:24];
-  wire [2:0] cfg_last = reg0[23:21];
   wire [4:0] cfg_target = reg0[20:16];
-  wire [7:0] cfg_base = reg0[15:8];
 
-  wire lut_commit = write_pulse & ((cfg_target == 5'd0) | (cfg_target == 5'd1));
   wire threshold_write = write_pulse & (cfg_target == 5'd2);
   wire ctrl_write = write_pulse & (cfg_target == 5'd3);
   wire block_tol_write = write_pulse & (cfg_target == 5'd4);
 
-  (* MARK_DEBUG = "TRUE" *) reg burst_active;
-  (* MARK_DEBUG = "TRUE" *) reg [2:0] burst_cnt;
-  reg burst_sel;
-  reg [2:0] burst_last;
-  reg [7:0] burst_base;
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      burst_active <= 1'b0;
-      burst_cnt <= 3'd0;
-      burst_sel <= 1'b0;
-      burst_last <= 3'd0;
-      burst_base <= 8'd0;
-    end else if (lut_commit) begin
-      burst_active <= 1'b1;
-      burst_cnt <= 3'd0;
-      burst_sel <= cfg_target[0];
-      burst_last <= cfg_last;
-      burst_base <= cfg_base;
-    end else if (burst_active & (burst_cnt == burst_last)) begin
-      burst_active <= 1'b0;
-      burst_cnt <= 3'd0;
-      burst_sel <= burst_sel;
-      burst_last <= burst_last;
-      burst_base <= burst_base;
-    end else if (burst_active) begin
-      burst_active <= 1'b1;
-      burst_cnt <= burst_cnt + 3'd1;
-      burst_sel <= burst_sel;
-      burst_last <= burst_last;
-      burst_base <= burst_base;
-    end else begin
-      burst_active <= burst_active;
-      burst_cnt <= burst_cnt;
-      burst_sel <= burst_sel;
-      burst_last <= burst_last;
-      burst_base <= burst_base;
-    end
-  end
-
-  reg [31:0] burst_data;
-
-  always @(*) begin
-    if (burst_cnt == 3'd0)
-      burst_data = reg1;
-    else if (burst_cnt == 3'd1)
-      burst_data = reg2;
-    else if (burst_cnt == 3'd2)
-      burst_data = reg3;
-    else if (burst_cnt == 3'd3)
-      burst_data = reg4;
-    else if (burst_cnt == 3'd4)
-      burst_data = reg5;
-    else if (burst_cnt == 3'd5)
-      burst_data = reg6;
-    else
-      burst_data = reg7;
-  end
-
-  wire [7:0] burst_addr = burst_base + {5'd0, burst_cnt};
-
-  assign step_lut_write_o = burst_active & ~burst_sel;
-  assign offset_lut_write_o = burst_active & burst_sel;
-  assign step_lut_addr_o = burst_addr[5:0];
-  assign step_lut_data_o = burst_data;
-  assign offset_lut_addr_o = burst_addr[5:0];
-  assign offset_lut_data_o = burst_data;
+  assign commit_o = write_pulse;
+  assign target_o = cfg_target;
+  assign bad_target_o = write_pulse & ~(threshold_write | ctrl_write | block_tol_write);
 
   always @(posedge clk) begin
     if (!rst_n)
@@ -216,24 +180,7 @@ module register_bank(
       block_tol_o <= reg1;
   end
 
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      step_lut_len_o <= 7'd64;
-      offset_lut_len_o <= 7'd64;
-    end else begin
-      if (lut_commit & (cfg_target == 5'd0) & (cfg_len != 7'd0))
-        step_lut_len_o <= cfg_len;
-      else
-        step_lut_len_o <= step_lut_len_o;
-
-      if (lut_commit & (cfg_target == 5'd1) & (cfg_len != 7'd0))
-        offset_lut_len_o <= cfg_len;
-      else
-        offset_lut_len_o <= offset_lut_len_o;
-    end
-  end
-
-  (* MARK_DEBUG = "TRUE" *) reg [31:0] ctrl;
+  reg [31:0] ctrl;
 
   assign search_mode_o = ctrl[0];
   assign estop_hold_o = ctrl[4];
@@ -241,6 +188,7 @@ module register_bank(
   assign block_en_o = ctrl[7];
   assign short_confirm_o = ctrl[8];
   assign confirm_o = ctrl[19:17];
+  assign ctrl_o = ctrl;
 
   always @(posedge clk) begin
     if (!rst_n)

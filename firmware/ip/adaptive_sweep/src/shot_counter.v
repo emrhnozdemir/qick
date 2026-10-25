@@ -30,11 +30,12 @@ module shot_counter(
   output warmup_done_o,
   output [4:0] retire_shift_o,
 
-  (* MARK_DEBUG = "TRUE" *) output reg stopped_early_o,
-  (* MARK_DEBUG = "TRUE" *) output reg [31:0] shots_used_o
+  output reg stopped_early_o,
+  output reg [31:0] shots_used_o,
+  output [31:0] debug_o
 );
 
-  (* MARK_DEBUG = "TRUE" *) reg [4:0] cap_exponent;
+  reg [4:0] cap_exponent;
   reg [31:0] warmup_shots;
 
   always @(posedge clk) begin
@@ -47,17 +48,17 @@ module shot_counter(
     end
   end
 
-  (* MARK_DEBUG = "TRUE" *) reg armed;
-  (* MARK_DEBUG = "TRUE" *) reg stopped;
-  (* MARK_DEBUG = "TRUE" *) reg [31:0] shot_count;
-  (* MARK_DEBUG = "TRUE" *) reg [4:0] check_bit;
+  reg armed;
+  reg stopped;
+  reg [31:0] shot_count;
+  reg [4:0] check_bit;
   reg previous_bit;
 
   wire counting = armed & shot_i;
-  (* MARK_DEBUG = "TRUE" *) wire folding = counting & ~stopped;
+  wire folding = counting & ~stopped;
   wire [31:0] shot_number = shot_count + 32'd1;
   wire at_cap = shot_number[cap_exponent];
-  (* MARK_DEBUG = "TRUE" *) wire cap_reached = counting & at_cap;
+  wire cap_reached = counting & at_cap;
   wire stop_active = stop_i & armed & ~stopped;
 
   wire watched_bit = shot_number[check_bit];
@@ -149,5 +150,8 @@ module shot_counter(
       end
     end
   end
+
+  assign debug_o = {shot_count[15:0], check_bit, cap_exponent, armed, stopped,
+                    warmup_done_o, stopped_early_o, 1'b0, emit_o};
 
 endmodule
