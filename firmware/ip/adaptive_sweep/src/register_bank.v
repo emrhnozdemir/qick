@@ -47,8 +47,6 @@ module register_bank(
   output reg [31:0] n_min_o,
   output reg [31:0] f_lo_o,
   output reg [31:0] f_hi_o,
-  output reg [15:0] pair_min_o,
-  output reg [15:0] pair_max_o,
   output reg [15:0] threshold_o,
   output reg [31:0] block_tol_o,
 
@@ -227,13 +225,9 @@ module register_bank(
     if (!rst_n) begin
       f_lo_o <= 0;
       f_hi_o <= 32'hFFFFFFFF;
-      pair_min_o <= 1;
-      pair_max_o <= 1;
     end else if (cfg_search_i) begin
       f_lo_o <= dt1_i;
       f_hi_o <= dt2_i;
-      pair_min_o <= dt3_i[15:0];
-      pair_max_o <= dt4_i[15:0];
     end
   end
 

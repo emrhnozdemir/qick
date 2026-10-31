@@ -60,6 +60,10 @@ module tb_qick ();
 // string TEST_NAME = "test_randomized_benchmarking";
 // string TEST_NAME = "test_qubit_emulator";
 string TEST_NAME = "test_adaptive_sweep";
+// Where the test folders are, seen from the xsim working directory: by default
+// the Vivado project's run directory (qick_testbench.sim/sim_1/behav/xsim).
+// +TB_DIR=<path ending in /> runs a test from anywhere.
+string TB_DIR = "../../../../src/tb/";
 //----------------------------------------------------
 
 // Default Simulation Settings
@@ -87,6 +91,31 @@ initial if ($test$plusargs("AS_SRC_AVGBUF")) AS_STREAM_SRC = "AS_SRC_AVGBUF";
 // personal_files/adaptive_sweep/sim/interrupt_test/build_progs.py.
 integer AS_ESTOP_D = 8;
 initial if (!$value$plusargs("AS_ESTOP_D=%d", AS_ESTOP_D)) AS_ESTOP_D = 8;
+//----------------------------------------------------
+
+// adaptive_sweep system test (src/tb/test_adaptive_sweep_system). A test folder
+// holding tb_config.txt runs the compiled notebook programs on the live chain:
+// generator -> a resonance in the DAC/ADC loopback -> readout -> avg_buffer ->
+// adaptive_sweep, with the case's AXI settings, its completion counter and a
+// log for run.py. Select the folder with +TEST_NAME=<folder below src/tb>;
+// sys_load_config() reads the keys below from it.
+bit         SYS_TEST      = 1'b0;
+integer     sys_ipc       = 0;       // tProc interrupt vector (0 disarms it)
+integer     sys_run_us    = 1000;    // give up after this many us
+integer     sys_drain_us  = 5;       // keep logging this long after completion
+integer     sys_estop_d   = 0;       // AXI target 2, written when > 0
+integer     sys_block_tol = 0;       // AXI target 4
+integer     sys_ro_len    = 100;     // avg_buffer window, readout output samples
+integer     sys_counter   = 1;       // tProc counter that marks completion (1 or 2)
+integer     sys_count     = 1;       // ... and its final value
+integer     sys_res_kind  = 0;       // resonance: 0 none, 1 peak, 2 dip
+bit [31:0]  sys_res_f0    = 32'd0;   // its centre, generator frequency word
+bit [31:0]  sys_res_hw    = 32'd1;   // its half width at half maximum, generator words
+real        sys_res_base  = 1.0;     // transmission off the line
+real        sys_res_depth = 0.0;     // line height (peak) or depth (dip)
+integer     sys_noise     = 0;       // ADC noise, LSB rms
+integer     sys_seed      = 1;
+integer     sys_trace_us  = 0;       // also log the readout output, waveforms and triggers this long
 //----------------------------------------------------
 
 // VIP Agents
@@ -869,6 +898,44 @@ wire        as_interrupt;
 
    assign axis_sg_dac_tready        = 1'b1;  // DAC always ready to receive samples
 
+   // System test: the resonance. The tone on the line is the one in the last
+   // waveform the tProc dispatched to the generator (m0, frequency word in
+   // [31:0]); its transmission scales every ADC sample and white noise is
+   // added. A shot period longer than pulse + readout keeps the next waveform
+   // from arriving while the previous tone is still being measured.
+   real sys_gain = 1.0;
+
+   function automatic real sys_transmission(input bit [31:0] word);
+      real x, line;
+      begin
+         x    = (real'(word) - real'(sys_res_f0)) / real'(sys_res_hw);
+         line = 1.0 / (1.0 + x * x);
+         case (sys_res_kind)
+            1:       sys_transmission = sys_res_base + sys_res_depth * line;
+            2:       sys_transmission = sys_res_base - sys_res_depth * line;
+            default: sys_transmission = 1.0;
+         endcase
+      end
+   endfunction
+
+   function automatic logic signed [15:0] sys_resonate(input logic signed [15:0] s);
+      real    v;
+      integer q;
+      begin
+         v = real'(s) * sys_gain;
+         if (sys_noise > 0) v = v + real'($dist_normal(sys_seed, 0, sys_noise));
+         q = (v >= 0.0) ? $rtoi(v + 0.5) : -$rtoi(0.5 - v);
+         if (q >  2**(ADC_W-1)-1) q =  2**(ADC_W-1)-1;
+         if (q < -2**(ADC_W-1))   q = -2**(ADC_W-1);
+         sys_resonate = q;
+      end
+   endfunction
+
+   always @(posedge t_clk) begin
+      if (SYS_TEST && tproc_sgcdc_0_axis_tvalid)
+         sys_gain = sys_transmission(tproc_sgcdc_0_axis_tdata[31:0]);
+   end
+
    logic [$clog2(N_DDS)-1:0] adc_samp_cnt;
    always @(posedge adc_fs) begin
       if (adc_samp_cnt < 7) begin
@@ -879,7 +946,7 @@ wire        as_interrupt;
          adc_samp_cnt      <= 0;
          rf_signal_valid   <= 1;
       end
-      rf_signal_data[16*adc_samp_cnt +: 16] <= adc_data;
+      rf_signal_data[16*adc_samp_cnt +: 16] <= SYS_TEST ? sys_resonate(adc_data) : adc_data;
    end
 
    // Model Transport delay
@@ -988,9 +1055,10 @@ wire        as_interrupt;
       // Modulation trigger.
       .trigger                (trigger_0           ),
 
-      // Reset and clock for axis_*.
+      // Reset and clock for axis_*. A system test runs on the loopback and
+      // stops the emulator's ADC-rate clock: it is most of the simulation time.
       .aresetn                (s_ps_dma_aresetn    ),
-      .aclk                   (adc_fs             ),
+      .aclk                   (adc_fs & ~SYS_TEST ),
 
       // s_axis_* for input.
       .s_axis_tvalid          (1'b1),
@@ -1508,6 +1576,18 @@ wire        as_interrupt;
       end
    endtask
 
+   // Any table target: REG1 = payload, then the REG0 toggle with the target,
+   // as Adaptive_Sweep.load_tables() does on the board.
+   task automatic as_write_table(input [4:0] target, input [31:0] data);
+      begin
+         as_axi_write(8'h04, data);
+         as_axi_write(8'h00, {1'b0, 7'd0, 3'd0, target, 8'd0, 8'd0});
+         as_axi_write(8'h00, {1'b1, 7'd0, 3'd0, target, 8'd0, 8'd0});
+         repeat (20) @(posedge c_clk);
+         $display("*** %t - adaptive_sweep AXI target %0d <= %0d", $realtime(), target, data);
+      end
+   endtask
+
    adaptive_sweep u_adaptive_sweep (
       .clk           (c_clk            ),
       .rst_n         (rst_ni           ),
@@ -1557,7 +1637,7 @@ wire        as_interrupt;
       if (u_adaptive_sweep.grid_valid) begin
          $display("*** %t - adaptive_sweep point %0d: freq_word=0x%08x power=%0d (iq cursor %0d)",
                   $realtime(), u_adaptive_sweep.pf_point_idx,
-                  u_adaptive_sweep.u_peak_finder.frequency, u_adaptive_sweep.ac_power[63:0],
+                  u_adaptive_sweep.u_peak_finder.walker.frequency, u_adaptive_sweep.ac_power[63:0],
                   iqf_cursor);
       end
       if (u_adaptive_sweep.pf_finish) begin
@@ -1600,13 +1680,98 @@ wire        as_interrupt;
          $display("*** %t - REDIRECT taken: PC <- %0d",
                   $realtime(), AXIS_QPROC.QPROC.CORE_0.CORE_CPU.ipc_i);
       if (u_adaptive_sweep.rearm_now)
-         $display("*** %t - REARM (op14): draining=%0b arm_pend=%0b dropped=%0d",
+         $display("*** %t - REARM (op11): draining=%0b arm_pend=%0b dropped=%0d",
                   $realtime(), u_adaptive_sweep.draining,
                   u_adaptive_sweep.arm_pend, u_adaptive_sweep.drain_drop_cnt);
       if (u_adaptive_sweep.point_arm)
          $display("*** %t - point armed (idx %0d)", $realtime(),
                   u_adaptive_sweep.pf_point_idx);
    end
+
+   // System test log (sys_events.csv, read by run.py): every shot's integrated
+   // I/Q with the generator word it was played at, every grid point and KW
+   // probe the IP measured, every early-stop interrupt.
+   integer    sys_log = 0;
+   bit [31:0] sys_word = 32'd0;
+   bit [31:0] sys_shot_words [$];
+   bit [31:0] sys_shot_word;
+   reg        sys_trig_d = 1'b0;
+
+   always @(posedge t_clk) begin
+      if (SYS_TEST && tproc_sgcdc_0_axis_tvalid) sys_word = tproc_sgcdc_0_axis_tdata[31:0];
+   end
+
+   always @(posedge c_clk) begin
+      if (SYS_TEST && sys_log != 0) begin
+         sys_trig_d <= trigger_0;
+         if (trigger_0 & ~sys_trig_d) sys_shot_words.push_back(sys_word);
+         if (m2_c_tvalid) begin
+            sys_shot_word = (sys_shot_words.size() > 0) ? sys_shot_words.pop_front() : 32'hFFFF_FFFF;
+            $fdisplay(sys_log, "shot,%0.1f,%0d,%0d,%0d", $realtime(), sys_shot_word,
+                      $signed(m2_c_tdata[31:0]), $signed(m2_c_tdata[63:32]));
+         end
+         if (u_adaptive_sweep.grid_valid)
+            $fdisplay(sys_log, "point,%0.1f,%0d,%0d,%0d", $realtime(), u_adaptive_sweep.pf_point_idx,
+                      u_adaptive_sweep.u_peak_finder.walker.frequency, u_adaptive_sweep.ac_power);
+         if (u_adaptive_sweep.search_valid)
+            $fdisplay(sys_log, "probe,%0.1f,%0d,%0d", $realtime(), u_adaptive_sweep.eng_freq_word,
+                      u_adaptive_sweep.ac_power);
+         if (u_adaptive_sweep.interrupt_o)
+            $fdisplay(sys_log, "irq,%0.1f", $realtime());
+      end
+   end
+
+   // with trace_us: the readout output (what avg_buffer integrates), every waveform
+   // the tProc dispatches to the generator and every trigger, for timing checks
+   realtime sys_t0 = 0;
+   reg      sys_trace_trig_d = 1'b0;
+   always @(posedge ro_clk) begin
+      if (SYS_TEST && sys_log != 0 && $realtime() - sys_t0 < sys_trace_us * 1us && axis_ro_avg_tvalid)
+         $fdisplay(sys_log, "ro,%0.1f,%0d,%0d", $realtime(), $signed(axis_ro_avg_tdata[15:0]),
+                   $signed(axis_ro_avg_tdata[31:16]));
+   end
+   always @(posedge t_clk) begin
+      if (SYS_TEST && sys_log != 0 && $realtime() - sys_t0 < sys_trace_us * 1us) begin
+         sys_trace_trig_d <= trigger_0;
+         if (tproc_sgcdc_0_axis_tvalid)
+            $fdisplay(sys_log, "wave,%0.1f,%0d", $realtime(), tproc_sgcdc_0_axis_tdata[31:0]);
+         if (trigger_0 & ~sys_trace_trig_d)
+            $fdisplay(sys_log, "trig,%0.1f", $realtime());
+      end
+   end
+
+   function automatic [31:0] sys_counter_now();
+      sys_counter_now = (sys_counter == 2) ? AXIS_QPROC.QPROC.core0_w_dt[1]
+                                           : AXIS_QPROC.QPROC.core0_w_dt[0];
+   endfunction
+
+   // One run of a system-test case: start the program, wait for its
+   // completion counter (or give up after sys_run_us), drain, stop, dump DMEM.
+   task automatic sys_run();
+      realtime t_start, t_done;
+      bit      done;
+      begin
+         config_average_readout(0, sys_ro_len);
+         sys_log = $fopen("sys_events.csv", "w");
+         WRITE_AXI( REG_TPROC_CTRL , 4); //PROC_START
+         t_start = $realtime();
+         sys_t0  = t_start;
+         $fdisplay(sys_log, "start,%0.1f", t_start);
+         while (sys_counter_now() < sys_count && $realtime() - t_start < sys_run_us * 1us)
+            @(posedge c_clk);
+         done   = sys_counter_now() >= sys_count;
+         t_done = $realtime();
+         $fdisplay(sys_log, "done,%0.1f,%0d,%0d", t_done, done, sys_counter_now());
+         #(sys_drain_us * 1us);
+         WRITE_AXI( REG_TPROC_CTRL , 8); //PROC_STOP
+         $fclose(sys_log);
+         sys_log = 0;
+         $writememh("sys_dmem.mem", AXIS_QPROC.QPROC.CORE_0.CORE_MEM.D_MEM.RAM, 0, 4095);
+         $display("*** SYSTEM %s done=%0d counter=%0d/%0d c1=%0d c2=%0d t_start_ns=%0.1f t_done_ns=%0.1f fpga_us=%0.3f",
+                  TEST_NAME, done, sys_counter_now(), sys_count, AXIS_QPROC.QPROC.core0_w_dt[0],
+                  AXIS_QPROC.QPROC.core0_w_dt[1], t_start / 1ns, t_done / 1ns, (t_done - t_start) / 1us);
+      end
+   endtask
 
 //--------------------------------------
 // TEST STIMULI
@@ -1669,6 +1834,15 @@ initial begin
    $display("OUT_WPORT_QTY %0d",  `OUT_WPORT_QTY);
    
   
+   // +TEST_NAME picks the folder below src/tb; a tb_config.txt in it makes
+   // this a system test (sys_load_config) on the live readout chain.
+   if ($value$plusargs("TEST_NAME=%s", TEST_NAME))
+      $display("*** TEST_NAME from plusarg: %s", TEST_NAME);
+   if ($value$plusargs("TB_DIR=%s", TB_DIR))
+      $display("*** TB_DIR from plusarg: %s", TB_DIR);
+   sys_load_config(TEST_NAME);
+   if (SYS_TEST) AS_STREAM_SRC = "AS_SRC_AVGBUF";
+
    // Load tProc Memories with Program
    tproc_load_mem(TEST_NAME);
 
@@ -1730,10 +1904,14 @@ initial begin
    // adaptive_sweep's early-stop threshold is an AXI register, not part of the
    // tProc program, so it has to be written before the program runs - the same
    // thing Adaptive_Sweep.set_estop_thr() does on the board.
-   as_write_estop_d(AS_ESTOP_D[15:0]);
+   if (SYS_TEST) begin
+      if (sys_estop_d > 0) as_write_table(5'd2, sys_estop_d);
+      as_write_table(5'd4, sys_block_tol);
+   end else
+      as_write_estop_d(AS_ESTOP_D[15:0]);
 
-   // Load Signal Generator Envelope Table Memory.
-   sg_load_mem(TEST_NAME);
+   // Load Signal Generator Envelope Table Memory (const pulses need none).
+   if (!SYS_TEST) sg_load_mem(TEST_NAME);
 
    #1us;
 
@@ -1748,12 +1926,13 @@ initial begin
 
    // Interrupt vector: pmem address of the compiled program's landing block.
    // 0 (the default) disarms the redirect, so programs without one are unchanged.
-   if (!$value$plusargs("IPC=%d", tproc_ipc)) tproc_ipc = 0;
+   if (!$value$plusargs("IPC=%d", tproc_ipc)) tproc_ipc = SYS_TEST ? sys_ipc : 0;
    WRITE_AXI( REG_TPROC_IPC , tproc_ipc);
    $display("*** tProc IPC = %0d ***", tproc_ipc);
    #100ns;
 
-   repeat (REPEAT_EXEC) begin
+   if (SYS_TEST) sys_run();
+   else repeat (REPEAT_EXEC) begin
 
       config_decimated_readout(0, ro_length);
       config_average_readout(0, ro_length);
@@ -2030,12 +2209,52 @@ task iq_load_mem(string test_name);
 
    $display("### Task iq_load_mem() start ###");
 
-   iq_file = {"../../../../src/tb/",test_name,"/iq_shots.mem"};
+   iq_file = {TB_DIR,test_name,"/iq_shots.mem"};
 
    $readmemh(iq_file, u_iq_feeder.mem);
 
    $display("Loaded recorded resonator I/Q from %s", iq_file);
    $display("### Task iq_load_mem() end ###");
+endtask
+
+
+// System test settings: "<key> <value>" lines of <test>/tb_config.txt. No file,
+// no system test: every other test runs as before.
+task sys_load_config(string test_name);
+   string cfg_file, key, val;
+   integer fd;
+
+   cfg_file = {TB_DIR,test_name,"/tb_config.txt"};
+   fd = $fopen(cfg_file, "r");
+   if (fd == 0) return;
+   SYS_TEST = 1'b1;
+   while ($fscanf(fd, "%s %s", key, val) == 2) begin
+      case (key)
+         "ipc":       sys_ipc       = val.atoi();
+         "run_us":    sys_run_us    = val.atoi();
+         "drain_us":  sys_drain_us  = val.atoi();
+         "estop_d":   sys_estop_d   = val.atoi();
+         "block_tol": sys_block_tol = val.atoi();
+         "ro_len":    sys_ro_len    = val.atoi();
+         "counter":   sys_counter   = val.atoi();
+         "count":     sys_count     = val.atoi();
+         "res_kind":  sys_res_kind  = val.atoi();
+         "res_f0":    sys_res_f0    = val.atohex();
+         "res_hw":    sys_res_hw    = val.atohex();
+         "res_base":  sys_res_base  = val.atoreal();
+         "res_depth": sys_res_depth = val.atoreal();
+         "noise":     sys_noise     = val.atoi();
+         "seed":      sys_seed      = val.atoi();
+         "trace_us":  sys_trace_us  = val.atoi();
+         default:     $fatal(1, "%s: unknown key %s", cfg_file, key);
+      endcase
+   end
+   $fclose(fd);
+   $display("*** SYSTEM TEST %s: ipc=%0d run_us=%0d estop_d=%0d block_tol=%0d ro_len=%0d counter%0d=%0d",
+            test_name, sys_ipc, sys_run_us, sys_estop_d, sys_block_tol, sys_ro_len,
+            sys_counter, sys_count);
+   $display("*** SYSTEM TEST resonance kind=%0d f0=0x%08x hw=0x%08x base=%0.3f depth=%0.3f noise=%0d seed=%0d",
+            sys_res_kind, sys_res_f0, sys_res_hw, sys_res_base, sys_res_depth, sys_noise, sys_seed);
 endtask
 
 
@@ -2045,9 +2264,9 @@ task tproc_load_mem(string test_name);
    $display("### Task tproc_load_mem() start ###");
    $display("Loading Test: %s", test_name);
 
-   pmem_file = {"../../../../src/tb/",test_name,"/pmem.mem"};
-   wmem_file = {"../../../../src/tb/",test_name,"/wmem.mem"};
-   dmem_file = {"../../../../src/tb/",test_name,"/dmem.mem"};
+   pmem_file = {TB_DIR,test_name,"/pmem.mem"};
+   wmem_file = {TB_DIR,test_name,"/wmem.mem"};
+   dmem_file = {TB_DIR,test_name,"/dmem.mem"};
 
    $readmemh(pmem_file, AXIS_QPROC.QPROC.CORE_0.CORE_MEM.P_MEM.RAM);
    $readmemh(wmem_file, AXIS_QPROC.QPROC.CORE_0.CORE_MEM.W_MEM.RAM);
@@ -2089,7 +2308,7 @@ task sg_load_mem(string test_name) /*, input logic tb_load_mem, output logic tb_
    tb_load_mem    = 1;
 
    // File must be relative to where the simulation is run from (i.e.: xxx.sim/sim_x/behav/xsim)
-   sg_file = {"../../../../src/tb/",test_name,"/sg_0.mem"};
+   sg_file = {TB_DIR,test_name,"/sg_0.mem"};
    fd = $fopen(sg_file,"r");
 
    wait (sg_s0_axis_tready);

@@ -1,505 +1,248 @@
 `timescale 1ns / 1ps
 
-module gradient_engine (
+module gradient_engine(
   input clk,
   input rst_n,
 
   input start_i,
-  input two_sided_i,
-  input movement_guard_i,
   input dip_i,
+  input [31:0] start_freq_i,
+  input [31:0] step_i,
+  input [15:0] n_points_i,
   input [31:0] x0_i,
   input [31:0] f_lo_i,
   input [31:0] f_hi_i,
-  input [31:0] step_i,
   input [31:0] min_step_i,
   input [15:0] max_iteration_i,
-  input [7:0] patience_i,
-  input [4:0] lambda_i,
-  input [15:0] pair_min_i,
-  input [15:0] pair_max_i,
+  input [15:0] threshold_i,
 
-  output reg [31:0] freq_word_o,
-  output reg freq_valid_o,
+  output [31:0] freq_word_o,
+  output freq_valid_o,
   input freq_ack_i,
-  output reg probe_arm_o,
+  output probe_arm_o,
   input amp_valid_i,
   input [63:0] amp_data_i,
 
-  output reg busy_o,
-  output reg done_o,
-  output reg converged_o,
-  output reg capped_o,
-  output reg stalled_o,
+  output busy_o,
+  output done_o,
+  output converged_o,
+  output capped_o,
+  output nothing_o,
   output [31:0] x_o,
   output [15:0] iteration_o,
-  output [15:0] pairs_o,
-  output [31:0] signed_sum_high_o,
-  output [31:0] step_o,
+  output [15:0] points_o,
+  output [31:0] spacing_o,
+  output [31:0] jump_o,
   output [31:0] debug_o
 );
 
-  localparam [3:0] S_IDLE = 4'd0, S_PAIR_INIT = 4'd1, S_PRESENT_A = 4'd2, S_MEASURE_A = 4'd3, S_PRESENT_B = 4'd4, S_MEASURE_B = 4'd5, S_DECIDE = 4'd6, S_STEP = 4'd7, S_TIE = 4'd8, S_CONVERGE = 4'd9, S_DONE = 4'd10, S_DIFFERENCE = 4'd11, S_CERTIFY = 4'd12;
-  localparam [3:0] S_DUPLICATE = 4'd13, S_PREP_PROBES = 4'd14;
+  wire [3:0] state;
+  wire [3:0] phase;
+  wire [3:0] decision;
+  wire measuring;
 
-  reg [3:0] state;
-  reg [3:0] next_state;
+  wire [67:0] pa, pb;
+  wire psub;
+  wire [33:0] fa, fb;
+  wire fsub;
 
-  reg two_sided;
-  reg movement_guard;
-  reg dip;
-  reg [31:0] f_lo;
-  reg [31:0] f_hi;
-  reg [31:0] step;
-  reg [31:0] min_step;
-  reg [15:0] max_iteration;
-  reg [15:0] pair_min;
-  reg [15:0] pair_max;
-  reg [7:0] patience;
-  reg [4:0] lambda;
+  wire [67:0] palu;
+  wire pless;
+  wire [31:0] falu;
+  wire fless;
+  wire [63:0] sh_out;
+  wire [6:0] enc_pos;
+  wire enc_zero;
+  wire [67:0] acc;
+  wire [66:0] t;
 
-  reg [31:0] x;
-  reg [31:0] measured_x;
-  reg [31:0] previous_x;
-  reg previous_valid;
-  reg [7:0] stall_streak;
-  wire guard_requested = movement_guard_i & ~two_sided_i;
-  wire [31:0] initial_floor = (min_step_i == 0) ? 32'd1 : min_step_i;
-  reg [63:0] power_a;
-  reg [63:0] power_b;
+  wire [63:0] p, g, pmax, worst;
+  wire [31:0] lo, b, hi;
+  wire [63:0] gl, gb, gh;
+  wire [31:0] target;
+  wire [15:0] idx;
+  wire grid_last;
+  wire [3:0] noise_shift;
+  wire seen;
+  wire dip;
 
-  wire [31:0] initial_x;
-  range_clip #(.W(32)) seed_clamp(
-    .a_i(x0_i),
-    .lo_i(f_lo_i),
-    .hi_i(f_hi_i),
-    .is_signed_i(1'b0),
-    .y_o(initial_x)
-  );
-
-  // Return a measured frequency, including the better measured endpoint when
-  // the guard suppresses a certified move. No extra result acquisition is needed.
-  assign x_o = movement_guard ? measured_x : x;
-
+  wire [31:0] step, min_step;
+  wire [31:0] sl, sr;
+  wire [63:0] dl, dr;
+  wire [31:0] short_side, long_side, span, half;
+  wire [6:0] lead_s, lead_d;
+  wire [3:0] k;
+  wire lower, stop, balanced, side, cap, go_up;
   wire [15:0] iteration;
-  wire [15:0] pair_count;
+  wire [31:0] width;
 
-  wire iteration_clear = (state == S_IDLE) & start_i;
-  wire iteration_enable = (state == S_STEP) | (state == S_TIE) | (state == S_DUPLICATE);
-  wire pair_clear = (state == S_PAIR_INIT);
-  wire pair_enable = (state == S_CERTIFY);
-
-  event_counter #(.W(16)) iterations(
+  engine_control control(
     .clk(clk),
     .rst_n(rst_n),
-    .clr(iteration_clear),
-    .en(iteration_enable),
-    .q_o(iteration)
+    .start_i(start_i),
+    .freq_ack_i(freq_ack_i),
+    .amp_valid_i(amp_valid_i),
+    .seen_i(seen),
+    .grid_last_i(grid_last),
+    .stop_i(stop),
+    .cap_i(cap),
+    .pless_i(pless),
+    .p_i(p),
+    .g_i(g),
+    .pmax_i(pmax),
+    .worst_i(worst),
+    .gl_i(gl),
+    .gb_i(gb),
+    .gh_i(gh),
+    .dl_i(dl),
+    .dr_i(dr),
+    .acc_i(acc),
+    .t_i(t),
+    .target_i(target),
+    .step_i(step),
+    .lo_i(lo),
+    .b_i(b),
+    .hi_i(hi),
+    .sl_i(sl),
+    .sr_i(sr),
+    .short_side_i(short_side),
+    .long_side_i(long_side),
+    .span_i(span),
+    .min_step_i(min_step),
+    .lead_s_i(lead_s),
+    .lead_d_i(lead_d),
+    .go_up_i(go_up),
+    .state_o(state),
+    .phase_o(phase),
+    .pa_o(pa),
+    .pb_o(pb),
+    .psub_o(psub),
+    .fa_o(fa),
+    .fb_o(fb),
+    .fsub_o(fsub),
+    .freq_valid_o(freq_valid_o),
+    .probe_arm_o(probe_arm_o),
+    .measuring_o(measuring),
+    .busy_o(busy_o),
+    .done_o(done_o),
+    .converged_o(converged_o),
+    .capped_o(capped_o),
+    .nothing_o(nothing_o),
+    .decision_o(decision)
   );
 
-  event_counter #(.W(16)) pairs(
+  arithmetic_unit arith(
     .clk(clk),
     .rst_n(rst_n),
-    .clr(pair_clear),
-    .en(pair_enable),
-    .q_o(pair_count)
+    .state_i(state),
+    .phase_i(phase),
+    .start_i(start_i),
+    .threshold_i(threshold_i),
+    .lower_i(lower),
+    .pa_i(pa),
+    .pb_i(pb),
+    .psub_i(psub),
+    .fa_i(fa),
+    .fb_i(fb),
+    .fsub_i(fsub),
+    .pmax_i(pmax),
+    .noise_shift_i(noise_shift),
+    .half_i(half),
+    .k_i(k),
+    .palu_o(palu),
+    .pless_o(pless),
+    .falu_o(falu),
+    .fless_o(fless),
+    .sh_out_o(sh_out),
+    .enc_pos_o(enc_pos),
+    .enc_zero_o(enc_zero),
+    .acc_o(acc),
+    .t_o(t)
   );
 
+  search_points points(
+    .clk(clk),
+    .rst_n(rst_n),
+    .state_i(state),
+    .start_i(start_i),
+    .dip_i(dip_i),
+    .start_freq_i(start_freq_i),
+    .n_points_i(n_points_i),
+    .x0_i(x0_i),
+    .f_lo_i(f_lo_i),
+    .f_hi_i(f_hi_i),
+    .amp_valid_i(amp_valid_i),
+    .amp_data_i(amp_data_i),
+    .pless_i(pless),
+    .falu_i(falu),
+    .enc_pos_i(enc_pos),
+    .side_i(side),
+    .stop_i(stop),
+    .p_o(p),
+    .g_o(g),
+    .pmax_o(pmax),
+    .worst_o(worst),
+    .lo_o(lo),
+    .b_o(b),
+    .hi_o(hi),
+    .gl_o(gl),
+    .gb_o(gb),
+    .gh_o(gh),
+    .target_o(target),
+    .idx_o(idx),
+    .grid_last_o(grid_last),
+    .noise_shift_o(noise_shift),
+    .seen_o(seen),
+    .dip_o(dip)
+  );
+
+  step_planner planner(
+    .clk(clk),
+    .rst_n(rst_n),
+    .state_i(state),
+    .phase_i(phase),
+    .start_i(start_i),
+    .step_i(step_i),
+    .min_step_i(min_step_i),
+    .max_iteration_i(max_iteration_i),
+    .palu_i(palu),
+    .pless_i(pless),
+    .falu_i(falu),
+    .fless_i(fless),
+    .sh_out_i(sh_out[31:0]),
+    .enc_pos_i(enc_pos),
+    .enc_zero_i(enc_zero),
+    .step_o(step),
+    .min_step_o(min_step),
+    .sl_o(sl),
+    .sr_o(sr),
+    .dl_o(dl),
+    .dr_o(dr),
+    .short_side_o(short_side),
+    .long_side_o(long_side),
+    .span_o(span),
+    .half_o(half),
+    .lead_s_o(lead_s),
+    .lead_d_o(lead_d),
+    .k_o(k),
+    .lower_o(lower),
+    .stop_o(stop),
+    .balanced_o(balanced),
+    .side_o(side),
+    .cap_o(cap),
+    .go_up_o(go_up),
+    .iteration_o(iteration),
+    .width_o(width)
+  );
+
+  assign freq_word_o = target;
+  assign x_o = b;
   assign iteration_o = iteration;
-  assign pairs_o = pair_count;
-
-  // One register serves as both the probe offset c and the move size a, so
-  // the iterate after a certified move is always the winning measured probe.
-  wire [31:0] probe_high;
-  wire [31:0] probe_low;
-
-  probe_generator probes(
-    .x_i(x),
-    .c_i(step),
-    .f_lo_i(f_lo),
-    .f_hi_i(f_hi),
-    .x_plus_o(probe_high),
-    .x_minus_o(probe_low)
-  );
-
-  reg [31:0] held_probe_high;
-  reg [31:0] held_probe_low;
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      held_probe_high <= 0;
-      held_probe_low <= 0;
-    end else if (state == S_PREP_PROBES) begin
-      held_probe_high <= probe_high;
-      held_probe_low <= probe_low;
-    end
-  end
-
-  wire [31:0] probe_first = (two_sided | (held_probe_high == x)) ? held_probe_low : x;
-  wire [31:0] probe_second = held_probe_high;
-  wire duplicate_probes = movement_guard & (probe_first == probe_second);
-
-  wire signed [64:0] power_delta;
-  wire [64:0] power_delta_magnitude;
-
-  probe_difference differ(
-    .p_a_i(power_a),
-    .p_b_i(power_b),
-    .dip_i(dip),
-    .dp_o(power_delta),
-    .dp_abs_o(power_delta_magnitude)
-  );
-
-  reg signed [64:0] held_delta;
-  reg [64:0] held_magnitude;
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      held_delta <= 0;
-      held_magnitude <= 0;
-    end else if (state == S_DIFFERENCE) begin
-      held_delta <= power_delta;
-      held_magnitude <= power_delta_magnitude;
-    end
-  end
-
-  wire race_clear = (state == S_PAIR_INIT);
-  wire race_enable = (state == S_CERTIFY);
-
-  wire signed [72:0] signed_sum;
-  wire signed [72:0] signed_sum_next;
-  wire signed [72:0] magnitude_sum_next;
-
-  signed_accumulator #(.W(73)) signed_race(
-    .clk(clk),
-    .rst_n(rst_n),
-    .clr(race_clear),
-    .en(race_enable),
-    .d_i({{8{held_delta[64]}}, held_delta}),
-    .q_o(signed_sum),
-    .q_nxt_o(signed_sum_next)
-  );
-
-  signed_accumulator #(.W(73)) magnitude_race(
-    .clk(clk),
-    .rst_n(rst_n),
-    .clr(race_clear),
-    .en(race_enable),
-    .d_i({8'd0, held_magnitude}),
-    .q_o(),
-    .q_nxt_o(magnitude_sum_next)
-  );
-
-  assign signed_sum_high_o = signed_sum[72:41];
-
-  wire [72:0] signed_sum_magnitude;
-
-  abs_value #(.W(73)) signed_race_magnitude(
-    .a_i(signed_sum_next),
-    .y_o(signed_sum_magnitude)
-  );
-
-  wire [72:0] magnitude_sum_scaled = magnitude_sum_next >> lambda;
-
-  reg [72:0] held_signed_magnitude;
-  reg [72:0] held_magnitude_scaled;
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      held_signed_magnitude <= 0;
-      held_magnitude_scaled <= 0;
-    end else if (state == S_CERTIFY) begin
-      held_signed_magnitude <= signed_sum_magnitude;
-      held_magnitude_scaled <= magnitude_sum_scaled;
-    end
-  end
-
-  wire certified = (held_signed_magnitude > held_magnitude_scaled) & (pair_count >= pair_min);
-  wire race_exhausted = (pair_count >= pair_max);
-
-  wire signed [33:0] step_delta;
-  wire step_positive = ~signed_sum[72] & (signed_sum != 0);
-  wire step_negative = signed_sum[72];
-
-  signed_step #(.W(34)) stepper(
-    .pos_i(step_positive),
-    .neg_i(step_negative),
-    .step_i({2'b00, step}),
-    .delta_o(step_delta)
-  );
-
-  wire [33:0] next_x;
-
-  range_clip #(.W(34)) clamp(
-    .a_i({2'b00, x} + step_delta),
-    .lo_i({2'b00, f_lo}),
-    .hi_i({2'b00, f_hi}),
-    .is_signed_i(1'b1),
-    .y_o(next_x)
-  );
-
-  reg [31:0] held_next_x;
-
-  always @(posedge clk) begin
-    if (!rst_n)
-      held_next_x <= 0;
-    else if (state == S_DECIDE)
-      held_next_x <= next_x[31:0];
-  end
-
-  // Compare the movement after DDS-word quantization and range clipping.
-  // A certified move equal to the floor remains useful on a slope.
-  wire [31:0] move_distance = (held_next_x >= x) ?
-                              (held_next_x - x) : (x - held_next_x);
-  wire tiny_move = (move_distance < min_step);
-  wire return_cycle = previous_valid & (held_next_x == previous_x) & (held_next_x != x);
-  wire guard_block_step = movement_guard & (tiny_move | return_cycle);
-  wire guard_no_progress = movement_guard & ((state == S_TIE) |
-                            ((state == S_STEP) & (tiny_move | return_cycle)));
-  wire guard_refine = guard_no_progress & (step > min_step);
-  wire guard_stall_hit = guard_no_progress & (step <= min_step);
-  wire [31:0] half_step = step >> 1;
-  wire [31:0] refined_step = (half_step < min_step) ? min_step : half_step;
-  wire [8:0] next_stall_streak = {1'b0, stall_streak} + 9'd1;
-
-  wire patience_clear = (state == S_IDLE) & start_i;
-  wire patience_step = (state == S_STEP) | (state == S_TIE);
-  wire patience_hit = (state == S_TIE);
-  wire patience_converged;
-
-  convergence_patience #(.W(8)) patience_check(
-    .clk(clk),
-    .rst_n(rst_n),
-    .clr(patience_clear),
-    .step_i(patience_step),
-    .hit_i(patience_hit),
-    .patience_i(patience),
-    .conv_o(patience_converged)
-  );
-
-  always @(posedge clk) begin
-    if (!rst_n)
-      state <= S_IDLE;
-    else
-      state <= next_state;
-  end
-
-  always @(*) begin
-    case (state)
-      S_IDLE:
-        next_state = start_i ? S_PAIR_INIT : S_IDLE;
-
-      S_PAIR_INIT:
-        next_state = S_PREP_PROBES;
-
-      S_PREP_PROBES:
-        next_state = S_PRESENT_A;
-
-      S_PRESENT_A:
-        next_state = freq_ack_i ? S_MEASURE_A : S_PRESENT_A;
-
-      S_MEASURE_A:
-        next_state = amp_valid_i ? (duplicate_probes ? S_DUPLICATE : S_PRESENT_B) : S_MEASURE_A;
-
-      S_PRESENT_B:
-        next_state = freq_ack_i ? S_MEASURE_B : S_PRESENT_B;
-
-      S_MEASURE_B:
-        next_state = amp_valid_i ? S_DIFFERENCE : S_MEASURE_B;
-
-      S_DIFFERENCE:
-        next_state = S_CERTIFY;
-
-      S_CERTIFY:
-        next_state = S_DECIDE;
-
-      S_DECIDE: begin
-        if (certified)
-          next_state = S_STEP;
-        else if (race_exhausted)
-          next_state = S_TIE;
-        else
-          next_state = S_PRESENT_A;
-      end
-
-      S_STEP:
-        next_state = S_CONVERGE;
-
-      S_TIE:
-        next_state = S_CONVERGE;
-
-      S_DUPLICATE:
-        next_state = S_CONVERGE;
-
-      S_CONVERGE: begin
-        if (movement_guard ? stalled_o : patience_converged)
-          next_state = S_DONE;
-        else if (iteration >= max_iteration)
-          next_state = S_DONE;
-        else
-          next_state = S_PAIR_INIT;
-      end
-
-      S_DONE:
-        next_state = S_IDLE;
-
-      default:
-        next_state = S_IDLE;
-    endcase
-  end
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      two_sided <= 0;
-      movement_guard <= 0;
-      dip <= 0;
-      f_lo <= 0;
-      f_hi <= 32'hFFFFFFFF;
-      step <= 0;
-      min_step <= 0;
-      max_iteration <= 0;
-      pair_min <= 1;
-      pair_max <= 1;
-      patience <= 0;
-      lambda <= 0;
-    end else if ((state == S_IDLE) & start_i) begin
-      two_sided <= two_sided_i;
-      movement_guard <= guard_requested;
-      dip <= dip_i;
-      f_lo <= f_lo_i;
-      f_hi <= f_hi_i;
-      step <= (guard_requested & (step_i < initial_floor)) ? initial_floor : step_i;
-      min_step <= guard_requested ? initial_floor : min_step_i;
-      max_iteration <= (max_iteration_i == 16'd0) ? 16'd1 : max_iteration_i;
-      pair_min <= (pair_min_i == 16'd0) ? 16'd1 : (pair_min_i > 16'd255) ? 16'd255 : pair_min_i;
-      pair_max <= (pair_max_i == 16'd0) ? 16'd1 : (pair_max_i > 16'd255) ? 16'd255 : pair_max_i;
-      patience <= (guard_requested & (patience_i == 0)) ? 8'd1 : patience_i;
-      lambda <= lambda_i;
-    end else if (guard_refine) begin
-      step <= refined_step;
-    end
-  end
-
-  always @(posedge clk) begin
-    if (!rst_n)
-      x <= 0;
-    else if ((state == S_IDLE) & start_i)
-      x <= initial_x;
-    else if ((state == S_STEP) & ~guard_block_step)
-      x <= movement_guard ? held_next_x : next_x[31:0];
-  end
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      measured_x <= 0;
-      previous_x <= 0;
-      previous_valid <= 0;
-      stall_streak <= 0;
-    end else if ((state == S_IDLE) & start_i) begin
-      measured_x <= initial_x;
-      previous_x <= initial_x;
-      previous_valid <= 0;
-      stall_streak <= 0;
-    end else if (movement_guard) begin
-      if (((state == S_MEASURE_A) & amp_valid_i & (probe_first == x)) |
-          ((state == S_MEASURE_B) & amp_valid_i & (probe_second == x)))
-        measured_x <= x;
-
-      // S_STEP in guarded mode is reached only by a certified race. Select
-      // its winning endpoint even if a tiny move or cycle keeps x unchanged.
-      // This avoids returning a known worse incumbent at a clipped boundary.
-      if (state == S_STEP)
-        measured_x <= step_positive ? probe_second : probe_first;
-
-      if (guard_refine) begin
-        previous_valid <= 0;
-        stall_streak <= 0;
-      end else if (guard_stall_hit) begin
-        // Keep cycle history while holding x, so the same return move is
-        // still recognized on the next independently measured iteration.
-        stall_streak <= next_stall_streak[7:0];
-      end else if (state == S_STEP) begin
-        previous_x <= x;
-        previous_valid <= 1;
-        stall_streak <= 0;
-      end
-    end
-  end
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      power_a <= 0;
-      power_b <= 0;
-    end else begin
-      if ((state == S_MEASURE_A) & amp_valid_i)
-        power_a <= amp_data_i;
-
-      if ((state == S_MEASURE_B) & amp_valid_i)
-        power_b <= amp_data_i;
-    end
-  end
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      freq_word_o <= 0;
-      freq_valid_o <= 0;
-      probe_arm_o <= 0;
-    end else if (state == S_PRESENT_A) begin
-      freq_word_o <= probe_first;
-      freq_valid_o <= ~freq_ack_i;
-      probe_arm_o <= freq_ack_i;
-    end else if (state == S_PRESENT_B) begin
-      freq_word_o <= probe_second;
-      freq_valid_o <= ~freq_ack_i;
-      probe_arm_o <= freq_ack_i;
-    end else begin
-      probe_arm_o <= 0;
-
-      if (state == S_IDLE)
-        freq_valid_o <= 0;
-    end
-  end
-
-  always @(posedge clk) begin
-    if (!rst_n)
-      done_o <= 0;
-    else
-      done_o <= (state == S_DONE);
-  end
-
-  always @(posedge clk) begin
-    if (!rst_n)
-      busy_o <= 0;
-    else if ((state == S_IDLE) & start_i)
-      busy_o <= 1;
-    else if (state == S_DONE)
-      busy_o <= 0;
-  end
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      converged_o <= 0;
-      capped_o <= 0;
-      stalled_o <= 0;
-    end else if ((state == S_IDLE) & start_i) begin
-      converged_o <= 0;
-      capped_o <= 0;
-      stalled_o <= 0;
-    end else if (movement_guard & ((state == S_DUPLICATE) |
-                 (guard_stall_hit & (next_stall_streak >= {1'b0, patience})))) begin
-      stalled_o <= 1;
-    end else if (state == S_CONVERGE) begin
-      if (~movement_guard & patience_converged)
-        converged_o <= 1;
-      else if (~stalled_o & (iteration >= max_iteration))
-        capped_o <= 1;
-    end
-  end
-
-  assign step_o = step;
-  assign debug_o = {stall_streak, lambda,
-                    (state == S_MEASURE_A) | (state == S_MEASURE_B), 2'b00, state,
-                    two_sided, dip, movement_guard, freq_valid_o, probe_arm_o,
-                    busy_o, done_o, converged_o, capped_o, stalled_o, 2'b00};
+  assign points_o = idx;
+  assign spacing_o = width;
+  assign jump_o = step;
+  assign debug_o = {4'd0, phase, decision, k, state, seen, dip, measuring,
+                    freq_valid_o, probe_arm_o, busy_o, done_o, converged_o, capped_o,
+                    nothing_o, side, balanced};
 
 endmodule

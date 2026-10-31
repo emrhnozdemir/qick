@@ -185,10 +185,10 @@ class QP2Accel:
         programs and notebooks use them, and because ``reduce_sel == 3`` is
         still what gates ``dump_log``.  See MODULE_GUIDE.txt section 7.3.
     gdkw_calcs : tuple of str
-        Subset of ``calcs`` usable with the GD/KW engine.  The engine consumes
-        a 64-bit power (sized for the 32-bit-mean schemes); only a scheme
-        whose power can exceed that (the raw 64-bit sum) is excluded, the
-        router saturates it rather than wrapping, but it is still wrong.
+        Subset of ``calcs`` usable with the KW search engine.  The search
+        takes its noise gate and tie threshold from the early-stop threshold
+        register, which describes a probe's precision only when the probe
+        stopped on it, so only the early-stopping scheme qualifies.
     abi : int
         Version of the opcode map.  ``adaptive_sweep`` reports the ABI it was
         built with in its AXI IDENT register, so a bitstream compiled against
@@ -351,6 +351,20 @@ FINE_TUNING_SWEEP = QP2Accel(
 # The IP reports the ABI it was built for in its AXI IDENT register
 # (Adaptive_Sweep.check_abi).  GET_GDKW_DIAG (old 8) was deleted: its two
 # words are debug view 1 of the Adaptive_Sweep driver.
+#
+# Opcode map ABI 3 (2026-10-29): the fixed-step GD/KW engine was replaced by
+# the difference-proportional KW search.  RUN_GD (9) was removed and the
+# control ops after it moved down one (2026-10-30): RUN_KW 9, CLR_RESULT 10,
+# REARM 11; 12..14 are free, CFG_INTERRUPT stays 15 (the processor decodes
+# it) and the read class stays 16..19.  RUN_KW lost its patience field
+# (patience is AXI target 5, like the early-stop threshold) and its response
+# bit 2 / status bit 0 mean nothing_seen instead of the GD guard's stalled.
+#
+# Opcode map ABI 4 (2026-10-31): the KW engine became the border search.
+# RUN_KW walks the CFG_WINDOW grid itself (n_points >= 2; otherwise it starts
+# from f_lo, x0, f_hi), then probes one word at a time inside the border
+# around the best point.  RUN_KW dt2 (lambda), CFG_GDKW dt3/dt4 (m_min,
+# m_max) and AXI target 5 (patience) are gone.
 _AS_OPS = {
     "CFG_WINDOW": QP2Op(
         number=0, mnemonic="CFG_WINDOW",
@@ -363,8 +377,9 @@ _AS_OPS = {
         doc="grid window; 'n_points' is 16 bits (register_bank.v n_points_o "
             "<= dt3_i[15:0]; peak_finder treats 0 as 1, so 65536 would run "
             "as a one-point sweep - plan_sweep bounds it to 65535); 'step' "
-            "doubles as the GD forward-probe spacing and "
-            "the racing-mode fixed step (fstep_i), and 'avg_shift' is the "
+            "with start and n_points also gives the coarse grid a KW search "
+            "walks first (n_points < 2 starts it from f_lo, x0, f_hi), and "
+            "'avg_shift' is the "
             "log2 of the shot count folded per armed point. It is an EXPONENT, "
             "not a count: shot_counter watches bit avg_shift of the shot "
             "number, so the cap is exactly 1 << avg_shift (register_bank.v "
@@ -429,56 +444,45 @@ _AS_OPS = {
             "dt2 = {nconv_count[15:0], 6'd0, sat, conv, k[4:0], "
             "type[2:0]} - decode with AS_DIAG_FIELDS",
     ),
-    "RUN_GD": QP2Op(
-        number=9, mnemonic="RUN_GD", blocking=True, responds=True,
-        args={
-            "dt1": _word("x0", signed=True),
-            "dt2": (Field("movement_guard", 1, 1),
-                    Field("lambda", 5, 4),
-                    Field("patience", 8, 16)),
-            "dt3": _word("min_step"),
-            "dt4": (Field("max_iter", 16, 0),),
-        },
-        resp={"dt1": _word("x_final", signed=True),
-              "dt2": (Field("converged", 1, 0),
-                      Field("capped", 1, 1),
-                      Field("stalled", 1, 2),
-                      Field("iter", 16, 16))},
-        doc="gradient-descent search, forward pair P(x+step) - P(x), repeated "
-            "until the race certifies a move. lambda must be >= 1: at 0 the "
-            "certification |sum(dp)| > sum(|dp|) >> lambda can never pass "
-            "and x never moves. movement_guard enables step refinement and "
-            "bounded no-progress stopping; stalled is distinct "
-            "from convergence and returns the winning measured probe of the "
-            "final certified race, or the measured current iterate for an "
-            "unresolved race",
-    ),
     "RUN_KW": QP2Op(
-        number=10, mnemonic="RUN_KW", blocking=True, responds=True,
+        number=9, mnemonic="RUN_KW", blocking=True, responds=True,
         args={
             "dt1": _word("x0", signed=True),
-            "dt2": (Field("lambda", 5, 4),
-                    Field("patience", 8, 16)),
             "dt3": _word("min_step"),
             "dt4": (Field("max_iter", 16, 0),),
         },
         resp={"dt1": _word("x_final", signed=True),
               "dt2": (Field("converged", 1, 0),
                       Field("capped", 1, 1),
+                      Field("nothing_seen", 1, 2),
                       Field("iter", 16, 16))},
-        doc="Kiefer-Wolfowitz search, symmetric pair P(x+c) - P(x-c), repeated "
-            "until the race certifies a move. lambda must be >= 1, see RUN_GD",
+        doc="border search (gradient_engine, ABI 4). Start: with CFG_WINDOW "
+            "n_points >= 2 the engine walks that grid (start + i*step) itself; "
+            "otherwise it measures f_lo, x0, f_hi (CFG_GDKW, dt1). The best "
+            "point and its two neighbours are the border lo < b < hi. Each "
+            "iteration measures ONE word inside the border: toward the higher "
+            "border value, step = (span >> 1) >> k with k = lead(dl + dr) - "
+            "lead(|dl - dr|), dl/dr how far b sits above lo/hi (the "
+            "power-of-two three-point vertex, never past half the span); an "
+            "unbalanced border (one side over 4x the other) probes its long "
+            "side at (span >> 2) + (span >> 3). A probe above b by more than "
+            "pmax >> flog2(D) becomes the best, otherwise it becomes the border "
+            "on its side. Converged when both sides are <= min_step: x_final "
+            "is b moved by one more vertex step; capped after max_iter probes "
+            "(x_final = b); nothing_seen when the best start point is not "
+            "8 * (pmax >> flog2(D)) above the worst. D is the early-stop "
+            "threshold register; iter counts the probes after the start",
     ),
     "GET_FREQ": QP2Op(
         number=16, mnemonic="GET_FREQ", responds=True,
         resp={"dt1": _word("freq_word", signed=True),
               "dt2": (Field("freq_pending", 1, 0),)},
-        doc="GD/KW probe handshake: returns the probe word; reading it while "
+        doc="KW probe handshake: returns the probe word; reading it while "
             "pending acks the engine and arms the amp_calc for this probe's "
             "averager_value shots",
     ),
     "CLR_RESULT": QP2Op(
-        number=11, mnemonic="CLR_RESULT",
+        number=10, mnemonic="CLR_RESULT",
         doc="release a finished job's answer and drop the response-valid bit. "
             "Between a job finishing and this op, every read is held off so it "
             "cannot overwrite the answer: READY reaches the tProc a couple of "
@@ -490,23 +494,21 @@ _AS_OPS = {
         args={
             "dt1": _word("f_lo", signed=True),
             "dt2": _word("f_hi", signed=True),
-            "dt3": (Field("m_min", 16, 0),),
-            "dt4": (Field("m_max", 16, 0),),
         },
-        doc="GD/KW search window [f_lo, f_hi] and racing pair-count bounds; "
-            "gradient_engine clamps both m_min and m_max to 1..255 (0 -> 1) "
-            "and plan_sweep enforces the same range",
+        doc="KW search window [f_lo, f_hi]: the two outer start points when "
+            "the search starts from x0 (CFG_WINDOW n_points < 2); unused by a "
+            "search that starts from a grid",
     ),
     "GET_MEAN": QP2Op(
         number=19, mnemonic="GET_MEAN", responds=True,
         resp={"dt1": _word("mean_i", signed=True),
               "dt2": _word("mean_q", signed=True)},
         doc="32-bit mean I/Q read-back: the winning grid point's means when "
-            "the last job was a grid sweep, the last probe's for gd/kw (the "
+            "the last job was a grid sweep, the last probe's for kw (the "
             "truncating window sum[retire_shift +: 32], for every calc)",
     ),
     "REARM": QP2Op(
-        number=12, mnemonic="REARM",
+        number=11, mnemonic="REARM",
         doc="early-stop interrupt handshake. Sent once before START it enables "
             "the protocol: from then on an early stop raises interrupt_o and "
             "parks the IP, dropping every arrival, instead of arming the next "
@@ -535,12 +537,13 @@ AS_DIAG_FIELDS = (
 # status_word, built inline in adaptive_sweep.v (the status_word assign):
 #   {point_idx[15:0], eng_freq_valid, eng_busy, eng_converged, eng_capped,
 #    dest, estop_en, 1'b0, early_stop, warmup_done, 3'd0, mode,
-#    busy, finish_seen, eng_stalled}
-# Bit 0 reports a guarded GD stall. Bits 6:4
+#    busy, finish_seen, dest & eng_nothing}
+# Bit 0 reports a KW search that ended nothing-seen (until ABI 3 it was the
+# GD movement guard's stall). Bits 6:4
 # (reduce_sel) and 9 (prescale_en) are hardwired 0 as well since the
 # 2026-08-24 rebuild; their Fields stay so unpack_status keeps its keys.
 _AS_STATUS = (
-    Field("stalled", 1, 0),
+    Field("nothing_seen", 1, 0),
     Field("finish_seen", 1, 1),
     Field("busy", 1, 2),
     Field("mode", 1, 3),
@@ -565,7 +568,7 @@ ADAPTIVE_SWEEP = QP2Accel(
     rtl_template="",
     ops=_AS_OPS,
     status_bits=_AS_STATUS,
-    algorithms=("grid", "gd", "kw"),
+    algorithms=("grid", "kw"),
     # One shared datapath (src/amplitude_calculator.v): 58-bit S and D
     # accumulators, one early_stop_checker, one square_summer.  A calc name is
     # a CTRL preset, not a hardware index -- and since the 2026-08-24 rebuild
@@ -586,10 +589,11 @@ ADAPTIVE_SWEEP = QP2Accel(
         # the doubling grid with confirm 2 unless confirmation_policy='short'.
         "split":   dict(reduce_sel=3, prescale_en=0, estop_en=1, confirm=2),
     },
-    # the whole result path is 64 bits wide now, sized for the mean32
-    # calcs' 2^63 maximum power, so every calc can drive the gd/kw engine
-    gdkw_calcs=("shift", "welford", "split"),
-    abi=2,
+    # the KW search takes its noise gate and tie threshold from the early-stop
+    # threshold register, which describes a probe's precision only when the
+    # probe stopped on it: the search needs the split early stop
+    gdkw_calcs=("split",),
+    abi=4,
 )
 
 
@@ -915,6 +919,7 @@ AXI_TABLE_TARGETS = OrderedDict([
     ("estop_threshold", 2), # the 16-bit reciprocal D
     ("ctrl", 3),            # the CTRL word, same bits CFG_ACQ dt2 carries
     ("block_tol", 4),
+    # target 5 held the KW patience until ABI 4
 ])
 
 #: Named bits of the CTRL word.  CFG_ACQ dt2 IS this word (register_bank.v
@@ -960,7 +965,7 @@ def _accel_contract(accel):
 
 
 #: Bumped whenever the exported shape changes (not when a value changes).
-CONTRACT_VERSION = 6
+CONTRACT_VERSION = 8
 
 
 def qp2_contract():
@@ -1035,16 +1040,28 @@ def qp2_contract():
                 "count_semantics": "n_used counts estimator samples, excluding extra short "
                                    "confirmation acquisitions and discarded pipeline samples",
             },
-            "gd_movement_guard": {
-                "enable": "RUN_GD dt2 bit 1; default disabled",
-                "supported": "GD only; RUN_KW ignores the bit",
-                "min_step": "minimum step and movement floor; certified moves equal to the floor are allowed",
-                "patience": "consecutive no-progress iterations at min_step; default 2, range 1 through 255",
-                "refinement": "halve the step on a reversal cycle, exhausted race, or clipped sub-floor move, down to min_step",
-                "stalled": "RUN_GD response dt2 bit 2 and GET_STATUS bit 0; not convergence",
-                "return": "winning measured probe of the final certified race; "
-                          "measured current iterate for an unresolved race",
-                "certainty": "stalled and capped runs are uncertain; no statistical local-optimum confirmation",
+            "kw_search": {
+                "opcode": "RUN_KW (9): the border search (ABI 4)",
+                "start": "CFG_WINDOW n_points >= 2: the engine measures the grid start + i*step itself; "
+                         "otherwise f_lo, x0, f_hi; all through GET_FREQ",
+                "border": "the best start point b and its neighbours lo < b < hi (b itself at a grid end)",
+                "probe": "one word per iteration inside the border: toward the higher border value, "
+                         "(span >> 1) >> k with k = flog2(dl + dr) - flog2(|dl - dr|) clamped to [0, 15], "
+                         "dl/dr = how far b sits above lo/hi; an unbalanced border (one side over 4x the "
+                         "other) probes its long side at (span >> 2) + (span >> 3); never below min_step "
+                         "while the side is at least 2*min_step",
+                "update": "a probe more than pmax >> flog2(D) above b becomes b (the old b the border on the "
+                          "other side), otherwise it becomes the border on its side",
+                "noise_gate": "seen = b more than 8 * (pmax >> flog2(D)) above the worst start point, D the "
+                              "early-stop threshold register; otherwise nothing_seen after the start",
+                "min_step": "converged when both border sides are <= min_step; plan_sweep requires "
+                            "2*min_step <= the start span",
+                "result": "converged: b moved by one more vertex step (no measurement); capped or "
+                          "nothing_seen: b",
+                "response": "dt2 = {iter[15:0], 13'd0, nothing_seen, capped, converged}, iter = probes after "
+                            "the start; GET_STATUS bit 0 = dest & nothing_seen",
+                "requires": "calc='split' with early_stop: the noise gate assumes every probe stopped on "
+                            "the threshold",
             },
             "block_stability": {
                 "register_bits": 32,
@@ -1068,7 +1085,7 @@ def qp2_contract():
                 "name": "early-stop acquisition-abort redirect",
                 "request": "adaptive_sweep.v interrupt_o, a one-cycle pulse "
                            "registered from ac_early_pulse AND int_en",
-                "arm_op": "REARM (opcode 12), sent once before START to arm and "
+                "arm_op": "REARM (opcode 11), sent once before START to arm and "
                           "again from the landing block to release the park",
                 "destination": "the tProcessor TPROC_IPC register "
                                "(qproc_axi_reg slv_reg9), loaded by the "
@@ -1155,18 +1172,13 @@ class SweepPlan:
     dump_log: int = 0
     log_addr: int = 0
 
-    # gd/kw
+    # kw
     x0_mhz: Optional[float] = None
     x0: int = 0
     ro_x0: int = 0
     min_step_mhz: float = 0.0
     min_step: int = 0
     max_iter: int = 0
-    patience: int = 0
-    movement_guard: bool = False
-    lam: int = 0
-    m_min: int = 1
-    m_max: int = 1
     f_lo_mhz: float = 0.0
     f_hi_mhz: float = 0.0
     f_lo: int = 0
@@ -1205,7 +1217,7 @@ class SweepPlan:
     @property
     def handshake(self):
         """True if the tProc gets each frequency through the QP2 handshake."""
-        return self.algorithm in ("gd", "kw")
+        return self.algorithm == "kw"
 
     @property
     def total_shots(self):
@@ -1251,7 +1263,7 @@ class SweepPlan:
         same way the tProcessor does, so the winning index is recoverable from
         the winning word by replaying that walk.  It is *not* the ``point_idx``
         the status word carries: that one stops at the last index visited, not
-        at the best one.  Returns None for a gd/kw run (which revisits
+        at the best one.  Returns None for a kw run (which revisits
         frequencies, so a word does not name an index), for a degenerate step,
         or for a word that is not on the grid.
         """
@@ -1271,11 +1283,17 @@ class SweepPlan:
         lines = ["adaptive_sweep '%s' on %s (%s/%s)"
                  % (self.name, self.accel.name, self.algorithm, self.calc)]
         if self.handshake:
-            lines.append("  window %.4f-%.4f MHz, x0 %.4f MHz, max_iter %d"
-                         % (self.f_lo_mhz, self.f_hi_mhz, self.x0_mhz,
-                            self.max_iter))
-            lines.append("  probe step %.6f MHz (gen word %d)"
-                         % (self.step_mhz, self.gen_step))
+            if self.n_points >= 2:
+                lines.append("  coarse grid %.4f-%.4f MHz, %d points, step "
+                             "%.6f MHz, then the border search"
+                             % (self.start_mhz, self.stop_mhz, self.n_points,
+                                self.step_mhz))
+            else:
+                lines.append("  start f_lo %.4f / x0 %.4f / f_hi %.4f MHz, then "
+                             "the border search"
+                             % (self.f_lo_mhz, self.x0_mhz, self.f_hi_mhz))
+            lines.append("  min_step %.6f MHz (gen word %d), max_iter %d"
+                         % (self.min_step_mhz, self.min_step, self.max_iter))
         else:
             lines.append("  %.4f-%.4f MHz, %d points, step %.6f MHz"
                          % (self.start_mhz, self.stop_mhz, self.n_points,
@@ -1376,9 +1394,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                trig_time=0.0, shot_period=None,
                n0=None, n_min=None, emit_mode=None,
                estop_thr=None, block_tol=None,
-               x0=None, min_step=None, max_iter=None, patience=None,
-               movement_guard=False,
-               lambda_=None, m_min=2, m_max=8,
+               x0=None, min_step=None, max_iter=None,
                f_lo=None, f_hi=None,
                result_addr=0, debug=False, count_shots=False,
                dump_log=None, log_addr=None, interrupt=None,
@@ -1425,7 +1441,8 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                  "early_stop and interrupt disagree")
         early_stop = bool(interrupt)
     if early_stop is None:
-        early_stop = (calc == "split")
+        # the KW search needs the early stop, so it is the default there
+        early_stop = (calc == "split") or (algorithm == "kw" and calc is None)
     if early_stop:
         _require(calc in (None, "split"), "early_stop=True requires calc='split'")
         calc = "split"
@@ -1444,17 +1461,13 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         log_addr = points_addr
 
     # --- capability checks -------------------------------------------------
+    _require(algorithm != "gd",
+             "algorithm='gd' was removed with opcode-map ABI 3 (2026-10-29): "
+             "the one-sided pair x, x+c is the KW pair around x+c/2, and the "
+             "KW start measures a pair centred on x0. Use algorithm='kw'")
     _require(algorithm in accel.algorithms,
              "accelerator '%s' does not implement algorithm=%r; it implements "
              "%s" % (accel.name, algorithm, list(accel.algorithms)))
-    _require(isinstance(movement_guard, (bool, np.bool_)),
-             "movement_guard must be a boolean")
-    if movement_guard:
-        _require(algorithm == 'gd',
-                 "movement_guard only applies to algorithm='gd'")
-        _require(accel.has_op('RUN_GD')
-                 and 'movement_guard' in accel.op('RUN_GD').field_names(),
-                 "this accelerator does not support the GD movement guard")
     if calc is None:
         calc = accel.calcs[0] if len(accel.calcs) == 1 else "shift"
     calc_fields = accel.calc_fields(calc)
@@ -1484,12 +1497,13 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         _require(isinstance(confirm, Integral) and 1 <= confirm <= 7,
                  "confirm must be an integer in [1, 7]")
         calc_fields['confirm'] = int(confirm)
-    if algorithm in ("gd", "kw"):
+    if algorithm == "kw":
         _require(calc in accel.gdkw_calcs,
-                 "calc=%r cannot drive the GD/KW engine: its power can exceed "
-                 "the 64-bit search bus, which the router saturates to a flat "
-                 "all-ones response. Use one of %s."
-                 % (calc, list(accel.gdkw_calcs)))
+                 "algorithm='kw' needs the early stop (early_stop=True, "
+                 "calc='split'), got calc=%r: the search takes its noise gate "
+                 "and tie threshold from the early-stop threshold, which "
+                 "describes a probe only when the probe stopped on it"
+                 % (calc,))
 
     # --- channels and names ------------------------------------------------
     _require(gen_ch is not None, "gen_ch is required")
@@ -1596,7 +1610,8 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         _require(np.isfinite(stop), "stop must be finite")
     if step_supplied:
         _require(np.isfinite(step) and step != 0, "step must be finite and nonzero")
-    if algorithm == "grid":
+    kw_grid = algorithm == "kw" and x0 is None
+    if algorithm == "grid" or kw_grid:
         _require(stop is not None or (step is not None and n_points is not None),
                  "give stop=, or both step= and n_points=")
         if count_supplied:
@@ -1635,12 +1650,19 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                  % (n_field.mask, accel.name, n_field.bits, n_points))
         if stop is None:
             stop = start + step * (n_points - 1)
+        if kw_grid:
+            _require(n_points >= 2,
+                     "a kw search starting from a grid needs at least two "
+                     "points (got %d); give x0= to start from f_lo, x0, f_hi"
+                     % (n_points,))
     else:
         _require(stop is not None and start < stop,
-                 "gd/kw require start < stop")
-        _require(step is not None and step > 0,
-                 "gd/kw need step= (MHz): it is the probe spacing and the "
-                 "racing-mode move size, and must be positive")
+                 "kw requires start < stop")
+        _require(step is None and n_points is None,
+                 "a kw search started from x0 has no grid: drop step= and "
+                 "n_points= (or drop x0= to start from the coarse grid "
+                 "start..stop / step)")
+        step = stop - start
         n_points = 0
 
     plan.start_mhz = float(start)
@@ -1657,7 +1679,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     _require(plan.gen_span >= 0 or not stop_supplied,
              "the requested range contains no frequency on the shared DDS lattice")
     plan.gen_step, plan.ro_step = _sweep_step_words(prog, step, gen_ch, ro_ch)
-    if algorithm == 'grid' and stop_supplied and n_points > 1:
+    if (algorithm == 'grid' or kw_grid) and stop_supplied and n_points > 1:
 
 
 
@@ -1686,7 +1708,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     # but the accelerator does not, so its reported word would decode to a
     # frequency the tone never played.
     b_dds = gencfg["b_dds"]
-    if b_dds < 32 and algorithm == "grid":
+    if b_dds < 32 and (algorithm == "grid" or kw_grid):
         ends = (plan.gen_start, plan.gen_start + (n_points - 1) * plan.gen_step)
         _require(0 <= min(ends) and max(ends) < (1 << b_dds),
                  "the sweep runs from drive word %d to %d, outside this "
@@ -1794,7 +1816,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                 "algorithm='grid' - the stop is still logged and the mean is "
                 "exact either way - or interrupt=True, which aborts the "
                 "tProc's shot loop when the point converges - or serve each "
-                "frequency through algorithm='gd'/'kw'.")
+                "frequency through algorithm='kw'.")
         plan.emit_mode = 1 if emit_mode == "drain" else 0
         plan.confirm = plan.calc_fields.get("confirm", 0)
         plan.block_tol = None if block_tol is None else int(block_tol)
@@ -1803,91 +1825,74 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         _require(emit_mode is None, "emit_mode only applies to calc='split'")
         _require(estop_thr is None, "estop_thr only applies to calc='split'")
 
-    # --- gd/kw -------------------------------------------------------------
+    # --- kw ----------------------------------------------------------------
     if plan.handshake:
         _require(accel.has_op("GET_FREQ"),
                  "accelerator '%s' has no GET_FREQ handshake" % (accel.name,))
-        plan.movement_guard = bool(movement_guard)
 
-        f_lo = start if f_lo is None else f_lo
-        f_hi = stop if f_hi is None else f_hi
-        _require(np.isfinite(f_lo) and np.isfinite(f_hi),
-                 "f_lo and f_hi must be finite")
-        _require(f_lo < f_hi,
-                 "f_lo (%g MHz) must be below f_hi (%g MHz)" % (f_lo, f_hi))
-        _require(start <= f_lo < f_hi <= stop,
-                 "f_lo/f_hi must stay inside the requested start/stop range")
-        plan.f_lo_mhz, plan.f_hi_mhz = float(f_lo), float(f_hi)
-        plan.f_lo, low_readout, low_coordinate = _sweep_inward_endpoint(
-            prog, f_lo, gen_ch, ro_ch, 1)
-        plan.f_hi, high_readout, high_coordinate = _sweep_inward_endpoint(
-            prog, f_hi, gen_ch, ro_ch, -1)
-        _require(low_coordinate < high_coordinate,
-                 "f_lo/f_hi must contain at least two shared DDS frequencies")
-        _require(to_u32(plan.f_lo) < to_u32(plan.f_hi),
-                 "f_lo and f_hi map to drive words %d and %d, which are not in "
-                 "increasing order; the engine clips against unsigned words, so "
-                 "the window must not wrap" % (plan.f_lo, plan.f_hi))
-
-        x0 = start if x0 is None else x0
-        _require(np.isfinite(x0), "x0 must be finite")
-        _require(f_lo <= x0 <= f_hi,
-                 "x0=%g MHz is outside the search window [%g, %g] MHz"
-                 % (x0, f_lo, f_hi))
-        plan.x0_mhz = float(x0)
-        plan.x0, plan.ro_x0, seed_coordinate = _sweep_inward_endpoint(
-            prog, x0, gen_ch, ro_ch, 0)
-
-
-
-        if seed_coordinate < low_coordinate:
-            plan.x0, plan.ro_x0 = plan.f_lo, low_readout
-        elif seed_coordinate > high_coordinate:
-            plan.x0, plan.ro_x0 = plan.f_hi, high_readout
+        if kw_grid:
+            # the engine walks the grid first; its span is the window the
+            # border search stays inside, and the first probe is the grid start
+            _require(f_lo is None and f_hi is None,
+                     "f_lo/f_hi only apply to a kw search started from x0; a "
+                     "search from the coarse grid stays inside the grid")
+            last = to_s32(plan.gen_start + (n_points - 1) * plan.gen_step)
+            _require(plan.gen_step > 0 and to_u32(plan.gen_start) < to_u32(last),
+                     "a kw coarse grid must run upward in drive words without "
+                     "wrapping (start < stop, step > 0)")
+            plan.f_lo, plan.f_hi = plan.gen_start, last
+            plan.f_lo_mhz = plan.freq_of_word(prog, plan.gen_start)
+            plan.f_hi_mhz = plan.freq_of_word(prog, last)
+            plan.x0_mhz, plan.x0, plan.ro_x0 = plan.start_mhz, plan.gen_start, plan.ro_start
+        else:
+            f_lo = start if f_lo is None else f_lo
+            f_hi = stop if f_hi is None else f_hi
+            _require(np.isfinite(f_lo) and np.isfinite(f_hi),
+                     "f_lo and f_hi must be finite")
+            _require(f_lo < f_hi,
+                     "f_lo (%g MHz) must be below f_hi (%g MHz)" % (f_lo, f_hi))
+            _require(start <= f_lo < f_hi <= stop,
+                     "f_lo/f_hi must stay inside the requested start/stop range")
+            plan.f_lo_mhz, plan.f_hi_mhz = float(f_lo), float(f_hi)
+            plan.f_lo, low_readout, low_coordinate = _sweep_inward_endpoint(
+                prog, f_lo, gen_ch, ro_ch, 1)
+            plan.f_hi, high_readout, high_coordinate = _sweep_inward_endpoint(
+                prog, f_hi, gen_ch, ro_ch, -1)
+            _require(low_coordinate < high_coordinate,
+                     "f_lo/f_hi must contain at least two shared DDS frequencies")
+            _require(to_u32(plan.f_lo) < to_u32(plan.f_hi),
+                     "f_lo and f_hi map to drive words %d and %d, which are not in "
+                     "increasing order; the engine compares unsigned words, so "
+                     "the window must not wrap" % (plan.f_lo, plan.f_hi))
+            _require(np.isfinite(x0), "x0 must be finite")
+            _require(f_lo < x0 < f_hi,
+                     "x0=%g MHz must lie strictly inside the search window "
+                     "(%g, %g) MHz" % (x0, f_lo, f_hi))
+            plan.x0_mhz = float(x0)
+            plan.x0, plan.ro_x0, seed_coordinate = _sweep_inward_endpoint(
+                prog, x0, gen_ch, ro_ch, 0)
+            _require(low_coordinate < seed_coordinate < high_coordinate,
+                     "x0=%g MHz rounds onto a window edge; move it inside"
+                     % (x0,))
 
         _require(min_step is not None,
-                 "gd/kw need min_step= (MHz): the convergence threshold on the "
-                 "step size")
+                 "kw needs min_step= (MHz): the search converges once the "
+                 "border is within min_step on both sides of the best point")
         _require(np.isfinite(min_step) and min_step > 0,
                  "min_step must be finite and positive")
         plan.min_step_mhz = float(min_step)
         plan.min_step = _sweep_step_words(prog, min_step, gen_ch, ro_ch)[0]
         _require(plan.min_step > 0,
                  "min_step=%g MHz rounds to a zero drive-word step" % (min_step,))
+        _require(2 * plan.min_step <= to_u32(plan.f_hi) - to_u32(plan.f_lo),
+                 "min_step=%g MHz is more than half the search window "
+                 "[%g, %g] MHz: the border would be converged before the "
+                 "first probe" % (min_step, plan.f_lo_mhz, plan.f_hi_mhz))
 
-        _require(max_iter is not None, "gd/kw need max_iter=")
+        _require(max_iter is not None, "kw needs max_iter=")
         _require(1 <= int(max_iter) < (1 << 16),
                  "max_iter must be in [1, 65535], got %s" % (max_iter,))
         plan.max_iter = int(max_iter)
-
-        if plan.movement_guard:
-            patience = 2 if patience is None else patience
-            _require(isinstance(patience, Integral)
-                     and not isinstance(patience, (bool, np.bool_))
-                     and 1 <= patience <= 255,
-                     "movement_guard requires integer patience in [1, 255]")
-        patience = 0 if patience is None else int(patience)
-        _require(0 <= patience < (1 << 8),
-                 "patience must be in [0, 255], got %s" % (patience,))
-        plan.patience = patience
-
-        # |sum(dp)| <= sum(|dp|) always (triangle inequality), so at
-        # lambda 0 the race |sum(dp)| > sum(|dp|) >> lambda can never
-        # certify a move: every iteration exhausts m_max and ties, and
-        # the search sits at x0 until max_iter
-        plan.lam = 1 if lambda_ is None else int(lambda_)
-        _require(1 <= plan.lam < (1 << 5),
-                 "lambda_ must be in [1, 31], got %s: at 0 the "
-                 "certification test can never pass and x never moves"
-                 % (lambda_,))
-
-        # gradient_engine clamps pair_min and pair_max to 255 (its race
-        # accumulators are sized for 65 + 8 bits), so a larger request
-        # would be silently truncated - or, for m_min, made unreachable
-        _require(1 <= int(m_min) <= int(m_max) <= 255,
-                 "1 <= m_min <= m_max <= 255 is required, got "
-                 "m_min=%s m_max=%s" % (m_min, m_max))
-        plan.m_min, plan.m_max = int(m_min), int(m_max)
 
         # Readout tracking: the engine reports only the drive word, so the
         # tProc derives the readout word from it.  Anchor at the middle of the
@@ -1920,10 +1925,10 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
             ratio, max_delta)
     else:
         for label, value in (("x0", x0), ("min_step", min_step),
-                             ("max_iter", max_iter), ("patience", patience),
+                             ("max_iter", max_iter),
                              ("f_lo", f_lo), ("f_hi", f_hi)):
             _require(value is None,
-                     "%s only applies to algorithm='gd' or 'kw'" % (label,))
+                     "%s only applies to algorithm='kw'" % (label,))
 
     # --- stop-log dump -----------------------------------------------------
     if dump_log is None:
@@ -1934,7 +1939,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     plan.dump_log = 1 if dump_log else 0
     if plan.dump_log:
         _require(algorithm == "grid",
-                 "dump_log applies to grid sweeps; a gd/kw run revisits "
+                 "dump_log applies to grid sweeps; a kw run revisits "
                  "frequencies, so it has no grid index to file a stop under")
         _require(calc_fields.get("reduce_sel") == 3
                  and accel.has_op("GET_DIAG"),
@@ -2883,8 +2888,9 @@ class AdaptiveSweep(Macro):
     ``expand()`` produces the entire sequence: configuration ops, the
     waveform-memory seed, the RUN op, the service loop that fires shots, and the
     result read-back into data memory. It does NOT load the early-stop
-    threshold or block tolerance, those reach the IP only over AXI-Lite,
-    through the ``Adaptive_Sweep`` driver's ``load_tables(plan)``.
+    threshold or the block tolerance; those reach the IP
+    only over AXI-Lite, through the ``Adaptive_Sweep`` driver's
+    ``load_tables(plan)``.
 
     The child macros are built during ``preprocess()`` rather than ``expand()``
     because some of them are timed (``Pulse``, ``Trigger``, ``Delay``) and have
@@ -3183,7 +3189,7 @@ class AdaptiveSweep(Macro):
             self._landing_block(prog, asm, plan, resume_label,
                                 reg_point=reg_point)
 
-    #gd/kw handshake ---------------------------------------------------
+    #kw handshake ------------------------------------------------------
 
     def _emit_handshake(self, prog, asm, plan):
         accel = plan.accel
@@ -3197,10 +3203,9 @@ class AdaptiveSweep(Macro):
 
         self._config(prog, asm, plan)
         asm.qpb_send(accel, 'CFG_WINDOW', start_freq=plan.gen_start,
-                     step=plan.gen_step, n_points=0,
+                     step=plan.gen_step, n_points=plan.n_points,
                      avg_shift=plan.avg_shift)
-        asm.qpb_send(accel, 'CFG_GDKW', f_lo=plan.f_lo, f_hi=plan.f_hi,
-                     m_min=plan.m_min, m_max=plan.m_max)
+        asm.qpb_send(accel, 'CFG_GDKW', f_lo=plan.f_lo, f_hi=plan.f_hi)
 
         # constants for the readout-word tracker
         asm.write_reg(dst=reg_genbase, src=to_s32(plan.gen_base))
@@ -3210,11 +3215,8 @@ class AdaptiveSweep(Macro):
         self._seed_wave(asm, plan.gen_wave, plan.x0)
         self._seed_wave(asm, plan.ro_wave, plan.ro_x0)
 
-        mnemonic = 'RUN_KW' if plan.algorithm == 'kw' else 'RUN_GD'
-        guard_args = {'movement_guard': 1} if plan.movement_guard else {}
-        asm.qpb_send(accel, mnemonic, x0=plan.x0,
-                     min_step=plan.min_step, max_iter=plan.max_iter,
-                     patience=plan.patience, **{'lambda': plan.lam}, **guard_args)
+        asm.qpb_send(accel, 'RUN_KW', x0=plan.x0,
+                     min_step=plan.min_step, max_iter=plan.max_iter)
         asm.qpb_wait_ready(invert=True)
 
         service = self._label(prog, 'service')
@@ -5425,7 +5427,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         accelerator wants, and emits the configuration ops,
         run command, service loop, and result
         read-back into data memory.
-        :meth:`run_sweeps` loads the AXI threshold settings on the host.
+        :meth:`run_sweeps` loads the AXI settings (early-stop threshold, block
+        tolerance) on the host.
 
         A program that uses this is a *job* program, not a shot-averaged one.
         Call it from ``_initialize()``, leave ``_body()`` empty, and use
@@ -5440,9 +5443,10 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             Which accelerator to drive: ``"adaptive_sweep"`` or
             ``"fine_tuning_sweep"``.
         algorithm : str
-            ``"grid"`` (walk a fixed grid and take the argmax), or ``"gd"`` /
-            ``"kw"`` (gradient-descent or Kiefer-Wolfowitz search, where each
-            frequency arrives through a handshake).
+            ``"grid"`` (walk a fixed grid and take the argmax), or ``"kw"``
+            (the border search, ABI 4: a coarse grid, then one probe at a time
+            inside the border around the best point, each frequency through a
+            handshake).  ``"gd"`` was removed with opcode-map ABI 3.
         calc : str
             Measurement scheme: ``"shift"`` or ``"split"`` (``"welford"`` is
             a deprecated alias of ``"shift"`` and warns).  Defaults to the
@@ -5470,9 +5474,10 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             Name of the readout config from :meth:`add_readoutconfig`.
         start, stop : float
             Allowed band edges (MHz), rounded inward to the shared DDS
-            lattice. For gd/kw these also bound any explicit search window.
+            lattice. For kw these are the coarse grid the engine walks
+            first, or (with ``x0``) bound the search window.
         step : float
-            Grid step (MHz); for gd/kw, the probe spacing and racing-mode move.
+            Grid step (MHz), also the kw coarse grid's step (not with ``x0``).
             Give this or ``n_points``. Its realized magnitude rounds downward
             to the shared DDS lattice. Bounded grids may shorten it by a
             further lattice quantum to keep the requested count inside the
@@ -5584,48 +5589,20 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         dump_log, log_addr : bool, int
             Compatibility aliases for ``record_points`` and ``points_addr``.
         x0 : float
-            Starting frequency for gd/kw (MHz).  Defaults to ``start``.
+            kw only (MHz): start from the three words f_lo, x0, f_hi instead of
+            a coarse grid; x0 must lie strictly inside (f_lo, f_hi).  Without
+            it the engine walks the grid start..stop / step itself.
         min_step : float
-            Convergence threshold on the step size (MHz), for gd/kw.
-            With ``movement_guard=True``, this is the minimum step and the
-            movement floor. Certified moves equal to this floor are allowed.
+            kw (MHz): the search converges once the border is within
+            ``min_step`` on both sides of the best point.  ``2*min_step`` must
+            fit in the start span.
         max_iter : int
-            Iteration cap for gd/kw.
-        patience : int
-            Consecutive converged/tied iterations required to declare
-            convergence.  The default of 0 means *never converge*, the RTL
-            gates the convergence flag on ``patience != 0``, so a gd/kw
-            search left at the default always runs to ``max_iter`` and reports
-            itself capped.  Give it 1 or more to let the search stop early.
-            With ``movement_guard=True``, requires an integer in [1, 255],
-            defaults to 2, and counts consecutive no-progress iterations at
-            ``min_step`` before reporting a stall rather than convergence.
-        movement_guard : bool
-            Enable bounded no-progress handling for ``algorithm='gd'``.
-            Defaults to False.
-            Refine the step on a reversal cycle, exhausted race or clipped
-            sub-floor move, stop repeated movements below ``min_step``, and
-            avoid duplicate probes. Stalled and capped results are uncertain,
-            without a statistical claim of convergence. Return the winning
-            measured probe when the final race is certified, including when
-            movement is blocked or the step is refined. For an unresolved
-            race, return the measured current iterate. This adds no final
-            measurements and does not select a historical maximum. Requires
-            matching firmware supporting RUN_GD bit 1 and the stalled
-            response bit.
-        lambda_ : int
-            Certainty shift of the race: the engine repeats the fixed-step
-            pair until ``|sum(dp)| > sum(|dp|) >> lambda_``, then moves by
-            ``step``.  Defaults to 1 and must be in [1, 31]:
-            ``|sum(dp)| <= sum(|dp|)`` always, so at 0 no pair count can
-            ever certify a move and the search ties at ``x0``.
-        m_min, m_max : int
-            Bounds on pairs per move, ``1 <= m_min <= m_max <= 255`` (the
-            engine's pair counter and race accumulators are sized for 255).
-            Defaults 2 and 8.
+            Probe cap after the start for kw; the run reports itself capped,
+            or nothing_seen if the best start point did not clear the noise
+            gate.
         f_lo, f_hi : float
-            Search window for gd/kw (MHz), contained within ``[start, stop]``.
-            Defaults to the original band; overrides outside it are rejected.
+            kw with ``x0`` only: the two outer start words (MHz), within
+            ``[start, stop]``; default ``start`` and ``stop``.
         result_addr : int
             Data-memory address of the result block.  Literal data-memory
             addresses are 11-bit signed, so this must leave the 4-word block
@@ -5712,10 +5689,6 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         self.append_macro(FineTuningSweep(
             name=name, schedule=schedule, kwargs=dict(accel=accel, **kwargs)))
 
-    def gd_sweep(self, name, *, accel='adaptive_sweep', **kwargs):
-        """Run the hardware gradient search; see :meth:`adaptive_sweep`."""
-        self.adaptive_sweep(name, accel, algorithm='gd', **kwargs)
-
     def kw_sweep(self, name, *, accel='adaptive_sweep', **kwargs):
         """Run the hardware Kiefer-Wolfowitz search; see :meth:`adaptive_sweep`."""
         self.adaptive_sweep(name, accel, algorithm='kw', **kwargs)
@@ -5774,7 +5747,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                 the configured number of experiment iterations.
             ``stop_reason`` : str
                 ``'grid_complete'`` for a finished grid sweep,
-                ``'converged'``/``'max_iterations'``/``'finished'`` for gd/kw,
+                ``'converged'``/``'nothing_seen'``/``'max_iterations'``/
+                ``'finished'`` for kw,
                 ``'incomplete'`` while the counter is below its target. This is why the
                 *sweep* ended; per-point early stops are in ``stop_log``.
 
@@ -6010,6 +5984,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             self.compile()
         counter, _ = self._sweep_completion_spec()
         settings = [p for p in self._sweep_plans.values() if p.estop_d]
+        searches = [p for p in settings if p.handshake]
         if settings:
             first = settings[0]
             signature = lambda p: (p.estop_d, p.block_tol)
@@ -6073,14 +6048,11 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         if plan.writes_status:
             out['status'] = words[RESULT_STATUS]
             if plan.handshake:
-                # for gd/kw the status slot carries the RUN response's second word
+                # for kw the status slot carries the RUN response's second word
                 out['converged'] = bool(words[RESULT_STATUS] & 0x1)
                 out['capped'] = bool((words[RESULT_STATUS] >> 1) & 0x1)
-                out['stalled'] = bool((words[RESULT_STATUS] >> 2) & 0x1)
+                out['nothing_seen'] = bool((words[RESULT_STATUS] >> 2) & 0x1)
                 out['iterations'] = (words[RESULT_STATUS] >> 16) & 0xFFFF
-                if plan.movement_guard:
-                    out['uncertain'] = bool(out['done']
-                                            and (out['stalled'] or out['capped']))
             elif plan.accel.status_bits:
                 out.update(plan.accel.unpack_status(words[RESULT_STATUS]))
         if plan.writes_diag:
@@ -6108,8 +6080,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         if not out['done']:
             out['stop_reason'] = 'incomplete'
         elif plan.handshake:
-            out['stop_reason'] = ('stalled' if out.get('stalled')
-                                  else 'converged' if out.get('converged')
+            out['stop_reason'] = ('converged' if out.get('converged')
+                                  else 'nothing_seen' if out.get('nothing_seen')
                                   else 'max_iterations' if out.get('capped')
                                   else 'finished')
         else:
@@ -6182,13 +6154,10 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         if plan.handshake:
             cfg['window_mhz'] = (plan.f_lo_mhz, plan.f_hi_mhz)
             cfg['x0_mhz'] = plan.x0_mhz
-            cfg['probe_step_mhz'] = plan.step_mhz
+            cfg['coarse_points'] = plan.n_points
+            cfg['coarse_step_mhz'] = plan.step_mhz if plan.n_points >= 2 else None
             cfg['min_step_mhz'] = plan.min_step_mhz
             cfg['max_iter'] = plan.max_iter
-            cfg['patience'] = plan.patience
-            cfg['movement_guard'] = plan.movement_guard
-            cfg['lambda'] = plan.lam
-            cfg['pairs_per_move'] = (plan.m_min, plan.m_max)
         else:
             cfg['start_mhz'] = plan.start_mhz
             cfg['stop_mhz'] = plan.stop_mhz
@@ -6243,7 +6212,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                         'confirmation_policy', 'n_used_semantics',
                         'retained_shots', 'accelerator_shots', 'retained_shots_total',
                         'observed_shots', 'n_used', 'status', 'converged',
-                        'capped', 'stalled', 'uncertain', 'iterations'):
+                        'capped', 'nothing_seen', 'iterations'):
                 if key in result:
                     res[key] = result[key]
             if 'stop_log' in result:
@@ -6326,14 +6295,14 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                                 cfg['ro_start_word'], cfg['ro_step_word'])))
         else:
             lo, hi = cfg['window_mhz']
-            lines.append(row("search window", "%.4f - %.4f MHz, x0 %.4f MHz"
-                             % (lo, hi, cfg['x0_mhz'])))
-            lines.append(row("probe / min step", "%.6f / %.6f MHz"
-                             % (cfg['probe_step_mhz'], cfg['min_step_mhz'])))
-            lines.append(row("iteration cap", "%d (patience %d)"
-                             % (cfg['max_iter'], cfg['patience'])))
-            if cfg['movement_guard']:
-                lines.append(row("movement guard", "enabled; stalls are uncertain"))
+            if cfg['coarse_points'] >= 2:
+                lines.append(row("coarse grid", "%.4f - %.4f MHz, %d points, step %.6f MHz"
+                                 % (lo, hi, cfg['coarse_points'], cfg['coarse_step_mhz'])))
+            else:
+                lines.append(row("start words", "f_lo %.4f / x0 %.4f / f_hi %.4f MHz"
+                                 % (lo, cfg['x0_mhz'], hi)))
+            lines.append(row("min_step / probe cap", "%.6f MHz / %d"
+                             % (cfg['min_step_mhz'], cfg['max_iter'])))
 
         shots = "max %d per point (avg_shift %d)" % (
             cfg['max_shots_per_point'], cfg['avg_shift'])

@@ -42,12 +42,12 @@ module sweep_debug (
   input [15:0] pf_point_idx_i,
 
   input [31:0] eng_flags_i,
-  input [31:0] eng_step_i,
+  input [31:0] eng_spacing_i,
   input [31:0] eng_freq_word_i,
   input [31:0] eng_x_i,
   input [15:0] eng_iter_i,
-  input [15:0] eng_pairs_i,
-  input [31:0] eng_sd_hi_i,
+  input [15:0] eng_points_i,
+  input [31:0] eng_jump_i,
 
   input [31:0] ac_flags_i,
   input [63:0] ac_power_i,
@@ -65,8 +65,6 @@ module sweep_debug (
   input [31:0] cfg_nmin_i,
   input [31:0] cfg_flo_i,
   input [31:0] cfg_fhi_i,
-  input [15:0] cfg_pair_min_i,
-  input [15:0] cfg_pair_max_i,
   input [15:0] threshold_i,
   input [31:0] block_tol_i,
   input [31:0] ctrl_i,
@@ -90,14 +88,14 @@ module sweep_debug (
   reg [1:0] pf_state;
   reg pf_waiting, pf_freq_valid;
   reg [15:0] pf_point_idx;
-  reg [31:0] eng_flags, eng_step, eng_freq_word, eng_x, eng_sd_hi;
-  reg [15:0] eng_iter, eng_pairs;
+  reg [31:0] eng_flags, eng_spacing, eng_freq_word, eng_x, eng_jump;
+  reg [15:0] eng_iter, eng_points;
   reg [31:0] ac_flags, ac_mean_i, ac_mean_q, ac_n_used;
   reg [63:0] ac_power;
   reg ac_power_valid;
   reg [15:0] ac_log_entry;
   reg [31:0] cfg_start, cfg_step, cfg_warmup, cfg_nmin, cfg_flo, cfg_fhi, block_tol, ctrl;
-  reg [15:0] cfg_npoints, cfg_pair_min, cfg_pair_max, threshold;
+  reg [15:0] cfg_npoints, threshold;
   reg [4:0] cfg_avg_shift;
   reg [2:0] confirm;
   reg axi_commit, axi_bad_target;
@@ -131,12 +129,12 @@ module sweep_debug (
     pf_freq_valid <= pf_freq_valid_i;
     pf_point_idx <= pf_point_idx_i;
     eng_flags <= eng_flags_i;
-    eng_step <= eng_step_i;
+    eng_spacing <= eng_spacing_i;
     eng_freq_word <= eng_freq_word_i;
     eng_x <= eng_x_i;
     eng_iter <= eng_iter_i;
-    eng_pairs <= eng_pairs_i;
-    eng_sd_hi <= eng_sd_hi_i;
+    eng_points <= eng_points_i;
+    eng_jump <= eng_jump_i;
     ac_flags <= ac_flags_i;
     ac_power <= ac_power_i;
     ac_power_valid <= ac_power_valid_i;
@@ -152,8 +150,6 @@ module sweep_debug (
     cfg_nmin <= cfg_nmin_i;
     cfg_flo <= cfg_flo_i;
     cfg_fhi <= cfg_fhi_i;
-    cfg_pair_min <= cfg_pair_min_i;
-    cfg_pair_max <= cfg_pair_max_i;
     threshold <= threshold_i;
     block_tol <= block_tol_i;
     ctrl <= ctrl_i;
@@ -170,7 +166,7 @@ module sweep_debug (
   reg [15:0] commit_count;
   reg [4:0] last_target;
 
-  wire eng_measuring = eng_flags[18];
+  wire eng_measuring = eng_flags[9];
   wire power_expected = dest ? eng_measuring : pf_waiting;
   wire start_busy = job_start & ~rdy;
   wire stray_power = ac_power_valid & ~power_expected;
@@ -226,9 +222,9 @@ module sweep_debug (
     end else begin
       case (read_sel)
         5'd0: begin view_dt1_o <= top_word; view_dt2_o <= errors_word; end
-        5'd1: begin view_dt1_o <= eng_flags; view_dt2_o <= {eng_pairs, eng_iter}; end
+        5'd1: begin view_dt1_o <= eng_flags; view_dt2_o <= {eng_points, eng_iter}; end
         5'd2: begin view_dt1_o <= eng_freq_word; view_dt2_o <= eng_x; end
-        5'd3: begin view_dt1_o <= eng_step; view_dt2_o <= eng_sd_hi; end
+        5'd3: begin view_dt1_o <= eng_spacing; view_dt2_o <= eng_jump; end
         5'd4: begin view_dt1_o <= ac_power[31:0]; view_dt2_o <= ac_power[63:32]; end
         5'd5: begin view_dt1_o <= ac_mean_i; view_dt2_o <= ac_mean_q; end
         5'd6: begin view_dt1_o <= ac_n_used; view_dt2_o <= {nconv, 5'd0, ac_log_entry[10:0]}; end
@@ -237,7 +233,7 @@ module sweep_debug (
         5'd9: begin view_dt1_o <= {cfg_npoints, pf_point_idx}; view_dt2_o <= {threshold, confirm, 8'd0, cfg_avg_shift}; end
         5'd10: begin view_dt1_o <= cfg_warmup; view_dt2_o <= cfg_nmin; end
         5'd11: begin view_dt1_o <= cfg_flo; view_dt2_o <= cfg_fhi; end
-        5'd12: begin view_dt1_o <= {cfg_pair_max, cfg_pair_min}; view_dt2_o <= ctrl; end
+        5'd12: begin view_dt1_o <= 32'd0; view_dt2_o <= ctrl; end
         5'd13: begin view_dt1_o <= block_tol; view_dt2_o <= {commit_count, 11'd0, last_target}; end
         5'd14: begin view_dt1_o <= drain_drop_cnt; view_dt2_o <= 32'd0; end
         5'd15: begin view_dt1_o <= resp_dt1; view_dt2_o <= resp_dt2; end

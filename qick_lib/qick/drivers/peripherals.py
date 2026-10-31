@@ -919,7 +919,8 @@ class Adaptive_Sweep(SocIP):
 
     Two jobs.  First, the settings the generated tProc program does NOT
     itself send: the early-stop threshold and the block tolerance (and CTRL,
-    for retargeting a loaded program).  Call :meth:`load_tables` with the
+    for retargeting a loaded program).  Call
+    :meth:`load_tables` with the
     sweep's plan (or the individual setters) before starting a program that
     needs them.  Second, the debug views of the running IP:
     :meth:`print_status`, :meth:`print_debug`, :meth:`read_view` and
@@ -936,7 +937,9 @@ class Adaptive_Sweep(SocIP):
     Register map, in words: ``REG0`` (``tbl_ctrl``) is
     ``{[31] toggle, [30:21] reserved, [20:16] target, [15:0] reserved}``,
     with target 2 = early-stop threshold, 3 = CTRL, 4 = absolute block
-    tolerance; ``REG1`` (``tbl_d0``) is the payload word; ``REG2``
+    tolerance (5 held the KW patience until ABI 4 and is now a bad target);
+    ``REG1`` (``tbl_d0``) is the payload word;
+    ``REG2``
     (``read_sel``) selects the debug view, a plain level; ``REG3`` is spare.
     ``REG4`` (``status``) returns the GET_STATUS word, ``REG5``/``REG6``
     (``dbg_dt1``/``dbg_dt2``) the selected view pair, and ``REG7``
@@ -952,25 +955,27 @@ class Adaptive_Sweep(SocIP):
 
     #: The opcode-map ABI this driver and asm_v2's registry are written for.
     #: The IP reports its own in ``ident`` bits 15:8 (:meth:`check_abi`).
-    ABI = 2
+    ABI = 4
 
-    ENGINE_STATES = ['IDLE', 'PAIR_INIT', 'PRESENT_A', 'MEASURE_A', 'PRESENT_B',
-                     'MEASURE_B', 'DECIDE', 'STEP', 'TIE', 'CONVERGE', 'DONE',
-                     'DIFFERENCE', 'CERTIFY', 'DUPLICATE', 'PREP_PROBES']
+    ENGINE_STATES = ['IDLE', 'PRESENT', 'MEASURE', 'START', 'PMAX', 'GRID1',
+                     'GRID2', 'GRID_END', 'SEEN', 'NOISE', 'BAR', 'BETTER',
+                     'WIDTH', 'PLAN', 'GO', 'DONE']
+    #: The border search's last decision, view 1 bits 23:20.
+    ENGINE_DECISIONS = ['NONE', 'GRID', 'BETTER', 'BORDER', 'CONVERGED',
+                        'CAPPED', 'NOTHING']
     FINDER_STATES = ['IDLE', 'SEND_FREQ', 'WAIT_MEAS']
     #: Debug views, by REG2 value: each returns a (dt1, dt2) word pair.
-    VIEWS = ['top', 'engine', 'engine_x', 'engine_step', 'power', 'mean',
+    VIEWS = ['top', 'engine', 'engine_x', 'engine_border', 'power', 'mean',
              'diag', 'acq', 'cfg_window', 'cfg_grid', 'cfg_acq', 'cfg_band',
-             'cfg_pairs', 'cfg_tol', 'drain', 'response']
+             'cfg_ctrl', 'cfg_tol', 'drain', 'response']
     #: Sticky error bits of view 0 dt2, cleared by the next START/RUN_*.
     ERROR_BITS = ['start_busy', 'unknown_op', 'read_held', 'bad_target',
                   'stray_power']
     _TOP_BITS = ['ac_armed', 'pf_freq_valid', 'eng_freq_valid', 'tvalid',
                  'arm_pend', 'draining', 'int_en', 'finish_seen', 'busy',
                  'dest', 'res_pend', 'vld', 'rdy']
-    _ENGINE_BITS = ['stalled', 'capped', 'converged', 'done', 'busy',
-                    'probe_arm', 'freq_valid', 'movement_guard', 'dip',
-                    'two_sided']
+    _ENGINE_BITS = ['nothing_seen', 'capped', 'converged', 'done', 'busy',
+                    'probe_arm', 'freq_valid', 'measuring', 'dip', 'seen']
     _ACQ_BITS = ['emit', 'short_mode', 'stopped_early', 'warmup_done',
                  'stopped', 'armed']
 
@@ -1138,21 +1143,24 @@ class Adaptive_Sweep(SocIP):
         """Print every debug view, decoded where the layout is fixed."""
         from qick.asm_v2 import AS_DIAG_FIELDS
         self.print_status()
-        flags, pairs_iter = self.read_view('engine')
+        flags, points_iter = self.read_view('engine')
         print('--- engine (view 1)')
         self._show('state', self._state_name(self.ENGINE_STATES, (flags >> 12) & 0xF))
-        self._show('stall_streak', flags >> 24)
-        self._show('lambda', (flags >> 19) & 0x1F)
+        self._show('decision', self._state_name(self.ENGINE_DECISIONS, (flags >> 20) & 0xF))
+        self._show('k', (flags >> 16) & 0xF)
+        self._show('plan_phase', (flags >> 24) & 0xF)
+        self._show('balanced', flags & 1)
+        self._show('side', ['down', 'up'][(flags >> 1) & 1])
         for i, name in enumerate(self._ENGINE_BITS, start=2):
             self._show(name, (flags >> i) & 1)
-        self._show('pairs', pairs_iter >> 16)
-        self._show('iter', pairs_iter & 0xFFFF)
+        self._show('points', points_iter >> 16)
+        self._show('iter', points_iter & 0xFFFF)
         freq_word, x = self.read_view('engine_x')
-        step, sd_hi = self.read_view('engine_step')
+        border, step = self.read_view('engine_border')
         self._show('freq_word', freq_word)
         self._show('x', x)
-        self._show('step', step)
-        self._show('sd_hi', int(np.int32(sd_hi)))
+        self._show('border_width', border)
+        self._show('last_step', step)
         lo, hi = self.read_view('power')
         mean_i, mean_q = self.read_view('mean')
         print('--- last point (views 4..7)')
@@ -1175,7 +1183,7 @@ class Adaptive_Sweep(SocIP):
         grid, acq_cfg = self.read_view('cfg_grid')
         warmup, n_min = self.read_view('cfg_acq')
         f_lo, f_hi = self.read_view('cfg_band')
-        pairs, ctrl = self.read_view('cfg_pairs')
+        _, ctrl = self.read_view('cfg_ctrl')
         block_tol, commits = self.read_view('cfg_tol')
         self._show('start_freq', start)
         self._show('step', step)
@@ -1188,8 +1196,6 @@ class Adaptive_Sweep(SocIP):
         self._show('n_min', n_min)
         self._show('f_lo', f_lo)
         self._show('f_hi', f_hi)
-        self._show('pair_max', pairs >> 16)
-        self._show('pair_min', pairs & 0xFFFF)
         self._show('ctrl', '0x%08x' % ctrl)
         self._show('block_tol', block_tol)
         self._show('axi_commits', commits >> 16)

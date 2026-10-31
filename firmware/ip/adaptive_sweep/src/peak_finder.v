@@ -18,10 +18,10 @@ module peak_finder(
   output reg freq_valid_o,
   output reg finish_o,
 
-  output reg [31:0] best_freq_o,
-  output reg [31:0] best_mean_i_o,
-  output reg [31:0] best_mean_q_o,
-  output reg [15:0] point_idx_o,
+  output [31:0] best_freq_o,
+  output [31:0] best_mean_i_o,
+  output [31:0] best_mean_q_o,
+  output [15:0] point_idx_o,
   output [1:0] state_o,
   output waiting_o
 );
@@ -31,17 +31,38 @@ module peak_finder(
   reg [1:0] state;
   reg [1:0] next_state;
 
-  reg [31:0] frequency;
-  reg [31:0] step;
-  reg [15:0] last_index;
-  reg [63:0] best_amplitude;
-  reg last_point;
-  reg dip;
-  reg best_valid;
+  wire [31:0] frequency;
+  wire last_point;
 
-  wire is_better = dip ? (amp_data_i < best_amplitude) : (amp_data_i > best_amplitude);
-  wire take_point = is_better | ~best_valid;
-  wire [15:0] next_index = point_idx_o + 16'd1;
+  point_walker walker(
+    .clk(clk),
+    .rst_n(rst_n),
+    .state_i(state),
+    .start_i(start_i),
+    .start_freq_i(start_freq_i),
+    .step_i(step_i),
+    .n_points_i(n_points_i),
+    .amp_valid_i(amp_valid_i),
+    .frequency_o(frequency),
+    .point_idx_o(point_idx_o),
+    .last_point_o(last_point)
+  );
+
+  best_tracker tracker(
+    .clk(clk),
+    .rst_n(rst_n),
+    .state_i(state),
+    .start_i(start_i),
+    .dip_i(dip_i),
+    .amp_valid_i(amp_valid_i),
+    .amp_data_i(amp_data_i),
+    .mean_i_i(mean_i_i),
+    .mean_q_i(mean_q_i),
+    .frequency_i(frequency),
+    .best_freq_o(best_freq_o),
+    .best_mean_i_o(best_mean_i_o),
+    .best_mean_q_o(best_mean_q_o)
+  );
 
   always @(posedge clk) begin
     if (!rst_n)
@@ -74,75 +95,27 @@ module peak_finder(
     if (!rst_n) begin
       freq_valid_o <= 0;
       finish_o <= 0;
-      best_freq_o <= 0;
-      best_mean_i_o <= 0;
-      best_mean_q_o <= 0;
-      point_idx_o <= 0;
-      frequency <= 0;
-      step <= 0;
-      last_index <= 0;
-      best_amplitude <= 0;
-      last_point <= 0;
-      dip <= 0;
-      best_valid <= 0;
     end else begin
       case (state)
-      S_IDLE: begin
-        freq_valid_o <= 0;
-        finish_o <= 0;
-        if (start_i) begin
-          frequency <= start_freq_i;
-          step <= step_i;
-          last_index <= (n_points_i == 16'd0) ? 16'd0 : (n_points_i - 16'd1);
-          point_idx_o <= 0;
-          last_point <= (n_points_i <= 16'd1);
-          dip <= dip_i;
-          best_amplitude <= dip_i ? {64{1'b1}} : {64{1'b0}};
-          best_valid <= 0;
-          best_freq_o <= 0;
-          best_mean_i_o <= 0;
-          best_mean_q_o <= 0;
-        end
-      end
-
-      S_SEND_FREQ: begin
-        freq_valid_o <= 1;
-        finish_o <= 0;
-      end
-
-      S_WAIT_MEAS: begin
-        freq_valid_o <= 0;
-        if (amp_valid_i) begin
-          if (take_point) begin
-            best_amplitude <= amp_data_i;
-            best_freq_o <= frequency;
-            best_mean_i_o <= mean_i_i;
-            best_mean_q_o <= mean_q_i;
-            best_valid <= 1;
-          end else begin
-            best_amplitude <= best_amplitude;
-            best_freq_o <= best_freq_o;
-            best_mean_i_o <= best_mean_i_o;
-            best_mean_q_o <= best_mean_q_o;
-            best_valid <= best_valid;
-          end
-
-          if (last_point)
-            finish_o <= 1;
-          else begin
-            finish_o <= 0;
-            frequency <= frequency + step;
-            point_idx_o <= next_index;
-            last_point <= (next_index == last_index);
-          end
-        end else
+        S_IDLE: begin
+          freq_valid_o <= 0;
           finish_o <= 0;
-      end
+        end
 
-      default: begin
-        freq_valid_o <= 0;
-        finish_o <= 0;
-      end
+        S_SEND_FREQ: begin
+          freq_valid_o <= 1;
+          finish_o <= 0;
+        end
+
+        S_WAIT_MEAS: begin
+          freq_valid_o <= 0;
+          finish_o <= amp_valid_i & last_point;
+        end
+
+        default: begin
+          freq_valid_o <= 0;
+          finish_o <= 0;
+        end
       endcase
     end
   end

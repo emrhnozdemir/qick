@@ -55,10 +55,9 @@ module adaptive_sweep (
   localparam [4:0] OP_CFG_ACQ = 5'd1;
   localparam [4:0] OP_CFG_GDKW = 5'd2;
   localparam [4:0] OP_START = 5'd8;
-  localparam [4:0] OP_RUN_GD = 5'd9;
-  localparam [4:0] OP_RUN_KW = 5'd10;
-  localparam [4:0] OP_CLR_RESULT = 5'd11;
-  localparam [4:0] OP_REARM = 5'd12;
+  localparam [4:0] OP_RUN_KW = 5'd9;
+  localparam [4:0] OP_CLR_RESULT = 5'd10;
+  localparam [4:0] OP_REARM = 5'd11;
   localparam [4:0] OP_CFG_INTERRUPT = 5'd15;
   localparam [4:0] OP_GET_FREQ = 5'd16;
   localparam [4:0] OP_GET_STATUS = 5'd17;
@@ -66,7 +65,7 @@ module adaptive_sweep (
   localparam [4:0] OP_GET_MEAN = 5'd19;
 
   // REG7 of the AXI slave: "AS", the opcode-map ABI, a reserved byte.
-  localparam [7:0] ABI = 8'd2;
+  localparam [7:0] ABI = 8'd4;
   localparam [31:0] IDENT = {16'h4153, ABI, 8'd0};
 
   assign s_axis_tready = 1'b1;
@@ -85,14 +84,14 @@ module adaptive_sweep (
   wire cfg_meas = en_rise & (qtag_op_i == OP_CFG_ACQ);
   wire cfg_gdkw = en_rise & (qtag_op_i == OP_CFG_GDKW);
   wire start_now = en_rise & (qtag_op_i == OP_START);
-  wire run_gdkw = en_rise & ((qtag_op_i == OP_RUN_GD) | (qtag_op_i == OP_RUN_KW));
+  wire run_kw = en_rise & (qtag_op_i == OP_RUN_KW);
   wire clr_result = en_rise & (qtag_op_i == OP_CLR_RESULT);
   wire rearm_now = en_rise & (qtag_op_i == OP_REARM);
   wire getfreq_rd = en_rise & (qtag_op_i == OP_GET_FREQ);
   wire status_rd = en_rise & (qtag_op_i == OP_GET_STATUS);
   wire diag_rd = en_rise & (qtag_op_i == OP_GET_DIAG);
   wire getmean_rd = en_rise & (qtag_op_i == OP_GET_MEAN);
-  wire op_decoded = cfg_sweep | cfg_meas | cfg_gdkw | start_now | run_gdkw |
+  wire op_decoded = cfg_sweep | cfg_meas | cfg_gdkw | start_now | run_kw |
                     clr_result | rearm_now | getfreq_rd | status_rd | diag_rd |
                     getmean_rd;
   wire op_unknown = en_rise & ~op_decoded & (qtag_op_i != OP_CFG_INTERRUPT);
@@ -108,8 +107,6 @@ module adaptive_sweep (
   wire [31:0] cfg_nmin;
   wire [31:0] cfg_flo;
   wire [31:0] cfg_fhi;
-  wire [15:0] cfg_pair_min;
-  wire [15:0] cfg_pair_max;
 
   wire search_mode;
   wire estop_hold;
@@ -171,8 +168,6 @@ module adaptive_sweep (
     .n_min_o(cfg_nmin),
     .f_lo_o(cfg_flo),
     .f_hi_o(cfg_fhi),
-    .pair_min_o(cfg_pair_min),
-    .pair_max_o(cfg_pair_max),
     .threshold_o(threshold),
     .block_tol_o(block_tol),
     .search_mode_o(search_mode),
@@ -216,12 +211,12 @@ module adaptive_sweep (
   wire eng_done;
   wire eng_converged;
   wire eng_capped;
-  wire eng_stalled;
+  wire eng_nothing;
   wire [31:0] eng_x;
   wire [15:0] eng_iter;
-  wire [15:0] eng_pairs;
-  wire [31:0] eng_sd_hi;
-  wire [31:0] eng_step;
+  wire [15:0] eng_points;
+  wire [31:0] eng_spacing;
+  wire [31:0] eng_jump;
   wire [31:0] eng_flags;
 
   wire eng_freq_ack = getfreq_rd & eng_freq_valid;
@@ -249,7 +244,7 @@ module adaptive_sweep (
       dest_r <= 1'b0;
     else if (start_now)
       dest_r <= 1'b0;
-    else if (run_gdkw)
+    else if (run_kw)
       dest_r <= 1'b1;
   end
 
@@ -267,14 +262,14 @@ module adaptive_sweep (
                         search_mode,
                         busy,
                         finish_seen,
-                        (dest_r & eng_stalled)};
+                        (dest_r & eng_nothing)};
 
   reg res_pend;
 
   always @(posedge clk) begin
     if (!rst_n)
       res_pend <= 1'b0;
-    else if (start_now | run_gdkw | clr_result)
+    else if (start_now | run_kw | clr_result)
       res_pend <= 1'b0;
     else if (pf_finish | eng_done)
       res_pend <= 1'b1;
@@ -295,7 +290,7 @@ module adaptive_sweep (
       qtag_vld_o <= 1'b1;
     end else if (eng_done) begin
       qtag_dt1_o <= eng_x;
-      qtag_dt2_o <= {eng_iter, 13'd0, eng_stalled, eng_capped, eng_converged};
+      qtag_dt2_o <= {eng_iter, 13'd0, eng_nothing, eng_capped, eng_converged};
       qtag_vld_o <= 1'b1;
     end else if (clr_result) begin
       qtag_vld_o <= 1'b0;
@@ -321,7 +316,7 @@ module adaptive_sweep (
   always @(posedge clk) begin
     if (!rst_n)
       qtag_rdy_o <= 1'b1;
-    else if (start_now | run_gdkw)
+    else if (start_now | run_kw)
       qtag_rdy_o <= 1'b0;
     else if (pf_finish | eng_done)
       qtag_rdy_o <= 1'b1;
@@ -361,7 +356,7 @@ module adaptive_sweep (
   always @(posedge clk) begin
     if (!rst_n) begin
       draining <= 1'b0;
-    end else if (start_now | run_gdkw) begin
+    end else if (start_now | run_kw) begin
       draining <= 1'b0;
     end else if (drain_set) begin
       draining <= 1'b1;
@@ -373,7 +368,7 @@ module adaptive_sweep (
   always @(posedge clk) begin
     if (!rst_n) begin
       arm_pend <= 1'b0;
-    end else if (start_now | run_gdkw) begin
+    end else if (start_now | run_kw) begin
       arm_pend <= 1'b0;
     end else if (rearm_now) begin
       arm_pend <= 1'b0;
@@ -385,7 +380,7 @@ module adaptive_sweep (
   always @(posedge clk) begin
     if (!rst_n) begin
       drain_drop_cnt <= 32'd0;
-    end else if (start_now | run_gdkw) begin
+    end else if (start_now | run_kw) begin
       drain_drop_cnt <= 32'd0;
     end else if (drain_now & s_axis_tvalid) begin
       drain_drop_cnt <= drain_drop_cnt + 32'd1;
@@ -427,7 +422,7 @@ module adaptive_sweep (
   always @(posedge clk) begin
     if (!rst_n)
       nconv_cnt <= 16'd0;
-    else if (start_now | run_gdkw)
+    else if (start_now | run_kw)
       nconv_cnt <= 16'd0;
     else if (ac_log_wr & ~ac_log_entry[8])
       nconv_cnt <= nconv_cnt + 16'd1;
@@ -439,20 +434,17 @@ module adaptive_sweep (
   gradient_engine u_gradient_engine (
     .clk               (clk),
     .rst_n             (rst_n),
-    .start_i           (run_gdkw),
-    .two_sided_i       (qtag_op_i == OP_RUN_KW),
-    .movement_guard_i  (qtag_dt2_i[1]),
+    .start_i           (run_kw),
     .dip_i             (search_mode),
+    .start_freq_i      (cfg_start),
+    .step_i            (cfg_step),
+    .n_points_i        (cfg_npoints),
     .x0_i              (qtag_dt1_i),
     .f_lo_i            (cfg_flo),
     .f_hi_i            (cfg_fhi),
-    .step_i            (cfg_step),
     .min_step_i        (qtag_dt3_i),
     .max_iteration_i   (qtag_dt4_i[15:0]),
-    .patience_i        (qtag_dt2_i[23:16]),
-    .lambda_i          (qtag_dt2_i[8:4]),
-    .pair_min_i        (cfg_pair_min),
-    .pair_max_i        (cfg_pair_max),
+    .threshold_i       (threshold),
     .freq_word_o       (eng_freq_word),
     .freq_valid_o      (eng_freq_valid),
     .freq_ack_i        (eng_freq_ack),
@@ -463,12 +455,12 @@ module adaptive_sweep (
     .done_o            (eng_done),
     .converged_o       (eng_converged),
     .capped_o          (eng_capped),
-    .stalled_o         (eng_stalled),
+    .nothing_o         (eng_nothing),
     .x_o               (eng_x),
     .iteration_o       (eng_iter),
-    .pairs_o           (eng_pairs),
-    .signed_sum_high_o (eng_sd_hi),
-    .step_o            (eng_step),
+    .points_o          (eng_points),
+    .spacing_o         (eng_spacing),
+    .jump_o            (eng_jump),
     .debug_o           (eng_flags)
   );
 
@@ -500,7 +492,7 @@ module adaptive_sweep (
     .clk              (clk),
     .rst_n            (rst_n),
     .read_sel_i       (read_sel),
-    .job_start_i      (start_now | run_gdkw),
+    .job_start_i      (start_now | run_kw),
     .op_strobe_i      (en_rise),
     .op_i             (qtag_op_i),
     .op_unknown_i     (op_unknown),
@@ -526,12 +518,12 @@ module adaptive_sweep (
     .pf_freq_valid_i  (pf_freq_valid),
     .pf_point_idx_i   (pf_point_idx),
     .eng_flags_i      (eng_flags),
-    .eng_step_i       (eng_step),
+    .eng_spacing_i    (eng_spacing),
     .eng_freq_word_i  (eng_freq_word),
     .eng_x_i          (eng_x),
     .eng_iter_i       (eng_iter),
-    .eng_pairs_i      (eng_pairs),
-    .eng_sd_hi_i      (eng_sd_hi),
+    .eng_points_i     (eng_points),
+    .eng_jump_i       (eng_jump),
     .ac_flags_i       (ac_flags),
     .ac_power_i       (ac_power),
     .ac_power_valid_i (ac_power_valid),
@@ -547,8 +539,6 @@ module adaptive_sweep (
     .cfg_nmin_i       (cfg_nmin),
     .cfg_flo_i        (cfg_flo),
     .cfg_fhi_i        (cfg_fhi),
-    .cfg_pair_min_i   (cfg_pair_min),
-    .cfg_pair_max_i   (cfg_pair_max),
     .threshold_i      (threshold),
     .block_tol_i      (block_tol),
     .ctrl_i           (ctrl_word),
