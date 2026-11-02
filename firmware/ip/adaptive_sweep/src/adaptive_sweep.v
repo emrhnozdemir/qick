@@ -48,9 +48,6 @@ module adaptive_sweep (
   output [31:0] ps_debug_do
 );
 
-  // QP2 opcode map. op[4:3] is the class: 0 configure, 1 control, 2 read,
-  // 3 debug. 15 is CFG_INTERRUPT, decoded by the processor and ignored here;
-  // 24 is reserved for GET_DEBUG.
   localparam [4:0] OP_CFG_WINDOW = 5'd0;
   localparam [4:0] OP_CFG_ACQ = 5'd1;
   localparam [4:0] OP_CFG_GDKW = 5'd2;
@@ -64,9 +61,7 @@ module adaptive_sweep (
   localparam [4:0] OP_GET_DIAG = 5'd18;
   localparam [4:0] OP_GET_MEAN = 5'd19;
 
-  // REG7 of the AXI slave: "AS", the opcode-map ABI, a reserved byte.
-  localparam [7:0] ABI = 8'd4;
-  localparam [31:0] IDENT = {16'h4153, ABI, 8'd0};
+  localparam [31:0] IDENT = 32'h4153_0500;
 
   assign s_axis_tready = 1'b1;
 
@@ -117,10 +112,9 @@ module adaptive_sweep (
   wire [31:0] ctrl_word;
 
   wire [31:0] status_word;
-  wire [31:0] dbg_status;
   wire [31:0] dbg_dt1;
   wire [31:0] dbg_dt2;
-  wire [4:0] read_sel;
+  wire [3:0] read_sel;
   wire axi_commit;
   wire [4:0] axi_target;
   wire axi_bad_target;
@@ -156,7 +150,7 @@ module adaptive_sweep (
     .dt2_i(qtag_dt2_i),
     .dt3_i(qtag_dt3_i),
     .dt4_i(qtag_dt4_i),
-    .status_i(dbg_status),
+    .status_i(status_word),
     .view_dt1_i(dbg_dt1),
     .view_dt2_i(dbg_dt2),
     .ident_i(IDENT),
@@ -186,7 +180,6 @@ module adaptive_sweep (
   wire pf_freq_valid;
   wire pf_finish;
   wire pf_waiting;
-  wire [1:0] pf_state;
   wire [31:0] best_freq;
   wire [31:0] pf_best_mean_i;
   wire [31:0] pf_best_mean_q;
@@ -198,7 +191,7 @@ module adaptive_sweep (
   wire [31:0] ac_mean_i;
   wire [31:0] ac_mean_q;
   wire ac_log_wr;
-  wire [15:0] ac_log_entry;
+  wire [9:0] ac_log_entry;
   wire [63:0] ac_power;
   wire ac_power_valid;
   wire [31:0] ac_flags;
@@ -212,6 +205,7 @@ module adaptive_sweep (
   wire eng_converged;
   wire eng_capped;
   wire eng_nothing;
+  wire eng_window;
   wire [31:0] eng_x;
   wire [15:0] eng_iter;
   wire [15:0] eng_points;
@@ -221,20 +215,15 @@ module adaptive_sweep (
 
   wire eng_freq_ack = getfreq_rd & eng_freq_valid;
 
-  reg busy;
   reg finish_seen;
 
   always @(posedge clk) begin
-    if (!rst_n) begin
-      busy <= 1'b0;
+    if (!rst_n)
       finish_seen <= 1'b0;
-    end else if (start_now) begin
-      busy <= 1'b1;
+    else if (start_now)
       finish_seen <= 1'b0;
-    end else if (pf_finish) begin
-      busy <= 1'b0;
+    else if (pf_finish)
       finish_seen <= 1'b1;
-    end
   end
 
   reg dest_r;
@@ -255,12 +244,12 @@ module adaptive_sweep (
                         eng_capped,
                         dest_r,
                         estop_en,
-                        1'b0,
+                        eng_window,
                         ac_early_stop,
                         ac_warmup_done,
                         3'd0,
                         search_mode,
-                        busy,
+                        pf_waiting,
                         finish_seen,
                         (dest_r & eng_nothing)};
 
@@ -290,7 +279,7 @@ module adaptive_sweep (
       qtag_vld_o <= 1'b1;
     end else if (eng_done) begin
       qtag_dt1_o <= eng_x;
-      qtag_dt2_o <= {eng_iter, 13'd0, eng_nothing, eng_capped, eng_converged};
+      qtag_dt2_o <= {eng_iter, 12'd0, eng_window, eng_nothing, eng_capped, eng_converged};
       qtag_vld_o <= 1'b1;
     end else if (clr_result) begin
       qtag_vld_o <= 1'b0;
@@ -300,7 +289,7 @@ module adaptive_sweep (
       qtag_vld_o <= 1'b1;
     end else if (diag_rd & ~res_pend) begin
       qtag_dt1_o <= ac_n_used;
-      qtag_dt2_o <= {nconv_cnt, 5'd0, ac_log_entry[10:0]};
+      qtag_dt2_o <= {nconv_cnt, 6'd0, ac_log_entry};
       qtag_vld_o <= 1'b1;
     end else if (getfreq_rd & ~res_pend) begin
       qtag_dt1_o <= eng_freq_word;
@@ -387,15 +376,15 @@ module adaptive_sweep (
     end
   end
 
-  wire point_arm = start_now | (arm_req & ~drain_now) | (rearm_now & arm_pend);
+  wire point_arm = (arm_req & ~drain_now) | (rearm_now & arm_pend);
 
   amplitude_calculator u_amplitude_calculator (
     .clk               (clk),
     .rst_n             (rst_n),
     .s_axis_tvalid     (s_axis_tvalid),
-    .s_axis_tready     (s_axis_tready),
     .s_axis_tdata      (s_axis_tdata),
     .arm_i             (point_arm),
+    .flush_i           (start_now | run_kw),
     .avg_shift_i       (cfg_avg_shift),
     .warmup_shots_i              (cfg_warmup_shots),
     .n_min_i           (cfg_nmin),
@@ -435,6 +424,7 @@ module adaptive_sweep (
     .clk               (clk),
     .rst_n             (rst_n),
     .start_i           (run_kw),
+    .abort_i           (start_now),
     .dip_i             (search_mode),
     .start_freq_i      (cfg_start),
     .step_i            (cfg_step),
@@ -456,6 +446,7 @@ module adaptive_sweep (
     .converged_o       (eng_converged),
     .capped_o          (eng_capped),
     .nothing_o         (eng_nothing),
+    .window_o          (eng_window),
     .x_o               (eng_x),
     .iteration_o       (eng_iter),
     .points_o          (eng_points),
@@ -468,6 +459,7 @@ module adaptive_sweep (
     .clk            (clk),
     .rst_n          (rst_n),
     .start_i        (start_now),
+    .abort_i        (run_kw),
     .start_freq_i   (cfg_start),
     .step_i         (cfg_step),
     .n_points_i     (cfg_npoints),
@@ -482,12 +474,9 @@ module adaptive_sweep (
     .best_mean_i_o  (pf_best_mean_i),
     .best_mean_q_o  (pf_best_mean_q),
     .point_idx_o    (pf_point_idx),
-    .state_o        (pf_state),
     .waiting_o      (pf_waiting)
   );
 
-  // Debug: the AXI views (REG4..REG6 through register_bank) and the ILA
-  // vectors, always built. sweep_debug registers everything it observes.
   sweep_debug monitor (
     .clk              (clk),
     .rst_n            (rst_n),
@@ -496,13 +485,12 @@ module adaptive_sweep (
     .op_strobe_i      (en_rise),
     .op_i             (qtag_op_i),
     .op_unknown_i     (op_unknown),
-    .read_held_i      ((status_rd | diag_rd | getfreq_rd | getmean_rd) & res_pend),
+    .read_held_i      ((status_rd | diag_rd | getfreq_rd | getmean_rd) & (res_pend | pf_finish | eng_done)),
     .getfreq_idle_i   (getfreq_rd & ~eng_freq_valid),
     .rdy_i            (qtag_rdy_o),
     .vld_i            (qtag_vld_o),
     .res_pend_i       (res_pend),
     .dest_i           (dest_r),
-    .busy_i           (busy),
     .finish_seen_i    (finish_seen),
     .int_en_i         (int_en),
     .draining_i       (draining),
@@ -513,7 +501,6 @@ module adaptive_sweep (
     .best_freq_i      (best_freq),
     .resp_dt1_i       (qtag_dt1_o),
     .resp_dt2_i       (qtag_dt2_o),
-    .pf_state_i       (pf_state),
     .pf_waiting_i     (pf_waiting),
     .pf_freq_valid_i  (pf_freq_valid),
     .pf_point_idx_i   (pf_point_idx),
@@ -542,18 +529,16 @@ module adaptive_sweep (
     .threshold_i      (threshold),
     .block_tol_i      (block_tol),
     .ctrl_i           (ctrl_word),
-    .confirm_i        (cfg_confirm),
     .axi_commit_i     (axi_commit),
     .axi_target_i     (axi_target),
     .axi_bad_target_i (axi_bad_target),
     .view_dt1_o       (dbg_dt1),
     .view_dt2_o       (dbg_dt2)
   );
-  assign dbg_status = status_word;
 
   assign c_debug_do = {en_rise, qtag_op_i,
-                       qtag_rdy_o, qtag_vld_o, res_pend, dest_r, busy, finish_seen,
-                       pf_state, eng_flags[15:12],
+                       qtag_rdy_o, qtag_vld_o, res_pend, dest_r, pf_waiting, finish_seen,
+                       1'b0, eng_flags[16:12],
                        eng_freq_valid, eng_probe_arm, eng_done, pf_freq_valid, pf_finish,
                        ac_flags[5], ac_flags[4], ac_flags[0], ac_power_valid, ac_early_pulse,
                        int_pulse, draining, arm_pend, s_axis_tvalid};

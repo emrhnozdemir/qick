@@ -58,15 +58,12 @@ module register_bank(
   output [2:0] confirm_o,
   output [31:0] ctrl_o,
 
-  output [4:0] read_sel_o,
+  output [3:0] read_sel_o,
   output commit_o,
   output [4:0] target_o,
   output bad_target_o
 );
 
-  // REG0 carries the commit toggle and the target, REG1 is the payload word,
-  // REG2 the debug read select, REG3 is spare. REG4..REG7 are read-only:
-  // status, the selected view pair, and the IDENT word.
   wire [31:0] reg0;
   wire [31:0] reg1;
   wire [31:0] reg2;
@@ -100,15 +97,12 @@ module register_bank(
     .REG0_REG(reg0),
     .REG1_REG(reg1),
     .REG2_REG(reg2),
-    .REG3_REG(),
-    .REG4_IN(dbg_status_axi),
-    .REG5_IN(dbg_dt1_axi),
-    .REG6_IN(dbg_dt2_axi),
-    .REG7_IN(ident_i)
+    .REG3_IN(dbg_status_axi),
+    .REG4_IN(dbg_dt1_axi),
+    .REG5_IN(dbg_dt2_axi),
+    .REG6_IN(ident_i)
   );
 
-  // The views are clk-domain registers captured here into s_axi_aclk;
-  // adaptive_sweep.xdc declares these capture flops a false path.
   always @(posedge s_axi_aclk) begin
     if (!s_axi_aresetn) begin
       dbg_status_axi <= 32'd0;
@@ -121,48 +115,41 @@ module register_bank(
     end
   end
 
-  (* ASYNC_REG = "TRUE" *) reg [4:0] read_sel_s0;
-  (* ASYNC_REG = "TRUE" *) reg [4:0] read_sel_s1;
+  (* ASYNC_REG = "TRUE" *) reg [3:0] read_sel_s0;
+  (* ASYNC_REG = "TRUE" *) reg [3:0] read_sel_s1;
 
   always @(posedge clk) begin
     if (!rst_n) begin
-      read_sel_s0 <= 5'd0;
-      read_sel_s1 <= 5'd0;
+      read_sel_s0 <= 4'd0;
+      read_sel_s1 <= 4'd0;
     end else begin
-      read_sel_s0 <= reg2[4:0];
+      read_sel_s0 <= reg2[3:0];
       read_sel_s1 <= read_sel_s0;
     end
   end
 
   assign read_sel_o = read_sel_s1;
 
-  reg toggle_s0;
-  reg toggle_s1;
+  (* ASYNC_REG = "TRUE" *) reg toggle_s0;
+  (* ASYNC_REG = "TRUE" *) reg toggle_s1;
   reg toggle_s2;
 
   always @(posedge clk) begin
-    if (!rst_n) begin
-      toggle_s0 <= 0;
-      toggle_s1 <= 0;
-      toggle_s2 <= 0;
-    end else begin
-      toggle_s0 <= reg0[31];
-      toggle_s1 <= toggle_s0;
-      toggle_s2 <= toggle_s1;
-    end
+    toggle_s0 <= reg0[31];
+    toggle_s1 <= toggle_s0;
+    toggle_s2 <= toggle_s1;
   end
 
-  wire write_pulse = toggle_s1 ^ toggle_s2;
+  wire write_pulse = rst_n & (toggle_s1 ^ toggle_s2);
 
   wire [4:0] cfg_target = reg0[20:16];
 
   wire threshold_write = write_pulse & (cfg_target == 5'd2);
-  wire ctrl_write = write_pulse & (cfg_target == 5'd3);
   wire block_tol_write = write_pulse & (cfg_target == 5'd4);
 
   assign commit_o = write_pulse;
   assign target_o = cfg_target;
-  assign bad_target_o = write_pulse & ~(threshold_write | ctrl_write | block_tol_write);
+  assign bad_target_o = write_pulse & ~(threshold_write | block_tol_write);
 
   always @(posedge clk) begin
     if (!rst_n)
@@ -178,23 +165,31 @@ module register_bank(
       block_tol_o <= reg1;
   end
 
-  reg [31:0] ctrl;
+  reg search_mode;
+  reg estop_hold;
+  reg [2:0] estop_flags;
+  reg [2:0] confirm;
 
-  assign search_mode_o = ctrl[0];
-  assign estop_hold_o = ctrl[4];
-  assign estop_en_o = ctrl[6];
-  assign block_en_o = ctrl[7];
-  assign short_confirm_o = ctrl[8];
-  assign confirm_o = ctrl[19:17];
-  assign ctrl_o = ctrl;
+  assign search_mode_o = search_mode;
+  assign estop_hold_o = estop_hold;
+  assign estop_en_o = estop_flags[0];
+  assign block_en_o = estop_flags[1];
+  assign short_confirm_o = estop_flags[2];
+  assign confirm_o = confirm;
+  assign ctrl_o = {12'd0, confirm, 8'd0, estop_flags, 1'b0, estop_hold, 3'd0, search_mode};
 
   always @(posedge clk) begin
-    if (!rst_n)
-      ctrl <= 0;
-    else if (cfg_meas_i)
-      ctrl <= dt2_i;
-    else if (ctrl_write)
-      ctrl <= reg1;
+    if (!rst_n) begin
+      search_mode <= 0;
+      estop_hold <= 0;
+      estop_flags <= 0;
+      confirm <= 0;
+    end else if (cfg_meas_i) begin
+      search_mode <= dt2_i[0];
+      estop_hold <= dt2_i[4];
+      estop_flags <= dt2_i[8:6];
+      confirm <= dt2_i[19:17];
+    end
   end
 
   always @(posedge clk) begin

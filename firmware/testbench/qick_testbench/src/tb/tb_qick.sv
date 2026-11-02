@@ -1718,6 +1718,20 @@ wire        as_interrupt;
                       u_adaptive_sweep.ac_power);
          if (u_adaptive_sweep.interrupt_o)
             $fdisplay(sys_log, "irq,%0.1f", $realtime());
+         // early-stop bookkeeping: which beats each point folded, its arm and its emit,
+         // and the tProc side of every interrupt (redirect, REARM)
+         if (u_adaptive_sweep.point_arm)
+            $fdisplay(sys_log, "arm,%0.1f", $realtime());
+         if (u_adaptive_sweep.u_amplitude_calculator.stop_check.counter.counting)
+            $fdisplay(sys_log, "fold,%0.1f,%0d", $realtime(),
+                      ~u_adaptive_sweep.u_amplitude_calculator.stop_check.counter.stopped);
+         if (u_adaptive_sweep.ac_power_valid)
+            $fdisplay(sys_log, "emit,%0.1f,%0d,%0d,%0d", $realtime(), u_adaptive_sweep.ac_n_used,
+                      u_adaptive_sweep.ac_early_stop, u_adaptive_sweep.ac_power);
+         if (AXIS_QPROC.QPROC.CORE_0.CORE_CPU.int_take)
+            $fdisplay(sys_log, "redirect,%0.1f", $realtime());
+         if (u_adaptive_sweep.rearm_now)
+            $fdisplay(sys_log, "rearm,%0.1f,%0d", $realtime(), u_adaptive_sweep.arm_pend);
       end
    end
 

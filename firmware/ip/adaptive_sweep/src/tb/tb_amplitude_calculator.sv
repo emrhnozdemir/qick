@@ -32,7 +32,7 @@ module tb_amplitude_calculator;
   wire [31:0] mean_i_o;
   wire [31:0] mean_q_o;
   wire log_wr_o;
-  wire [15:0] log_entry_o;
+  wire [9:0] log_entry_o;
   wire [63:0] power_o;
   wire power_valid_o;
 
@@ -42,9 +42,9 @@ module tb_amplitude_calculator;
     .clk              (clk),
     .rst_n            (rst_n),
     .s_axis_tvalid    (s_axis_tvalid),
-    .s_axis_tready    (s_axis_tready),
     .s_axis_tdata     (s_axis_tdata),
     .arm_i            (arm_i),
+    .flush_i(1'b0),
     .avg_shift_i      (avg_shift_i),
     .warmup_shots_i             (warmup_shots_i),
     .n_min_i          (n_min_i),
@@ -67,14 +67,14 @@ module tb_amplitude_calculator;
     .power_valid_o    (power_valid_o)
   );
 
-  reg [15:0] log_seen;
+  reg [9:0] log_seen;
   reg early_pulse_seen;
   reg [63:0] power_seen;
   reg power_hit;
 
   always @(posedge clk) begin
     if (!rst_n) begin
-      log_seen <= 16'hFFFF;
+      log_seen <= 10'h3FF;
       early_pulse_seen <= 1'b0;
       power_seen <= {64{1'b0}};
       power_hit <= 1'b0;
@@ -251,7 +251,7 @@ module tb_amplitude_calculator;
     chk64("A0 power", power_seen, 64'd1250000);
     chk32("A0 n_used", n_used_o, 32'd8);
     chk32("A0 early_stop", {31'd0, early_stop_o}, 32'd0);
-    chk32("A0 log entry (cap)", {16'd0, log_seen}, 32'h0000_0004);
+    chk32("A0 log entry (cap)", {22'd0, log_seen}, 32'h0000_0004);
 
     // ---------------------------------------------------------------
     // A1  truncating shift, positive: 1+1+2+2 = 6, 6/4 = 1.5 -> 1
@@ -295,7 +295,7 @@ module tb_amplitude_calculator;
     chk32("A2 early_stop", {31'd0, early_stop_o}, 32'd1);
     chk32("A2 early_pulse fired", {31'd0, early_pulse_seen}, 32'd1);
     chk64("A2 power", power_seen, 64'd1000000);
-    chk32("A2 log entry (stop, k=2)", {16'd0, log_seen}, 32'h0000_0110);
+    chk32("A2 log entry (stop, k=2)", {22'd0, log_seen}, 32'h0000_0110);
 
     // ---------------------------------------------------------------
     // A3  drain / hold: stop at n = 4, keep counting to the cap, and
@@ -463,7 +463,7 @@ module tb_amplitude_calculator;
     block_tol_i = 32'hffff_ffff;
     cfg(6, 1, 0, 4, 1, 64);
     do_arm;
-    chk32("A18 arm invalidates both snapshot epochs", {30'd0, dut.stop_check.magnitude.snapshot_valid}, 0);
+    chk32("A18 arm invalidates both snapshot epochs", {22'd0, dut.stop_check.magnitude.snapshot_exponent[1], dut.stop_check.magnitude.snapshot_exponent[0]}, 0);
     feed_n(4, 1234, -4321, 3);
     repeat (12) @(posedge clk);
     chk32("A18 no retirement without midpoint baseline", {31'd0, power_hit}, 0);

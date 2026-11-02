@@ -5,6 +5,7 @@ module peak_finder(
   input rst_n,
 
   input start_i,
+  input abort_i,
   input [31:0] start_freq_i,
   input [31:0] step_i,
   input [15:0] n_points_i,
@@ -22,27 +23,23 @@ module peak_finder(
   output [31:0] best_mean_i_o,
   output [31:0] best_mean_q_o,
   output [15:0] point_idx_o,
-  output [1:0] state_o,
   output waiting_o
 );
 
-  localparam [1:0] S_IDLE = 2'd0, S_SEND_FREQ = 2'd1, S_WAIT_MEAS = 2'd2;
-
-  reg [1:0] state;
-  reg [1:0] next_state;
+  reg waiting;
 
   wire [31:0] frequency;
   wire last_point;
+  wire measured = waiting & amp_valid_i;
 
   point_walker walker(
     .clk(clk),
     .rst_n(rst_n),
-    .state_i(state),
     .start_i(start_i),
     .start_freq_i(start_freq_i),
     .step_i(step_i),
     .n_points_i(n_points_i),
-    .amp_valid_i(amp_valid_i),
+    .measured_i(measured),
     .frequency_o(frequency),
     .point_idx_o(point_idx_o),
     .last_point_o(last_point)
@@ -51,10 +48,9 @@ module peak_finder(
   best_tracker tracker(
     .clk(clk),
     .rst_n(rst_n),
-    .state_i(state),
     .start_i(start_i),
     .dip_i(dip_i),
-    .amp_valid_i(amp_valid_i),
+    .measured_i(measured),
     .amp_data_i(amp_data_i),
     .mean_i_i(mean_i_i),
     .mean_q_i(mean_q_i),
@@ -65,62 +61,26 @@ module peak_finder(
   );
 
   always @(posedge clk) begin
-    if (!rst_n)
-      state <= S_IDLE;
-    else
-      state <= next_state;
-  end
-
-  always @(*) begin
-    case (state)
-      S_IDLE:
-        next_state = start_i ? S_SEND_FREQ : S_IDLE;
-
-      S_SEND_FREQ:
-        next_state = S_WAIT_MEAS;
-
-      S_WAIT_MEAS: begin
-        if (amp_valid_i)
-          next_state = last_point ? S_IDLE : S_SEND_FREQ;
-        else
-          next_state = S_WAIT_MEAS;
-      end
-
-      default:
-        next_state = S_IDLE;
-    endcase
-  end
-
-  always @(posedge clk) begin
     if (!rst_n) begin
+      waiting <= 0;
+      freq_valid_o <= 0;
+      finish_o <= 0;
+    end else if (start_i) begin
+      waiting <= 1;
+      freq_valid_o <= 1;
+      finish_o <= 0;
+    end else if (abort_i) begin
+      waiting <= 0;
       freq_valid_o <= 0;
       finish_o <= 0;
     end else begin
-      case (state)
-        S_IDLE: begin
-          freq_valid_o <= 0;
-          finish_o <= 0;
-        end
-
-        S_SEND_FREQ: begin
-          freq_valid_o <= 1;
-          finish_o <= 0;
-        end
-
-        S_WAIT_MEAS: begin
-          freq_valid_o <= 0;
-          finish_o <= amp_valid_i & last_point;
-        end
-
-        default: begin
-          freq_valid_o <= 0;
-          finish_o <= 0;
-        end
-      endcase
+      if (measured & last_point)
+        waiting <= 0;
+      freq_valid_o <= measured & ~last_point;
+      finish_o <= measured & last_point;
     end
   end
 
-  assign state_o = state;
-  assign waiting_o = (state == S_WAIT_MEAS);
+  assign waiting_o = waiting;
 
 endmodule

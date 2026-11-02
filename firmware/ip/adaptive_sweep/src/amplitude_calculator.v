@@ -5,10 +5,10 @@ module amplitude_calculator(
   input rst_n,
 
   input s_axis_tvalid,
-  input s_axis_tready,
   input [63:0] s_axis_tdata,
 
   input arm_i,
+  input flush_i,
   input [4:0] avg_shift_i,
   input [31:0] warmup_shots_i,
   input [31:0] n_min_i,
@@ -29,33 +29,30 @@ module amplitude_calculator(
   output [31:0] mean_i_o,
   output [31:0] mean_q_o,
   output log_wr_o,
-  output [15:0] log_entry_o,
+  output [9:0] log_entry_o,
 
   output [63:0] power_o,
   output power_valid_o,
   output [31:0] debug_o
 );
 
+  wire restart = arm_i | flush_i;
+
   reg signed [31:0] input_i;
   reg signed [31:0] input_q;
   reg input_valid;
-  reg input_ready;
 
   always @(posedge clk) begin
     if (!rst_n) begin
       input_i <= 0;
       input_q <= 0;
       input_valid <= 0;
-      input_ready <= 0;
     end else begin
       input_i <= s_axis_tdata[31:0];
       input_q <= s_axis_tdata[63:32];
-      input_valid <= s_axis_tvalid;
-      input_ready <= s_axis_tready;
+      input_valid <= s_axis_tvalid & ~restart;
     end
   end
-
-  wire shot_accepted = input_valid & input_ready;
 
   reg signed [31:0] shot_data_i;
   reg signed [31:0] shot_data_q;
@@ -69,7 +66,7 @@ module amplitude_calculator(
     end else begin
       shot_data_i <= input_i;
       shot_data_q <= input_q;
-      shot_valid <= shot_accepted;
+      shot_valid <= input_valid & ~restart;
     end
   end
 
@@ -113,6 +110,7 @@ module amplitude_calculator(
     .clk(clk),
     .rst_n(rst_n),
     .arm_i(arm_i),
+    .flush_i(flush_i),
     .shot_i(shot_valid),
     .enable_i(estop_en_i),
     .avg_shift_i(avg_shift_i),
@@ -148,13 +146,13 @@ module amplitude_calculator(
   reg [1:0] emit_pipe;
 
   always @(posedge clk) begin
-    if (!rst_n)
+    if (!rst_n || restart)
       emit_pipe <= 0;
     else
       emit_pipe <= {emit_pipe[0], emit};
   end
 
-  wire emit_ready = emit_pipe[1];
+  wire emit_ready = emit_pipe[1] & ~restart;
 
   assign log_wr_o = emit_ready;
 
@@ -162,6 +160,7 @@ module amplitude_calculator(
     .clk(clk),
     .rst_n(rst_n),
     .start_i(emit_ready),
+    .clear_i(restart),
     .i_i(point_i),
     .q_i(point_q),
     .power_o(power_o),

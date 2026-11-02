@@ -918,8 +918,8 @@ class Adaptive_Sweep(SocIP):
     Adaptive_Sweep host-side port.
 
     Two jobs.  First, the settings the generated tProc program does NOT
-    itself send: the early-stop threshold and the block tolerance (and CTRL,
-    for retargeting a loaded program).  Call
+    itself send: the early-stop threshold and the block tolerance (CTRL is
+    always sent by the program's CFG_ACQ).  Call
     :meth:`load_tables` with the
     sweep's plan (or the individual setters) before starting a program that
     needs them.  Second, the debug views of the running IP:
@@ -934,16 +934,16 @@ class Adaptive_Sweep(SocIP):
     comes out of reset at ``D=64``, so an unwritten register behaves as
     ``thr=1/64`` rather than disabling the early stop.
 
-    Register map, in words: ``REG0`` (``tbl_ctrl``) is
-    ``{[31] toggle, [30:21] reserved, [20:16] target, [15:0] reserved}``,
-    with target 2 = early-stop threshold, 3 = CTRL, 4 = absolute block
-    tolerance (5 held the KW patience until ABI 4 and is now a bad target);
-    ``REG1`` (``tbl_d0``) is the payload word;
-    ``REG2``
-    (``read_sel``) selects the debug view, a plain level; ``REG3`` is spare.
-    ``REG4`` (``status``) returns the GET_STATUS word, ``REG5``/``REG6``
-    (``dbg_dt1``/``dbg_dt2``) the selected view pair, and ``REG7``
-    (``ident``) ``{"AS", abi, reserved}``; those four are read-only.
+    Register map (ABI 5), in words: ``REG0`` (``tbl_ctrl``) is
+    ``{[31] toggle, [30:21] zero, [20:16] target, [15:0] zero}``,
+    with target 2 = early-stop threshold and 4 = absolute block tolerance
+    (every other target is a bad target; 3 wrote CTRL until ABI 4);
+    ``REG1`` (``tbl_d0``) is the payload word; ``REG2`` (``read_sel``)
+    selects the debug view (4 bits, views 0..15), a plain level. ``REG3``
+    (``status``) returns the
+    GET_STATUS word, ``REG4``/``REG5`` (``dbg_dt1``/``dbg_dt2``) the selected
+    view pair, and ``REG6`` (``ident``) ``{"AS", abi, reserved}``; those four
+    are read-only. Until ABI 4 a spare REG3 sat before them.
 
     Write protocol: the payload register is written first, then REG0 twice -
     once with the target and the toggle UNCHANGED, once with REG0[31]
@@ -953,17 +953,19 @@ class Adaptive_Sweep(SocIP):
     """
     bindto = ['emrhnozdemir:QICK:adaptive_sweep:1.0']
 
-    #: The opcode-map ABI this driver and asm_v2's registry are written for.
-    #: The IP reports its own in ``ident`` bits 15:8 (:meth:`check_abi`).
-    ABI = 4
+    #: The ABI (opcode map, response layout and AXI register map) this driver
+    #: and asm_v2's registry are written for. The IP reports its own in
+    #: ``ident`` bits 15:8 (:meth:`check_abi`).
+    ABI = 5
 
-    ENGINE_STATES = ['IDLE', 'PRESENT', 'MEASURE', 'START', 'PMAX', 'GRID1',
-                     'GRID2', 'GRID_END', 'SEEN', 'NOISE', 'BAR', 'BETTER',
-                     'WIDTH', 'PLAN', 'GO', 'DONE']
-    #: The border search's last decision, view 1 bits 23:20.
+    #: The border search's state, view 1 bits 16:12 and view 0 bits 18:14.
+    ENGINE_STATES = ['IDLE', 'PRESENT', 'MEASURE', 'PMAX', 'GRID1', 'GRID2',
+                     'GRID_END', 'SEEN', 'NOISE', 'BAR', 'BETTER', 'WIDTH',
+                     'PLAN0', 'PLAN1', 'PLAN2', 'PLAN3', 'PLAN4', 'PLAN5',
+                     'PLAN6', 'PLAN7', 'PLAN8', 'PLAN9', 'GO', 'DONE']
+    #: The border search's last decision, view 1 bits 23:21.
     ENGINE_DECISIONS = ['NONE', 'GRID', 'BETTER', 'BORDER', 'CONVERGED',
-                        'CAPPED', 'NOTHING']
-    FINDER_STATES = ['IDLE', 'SEND_FREQ', 'WAIT_MEAS']
+                        'CAPPED', 'NOTHING', 'WINDOW']
     #: Debug views, by REG2 value: each returns a (dt1, dt2) word pair.
     VIEWS = ['top', 'engine', 'engine_x', 'engine_border', 'power', 'mean',
              'diag', 'acq', 'cfg_window', 'cfg_grid', 'cfg_acq', 'cfg_band',
@@ -984,10 +986,10 @@ class Adaptive_Sweep(SocIP):
             'tbl_ctrl': 0,
             'tbl_d0': 1,
             'read_sel': 2,
-            'status': 4,
-            'dbg_dt1': 5,
-            'dbg_dt2': 6,
-            'ident': 7,
+            'status': 3,
+            'dbg_dt1': 4,
+            'dbg_dt2': 5,
+            'ident': 6,
         }
 
     def _init_firmware(self):
@@ -1052,19 +1054,6 @@ class Adaptive_Sweep(SocIP):
         self.tbl_d0 = int(value)
         self._tbl_commit(4)
 
-    def set_ctrl(self, word):
-        """Write the CTRL register directly (target 3).
-
-        CTRL drives ``search_mode`` (bit 0, 0 peak / 1 dip), ``estop_hold``
-        (bit 4), ``estop_en`` (bit 6), ``block_en`` (bit 7), and ``confirm``
-        (bits 19:17). The
-        generated program sets it at init over QP2 CFG_ACQ; writing it here
-        afterwards retargets a LOADED program, so those four can be swept
-        without a rebuild, exactly as the threshold can.
-        """
-        self.tbl_d0 = int(word) & 0xFFFFFFFF
-        self._tbl_commit(3)
-
     def load_tables(self, plan):
         """Load the plan's early-stop threshold and block tolerance."""
         if plan.estop_d:
@@ -1083,26 +1072,33 @@ class Adaptive_Sweep(SocIP):
         ident = int(self.ident)
         if (ident >> 16) != 0x4153:
             raise RuntimeError(
-                "adaptive_sweep IDENT register reads 0x%08x: this bitstream "
-                "predates the IDENT register (opcode map ABI 1) and does not "
-                "match the ABI %d programs this software compiles"
-                % (ident, self.ABI))
+                "adaptive_sweep IDENT register (word 6) reads 0x%08x: this "
+                "bitstream predates ABI 5, whose AXI map moved IDENT from word "
+                "7 to word 6, and does not match the ABI %d programs this "
+                "software compiles" % (ident, self.ABI))
         if self.abi != self.ABI:
             raise RuntimeError(
                 "adaptive_sweep bitstream carries opcode-map ABI %d, this "
                 "software expects ABI %d" % (self.abi, self.ABI))
 
     def read_view(self, sel):
-        """Select a debug view (0..31, or a name from :attr:`VIEWS`).
+        """Select a debug view (0..15, or a name from :attr:`VIEWS`).
 
         Returns the ``(dt1, dt2)`` word pair.  The select is a level: it
         crosses into the fabric clock and the view crosses back well within
-        one AXI read, so no wait is needed.
+        one AXI read, so no wait is needed.  The two words are two AXI reads
+        of a live view, so the pair is read until two reads in a row agree.
         """
         if isinstance(sel, str):
             sel = self.VIEWS.index(sel)
-        self.read_sel = int(sel) & 0x1F
-        return int(self.dbg_dt1), int(self.dbg_dt2)
+        self.read_sel = int(sel) & 0xF
+        pair = (int(self.dbg_dt1), int(self.dbg_dt2))
+        for _ in range(8):
+            again = (int(self.dbg_dt1), int(self.dbg_dt2))
+            if again == pair:
+                return pair
+            pair = again
+        raise RuntimeError("debug view %d did not hold still for two reads" % sel)
 
     def errors(self):
         """The sticky error bits of view 0, as a dict (cleared by START/RUN_*)."""
@@ -1124,15 +1120,14 @@ class Adaptive_Sweep(SocIP):
         word = int(self.status)
         print('---------------------------------------------')
         print('--- adaptive_sweep IDENT 0x%08x: abi %d' % (int(self.ident), self.abi))
-        print('--- STATUS (REG4) 0x%08x' % word)
+        print('--- STATUS (REG3) 0x%08x' % word)
         for name, value in ADAPTIVE_SWEEP.unpack_status(word).items():
             self._show(name, value)
         top, _ = self.read_view('top')
         print('--- handshake (view 0)')
         self._show('op_count', top >> 24)
         self._show('last_op', (top >> 19) & 0x1F)
-        self._show('engine_state', self._state_name(self.ENGINE_STATES, (top >> 15) & 0xF))
-        self._show('finder_state', self._state_name(self.FINDER_STATES, (top >> 13) & 0x3))
+        self._show('engine_state', self._state_name(self.ENGINE_STATES, (top >> 14) & 0x1F))
         for i, name in enumerate(self._TOP_BITS):
             self._show(name, (top >> i) & 1)
         print('--- errors since the last START/RUN')
@@ -1145,14 +1140,14 @@ class Adaptive_Sweep(SocIP):
         self.print_status()
         flags, points_iter = self.read_view('engine')
         print('--- engine (view 1)')
-        self._show('state', self._state_name(self.ENGINE_STATES, (flags >> 12) & 0xF))
-        self._show('decision', self._state_name(self.ENGINE_DECISIONS, (flags >> 20) & 0xF))
-        self._show('k', (flags >> 16) & 0xF)
-        self._show('plan_phase', (flags >> 24) & 0xF)
+        self._show('state', self._state_name(self.ENGINE_STATES, (flags >> 12) & 0x1F))
+        self._show('decision', self.ENGINE_DECISIONS[(flags >> 21) & 0x7])
+        self._show('k', (flags >> 17) & 0xF)
         self._show('balanced', flags & 1)
         self._show('side', ['down', 'up'][(flags >> 1) & 1])
         for i, name in enumerate(self._ENGINE_BITS, start=2):
             self._show(name, (flags >> i) & 1)
+        self._show('bad_window', (flags >> 24) & 1)
         self._show('points', points_iter >> 16)
         self._show('iter', points_iter & 0xFFFF)
         freq_word, x = self.read_view('engine_x')

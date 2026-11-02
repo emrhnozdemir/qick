@@ -5,6 +5,7 @@ module square_summer(
   input rst_n,
 
   input start_i,
+  input clear_i,
   input signed [31:0] i_i,
   input signed [31:0] q_i,
 
@@ -32,7 +33,7 @@ module square_summer(
   reg [3:0] valid_pipe;
 
   always @(posedge clk) begin
-    if (!rst_n)
+    if (!rst_n || clear_i)
       valid_pipe <= 0;
     else
       valid_pipe <= {valid_pipe[2:0], start_i};
@@ -44,7 +45,7 @@ module square_summer(
       valid_o <= 0;
     end else begin
       power_o <= i_squared + q_squared;
-      valid_o <= valid_pipe[3];
+      valid_o <= valid_pipe[3] & ~clear_i;
     end
   end
 

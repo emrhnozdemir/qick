@@ -21,13 +21,13 @@ module tb_short_confirmation;
   wire warmup_done_o, early_stop_o, early_pulse_o;
   wire [31:0] n_used_o, mean_i_o, mean_q_o;
   wire log_wr_o, power_valid_o;
-  wire [15:0] log_entry_o;
+  wire [9:0] log_entry_o;
   wire [63:0] power_o;
 
   amplitude_calculator dut (
     .clk(clk), .rst_n(rst_n),
-    .s_axis_tvalid(s_axis_tvalid), .s_axis_tready(s_axis_tready),
-    .s_axis_tdata(s_axis_tdata), .arm_i(arm_i),
+    .s_axis_tvalid(s_axis_tvalid),
+    .s_axis_tdata(s_axis_tdata), .arm_i(arm_i), .flush_i(1'b0),
     .avg_shift_i(avg_shift_i), .warmup_shots_i(32'd0), .n_min_i(n_min_i),
     .estop_en_i(estop_en_i), .estop_hold_i(estop_hold_i),
     .threshold_i(threshold_i), .block_en_i(block_en_i), .block_tol_i(32'd0),
@@ -335,14 +335,13 @@ module tb_short_confirmation;
     feed(16, 1000, -500, 0);
     expect_result("S16 disabled early stop falls back to cap", 16, 1000, -500, 0, 0);
 
-    // Do not count TVALID without TREADY or data presented without TVALID.
+    // Do not count data presented without TVALID (TREADY is tied high at the top).
     configure(6, 4, 3, 0, 64, 0, 1);
     minimum_confirmation_count = 8;
     feed(4, 1000, -500, 24);
-    s_axis_tvalid = 1; s_axis_tready = 0;
+    s_axis_tvalid = 0;
     s_axis_tdata = {32'd999999, 32'd999999};
     idle(6);
-    s_axis_tvalid = 0; s_axis_tready = 1;
     idle(6);
     no_result("S17 rejected bus cycles cannot confirm");
     feed(4, 3000, -1500, 24);
@@ -390,7 +389,8 @@ module tb_short_confirmation;
     configure(7, 4, 3, 0, 64, 0, 1);
     feed(8, 1000, -500, 0);
     idle(5);
-    check32("S20b old point has not retired before rearm", {31'd0, early_stop_o}, 0);
+    check32("S20b old point has not retired before rearm", {31'd0, dut.stop_check.counter.armed}, 1);
+    check32("S20b early_stop still reports the last emitted point (S20)", {31'd0, early_stop_o}, 1);
     configure(6, 4, 3, 0, 64, 0, 1);
     no_result("S20b rearm at final verdict cannot emit stale point");
     minimum_confirmation_count = 8;

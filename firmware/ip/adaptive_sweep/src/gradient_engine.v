@@ -5,6 +5,7 @@ module gradient_engine(
   input rst_n,
 
   input start_i,
+  input abort_i,
   input dip_i,
   input [31:0] start_freq_i,
   input [31:0] step_i,
@@ -28,6 +29,7 @@ module gradient_engine(
   output converged_o,
   output capped_o,
   output nothing_o,
+  output window_o,
   output [31:0] x_o,
   output [15:0] iteration_o,
   output [15:0] points_o,
@@ -36,9 +38,8 @@ module gradient_engine(
   output [31:0] debug_o
 );
 
-  wire [3:0] state;
-  wire [3:0] phase;
-  wire [3:0] decision;
+  wire [4:0] state;
+  wire [2:0] decision;
   wire measuring;
 
   wire [67:0] pa, pb;
@@ -80,6 +81,7 @@ module gradient_engine(
     .clk(clk),
     .rst_n(rst_n),
     .start_i(start_i),
+    .abort_i(abort_i),
     .freq_ack_i(freq_ack_i),
     .amp_valid_i(amp_valid_i),
     .seen_i(seen),
@@ -87,6 +89,7 @@ module gradient_engine(
     .stop_i(stop),
     .cap_i(cap),
     .pless_i(pless),
+    .fless_i(fless),
     .p_i(p),
     .g_i(g),
     .pmax_i(pmax),
@@ -113,7 +116,6 @@ module gradient_engine(
     .lead_d_i(lead_d),
     .go_up_i(go_up),
     .state_o(state),
-    .phase_o(phase),
     .pa_o(pa),
     .pb_o(pb),
     .psub_o(psub),
@@ -128,6 +130,7 @@ module gradient_engine(
     .converged_o(converged_o),
     .capped_o(capped_o),
     .nothing_o(nothing_o),
+    .window_o(window_o),
     .decision_o(decision)
   );
 
@@ -135,7 +138,6 @@ module gradient_engine(
     .clk(clk),
     .rst_n(rst_n),
     .state_i(state),
-    .phase_i(phase),
     .start_i(start_i),
     .threshold_i(threshold_i),
     .lower_i(lower),
@@ -175,7 +177,7 @@ module gradient_engine(
     .amp_data_i(amp_data_i),
     .pless_i(pless),
     .falu_i(falu),
-    .enc_pos_i(enc_pos),
+    .enc_pos_i(enc_pos[3:0]),
     .side_i(side),
     .stop_i(stop),
     .p_o(p),
@@ -200,12 +202,11 @@ module gradient_engine(
     .clk(clk),
     .rst_n(rst_n),
     .state_i(state),
-    .phase_i(phase),
     .start_i(start_i),
     .step_i(step_i),
     .min_step_i(min_step_i),
     .max_iteration_i(max_iteration_i),
-    .palu_i(palu),
+    .palu_i(palu[63:0]),
     .pless_i(pless),
     .falu_i(falu),
     .fless_i(fless),
@@ -241,7 +242,7 @@ module gradient_engine(
   assign points_o = idx;
   assign spacing_o = width;
   assign jump_o = step;
-  assign debug_o = {4'd0, phase, decision, k, state, seen, dip, measuring,
+  assign debug_o = {7'd0, window_o, decision, k, state, seen, dip, measuring,
                     freq_valid_o, probe_arm_o, busy_o, done_o, converged_o, capped_o,
                     nothing_o, side, balanced};
 

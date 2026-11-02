@@ -5,6 +5,7 @@ module shot_counter(
   input rst_n,
 
   input arm_i,
+  input flush_i,
   input shot_i,
   input [4:0] avg_shift_i,
   input [31:0] warmup_shots_i,
@@ -21,7 +22,6 @@ module shot_counter(
   output check_o,
   output [4:0] check_exponent_o,
   output short_check_o,
-  output [31:0] sample_count_o,
 
   output retire_o,
   output stopping_o,
@@ -52,9 +52,9 @@ module shot_counter(
   reg stopped;
   reg [31:0] shot_count;
   reg [4:0] check_bit;
-  reg previous_bit;
+  reg [4:0] hold_exponent;
 
-  wire counting = armed & shot_i;
+  wire counting = armed & shot_i & ~arm_i & ~flush_i;
   wire folding = counting & ~stopped;
   wire [31:0] shot_number = shot_count + 32'd1;
   wire at_cap = shot_number[cap_exponent];
@@ -63,12 +63,9 @@ module shot_counter(
 
   wire watched_bit = shot_number[check_bit];
 
-  assign check_o = folding & watched_bit & ~previous_bit & ~at_cap & enable_i;
+  assign check_o = folding & watched_bit & ~at_cap & enable_i;
   assign check_exponent_o = check_bit;
-  // Speculative even checkpoints preserve N+2/N+4 while N is in flight.
-  assign short_check_o = folding & ~at_cap & enable_i &
-                         (shot_number >= 32'd4) & ~shot_number[0];
-  assign sample_count_o = shot_number;
+  assign short_check_o = folding & ~at_cap & enable_i & (shot_number >= 32'd4) & ~shot_number[0];
 
   assign acc_first_o = (shot_count == 0);
   assign acc_enable_o = folding;
@@ -82,20 +79,12 @@ module shot_counter(
   assign retire_shift_o = stopping_o ? stop_exponent_i : cap_exponent;
 
   always @(posedge clk) begin
-    if (!rst_n) begin
+    if (!rst_n)
       check_bit <= 2;
-      previous_bit <= 0;
-    end else if (arm_i) begin
+    else if (arm_i | flush_i)
       check_bit <= 2;
-      previous_bit <= 0;
-    end else if (folding) begin
-      if (watched_bit & ~previous_bit) begin
-        check_bit <= check_bit + 5'd1;
-        previous_bit <= 0;
-      end else begin
-        previous_bit <= watched_bit;
-      end
-    end
+    else if (folding & watched_bit)
+      check_bit <= check_bit + 5'd1;
   end
 
   always @(posedge clk) begin
@@ -103,50 +92,50 @@ module shot_counter(
       armed <= 0;
       stopped <= 0;
       shot_count <= 0;
+      hold_exponent <= 0;
       stopped_early_o <= 0;
       shots_used_o <= 0;
-    end else begin
-      if (arm_i) begin
-        armed <= 1;
+    end else if (flush_i) begin
+      armed <= 0;
+      stopped <= 0;
+      shot_count <= 0;
+    end else if (arm_i) begin
+      armed <= 1;
+      stopped <= 0;
+      shot_count <= 0;
+    end else if (counting) begin
+      if (at_cap) begin
+        armed <= 0;
         stopped <= 0;
         shot_count <= 0;
-        stopped_early_o <= 0;
-      end else if (counting) begin
-        if (at_cap) begin
-          armed <= 0;
-          stopped <= 0;
-          shot_count <= 0;
-          if (!stopped) begin
-            stopped_early_o <= 0;
-            shots_used_o <= shot_number;
-          end
-        end else if (stop_active) begin
-          stopped_early_o <= 1;
-          shots_used_o <= 32'd1 << stop_exponent_i;
-          if (hold_i) begin
-            armed <= 1;
-            stopped <= 1;
-            shot_count <= shot_count + 32'd1;
-          end else begin
-            armed <= 0;
-            stopped <= 0;
-            shot_count <= 0;
-          end
-        end else begin
-          armed <= 1;
-          shot_count <= shot_count + 32'd1;
-        end
+        stopped_early_o <= stopped;
+        shots_used_o <= stopped ? (32'd1 << hold_exponent) : shot_number;
       end else if (stop_active) begin
-        stopped_early_o <= 1;
-        shots_used_o <= 32'd1 << stop_exponent_i;
         if (hold_i) begin
           armed <= 1;
           stopped <= 1;
+          shot_count <= shot_count + 32'd1;
+          hold_exponent <= stop_exponent_i;
         end else begin
           armed <= 0;
           stopped <= 0;
           shot_count <= 0;
+          stopped_early_o <= 1;
+          shots_used_o <= 32'd1 << stop_exponent_i;
         end
+      end else begin
+        shot_count <= shot_count + 32'd1;
+      end
+    end else if (stop_active) begin
+      if (hold_i) begin
+        stopped <= 1;
+        hold_exponent <= stop_exponent_i;
+      end else begin
+        armed <= 0;
+        stopped <= 0;
+        shot_count <= 0;
+        stopped_early_o <= 1;
+        shots_used_o <= 32'd1 << stop_exponent_i;
       end
     end
   end

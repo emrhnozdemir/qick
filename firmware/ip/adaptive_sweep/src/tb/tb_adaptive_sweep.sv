@@ -709,7 +709,7 @@ module tb_adaptive_sweep;
     // AXI target 5 (the KW patience until ABI 3) is free: a write is a bad target
     axi_tbl_write(5'd5, 32'd4);
     axi_select_view(5'd0);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("K6 target 5 is a bad target", {31'd0, axi_rd[3]}, 32'd1);
 
     // the threshold register sets the seen gate 8 * pmax / 2^flog2(D): at D = 2 the line can
@@ -833,13 +833,14 @@ module tb_adaptive_sweep;
     check32("SC1 QP reports saved N", qtag_dt1_o, 4);
     check32("SC1 QP reports candidate exponent", qtag_dt2_o, 32'h0000_0110);
 
-    // The same mode must be selectable through the asynchronous AXI
-    // target3 CTRL route, not just through the QP measurement operation.
+    // CTRL comes only from CFG_ACQ since ABI 5: AXI target 3 is a bad target.
     qp2_op(OP_CFG_ACQ, NSAMP, 32'h0006_0046, 0, 4);
     check32("SC2 baseline CTRL clears short bit", {31'd0, dut.short_confirm}, 0);
     axi_tbl_write(5'd3, 32'h0006_0146);
-    check32("SC2 AXI target3 sets short bit", {31'd0, dut.short_confirm}, 1);
-    check32("SC2 AXI target3 preserves three passes", {29'd0, dut.cfg_confirm}, 3);
+    check32("SC2 AXI target 3 no longer writes CTRL", {31'd0, dut.short_confirm}, 0);
+    qp2_op(OP_CFG_ACQ, NSAMP, 32'h0006_0146, 0, 4);
+    check32("SC2 CFG_ACQ sets short bit", {31'd0, dut.short_confirm}, 1);
+    check32("SC2 CFG_ACQ sets three passes", {29'd0, dut.cfg_confirm}, 3);
     qp2_op(OP_REARM, 0, 0, 0, 0);
     qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 1, 6);
     block_irq_before = block_irq_count;
@@ -892,11 +893,11 @@ module tb_adaptive_sweep;
     check32("K8 every probe stopped early and interrupted", block_irq_count - block_irq_before, 16);
     check32("K8 each probe retired at 8 shots", dut.ac_n_used, 8);
 
-    // DEBUG VIEWS. REG4 mirrors the GET_STATUS word, REG5/REG6 are the view
-    // pair chosen by REG2, REG7 is the IDENT word; the error bits are sticky
+    // DEBUG VIEWS (ABI 5 map). REG3 mirrors the GET_STATUS word, REG4/REG5 are the view
+    // pair chosen by REG2, REG6 is the IDENT word; the error bits are sticky
     // until the next START/RUN_*. The last job above was a KW run.
-    axi_read(8'h1C, axi_rd);
-    check32("D0 IDENT register", axi_rd, 32'h4153_0400);
+    axi_read(8'h18, axi_rd);
+    check32("D0 IDENT register", axi_rd, 32'h4153_0500);
 
     qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
     qp2_op(OP_CFG_ACQ, 0, CTRL_SHIFT, 0, 0);
@@ -909,26 +910,26 @@ module tb_adaptive_sweep;
     qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
     qp2_op(OP_GET_STATUS, 0, 0, 0, 0);
     status_t0 = qtag_dt1_o;
-    axi_read(8'h10, axi_rd);
+    axi_read(8'h0C, axi_rd);
     check32("D1 AXI STATUS equals the GET_STATUS word", axi_rd, status_t0);
     check32("D1 STATUS point_idx", {16'd0, axi_rd[31:16]}, 32'd2);
 
     axi_select_view(5'd6);
     qp2_op(OP_GET_DIAG, 0, 0, 0, 0);
-    axi_read(8'h14, axi_rd);
+    axi_read(8'h10, axi_rd);
     check32("D2 view 6 DT1 is GET_DIAG n_used", axi_rd, qtag_dt1_o);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D2 view 6 DT2 is the GET_DIAG verdict", axi_rd, qtag_dt2_o);
     axi_select_view(5'd5);
     qp2_op(OP_GET_MEAN, 0, 0, 0, 0);
-    axi_read(8'h14, axi_rd);
+    axi_read(8'h10, axi_rd);
     check32("D2 view 5 DT1 is the live mean I", axi_rd, qtag_dt1_o);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D2 view 5 DT2 is the live mean Q", axi_rd, qtag_dt2_o);
     axi_select_view(5'd15);
-    axi_read(8'h14, axi_rd);
+    axi_read(8'h10, axi_rd);
     check32("D2 view 15 DT1 is the last response", axi_rd, qtag_dt1_o);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D2 view 15 DT2 is the last response", axi_rd, qtag_dt2_o);
 
     qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
@@ -938,81 +939,82 @@ module tb_adaptive_sweep;
     run_kw_line(60000, 1000, 0, 2, 0);
     check_kw("D3 capped run", 32'h1001_8000, 32'h0002_0002, 7, 32'h70fd_8000, 32'h0ffd_8000);
     axi_select_view(5'd1);
-    axi_read(8'h14, axi_rd);
-    check32("D3 view 1 engine state idle", {28'd0, axi_rd[15:12]}, 32'd0);
+    axi_read(8'h10, axi_rd);
+    check32("D3 view 1 engine state idle", {27'd0, axi_rd[16:12]}, 32'd0);
     check32("D3 view 1 capped flag", {31'd0, axi_rd[3]}, 32'd1);
-    check32("D3 view 1 last decision is CAPPED", {28'd0, axi_rd[23:20]}, 32'd5);
-    axi_read(8'h18, axi_rd);
+    check32("D3 view 1 last decision is CAPPED", {29'd0, axi_rd[23:21]}, 32'd5);
+    axi_read(8'h14, axi_rd);
     check32("D3 view 1 DT2 is {points, iter}", axi_rd, {dut.eng_points, dut.eng_iter});
     check32("D3 five grid points", {16'd0, dut.eng_points}, 32'd5);
     check32("D3 two iterations", {16'd0, dut.eng_iter}, 32'd2);
     axi_select_view(5'd2);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D3 view 2 DT2 is x", axi_rd, dut.eng_x);
     axi_select_view(5'd3);
-    axi_read(8'h14, axi_rd);
+    axi_read(8'h10, axi_rd);
     check32("D3 view 3 DT1 is the border width", axi_rd,
             dut.u_gradient_engine.points.hi - dut.u_gradient_engine.points.lo);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D3 view 3 DT2 is the last move", axi_rd, dut.u_gradient_engine.planner.step);
 
     axi_select_view(5'd8);
-    axi_read(8'h14, axi_rd);
+    axi_read(8'h10, axi_rd);
     check32("D4 view 8 DT1 start_freq", axi_rd, KW_GRID);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D4 view 8 DT2 step", axi_rd, KW_STEP);
     axi_select_view(5'd11);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D4 view 11 DT2 f_hi", axi_rd, KW_HI);
     axi_select_view(5'd12);
-    axi_read(8'h14, axi_rd);
+    axi_read(8'h10, axi_rd);
     check32("D4 view 12 DT1 is free", axi_rd, 32'd0);
-    axi_read(8'h18, axi_rd);
-    check32("D4 view 12 DT2 CTRL", axi_rd, CTRL_SHIFT);
+    axi_read(8'h14, axi_rd);
+    check32("D4 view 12 DT2 CTRL live bits", axi_rd, CTRL_SHIFT & 32'h000E_01D1);
     axi_tbl_write(5'd4, 32'd77);
     axi_select_view(5'd13);
-    axi_read(8'h14, axi_rd);
+    axi_read(8'h10, axi_rd);
     check32("D4 view 13 DT1 block_tol", axi_rd, 32'd77);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D4 view 13 DT2 last target", {27'd0, axi_rd[4:0]}, 32'd4);
     commit_before = {16'd0, axi_rd[31:16]};
     axi_tbl_write(5'd4, 32'd0);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D4 view 13 commit count advanced by one", {16'd0, axi_rd[31:16]}, commit_before + 1);
 
     axi_select_view(5'd0);
     qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
     qp2_op(OP_CFG_WINDOW, START_FREQ, STEP, 32'd1, AVG_T0_SH);
     qp2_op(OP_START, 0, 0, 0, 0);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D5 errors clear at START", {27'd0, axi_rd[4:0]}, 32'd0);
     qp2_op(OP_START, 0, 0, 0, 0);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D5 START while busy", {27'd0, axi_rd[4:0]}, 32'b00001);
     qp2_op(5'd24, 0, 0, 0, 0);
     qp2_op(5'd15, 0, 0, 0, 0);
     qp2_op(5'd12, 0, 0, 0, 0);
     check32("D5 free op 12 starts nothing", {31'd0, dut.eng_busy}, 32'd0);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D5 unknown op flagged, CFG_INTERRUPT ignored", {27'd0, axi_rd[4:0]}, 32'b00011);
     axi_tbl_write(5'd7, 32'd1);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D5 bad AXI target", {27'd0, axi_rd[4:0]}, 32'b01011);
     feed_point(AVG_T0, 100, 0);
     wait_finish;
     qp2_op(OP_GET_STATUS, 0, 0, 0, 0);
-    axi_read(8'h18, axi_rd);
+    axi_read(8'h14, axi_rd);
     check32("D5 read while the result is held", {27'd0, axi_rd[4:0]}, 32'b01111);
     check32("D5 no stray power", {31'd0, axi_rd[4]}, 32'd0);
     qp2_op(OP_CLR_RESULT, 0, 0, 0, 0);
-    axi_read(8'h14, axi_rd);
+    axi_read(8'h10, axi_rd);
     check32("D5 view 0 last op is CLR_RESULT", {27'd0, axi_rd[23:19]}, {27'd0, OP_CLR_RESULT});
     check32("D5 view 0 finish_seen", {31'd0, axi_rd[7]}, 32'd1);
     check32("D5 view 0 ready", {31'd0, axi_rd[12]}, 32'd1);
 
     axi_select_view(5'd31);
-    axi_read(8'h14, axi_rd);
-    check32("D6 view 31 reads zero", axi_rd, 32'd0);
+    axi_read(8'h10, axi_rd);
+    check32("D6 the view select keeps 4 bits: 31 selects view 15", {28'd0, dut.monitor.read_sel}, 32'd15);
+    check32("D6 select 31 reads the last response (view 15)", axi_rd, qtag_dt1_o);
     axi_select_view(5'd0);
 
     check32("D7 c_debug_do counted every opcode strobe", op_pulses, op_calls);

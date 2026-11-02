@@ -18,35 +18,16 @@ module threshold_compare(
   input [59:0] block_magnitude_i,
   input block_valid_i,
   input [4:0] exponent_i,
+  input power_i,
 
   output reg stop_o,
   output reg [4:0] stop_exponent_o,
   output reg saturated_o,
   output verdict_valid_o,
-  output verdict_passed_o
+  output verdict_passed_o,
+  output verdict_power_o,
+  output [4:0] verdict_exponent_o
 );
-
-  reg [15:0] threshold;
-  reg [31:0] n_min;
-  reg [2:0] confirm;
-  reg block_en;
-  reg [31:0] block_tol;
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      threshold <= 0;
-      n_min <= 0;
-      confirm <= 0;
-      block_en <= 0;
-      block_tol <= 0;
-    end else if (arm_i) begin
-      threshold <= threshold_i;
-      n_min <= n_min_i;
-      confirm <= confirm_i;
-      block_en <= block_en_i;
-      block_tol <= block_tol_i;
-    end
-  end
 
   reg stage1_valid;
   reg stage2_valid;
@@ -56,12 +37,13 @@ module threshold_compare(
   reg [18:0] noise_chunk2;
   reg [58:0] stage1_signal;
   reg [4:0] stage1_exponent;
+  reg stage1_power;
   reg stage1_block_pass;
   reg stage2_block_pass;
   reg stage3_block_pass;
   reg stage4_block_pass;
 
-  wire [63:0] block_limit = {32'd0, block_tol} << (exponent_i - 5'd1);
+  wire [63:0] block_limit = {32'd0, block_tol_i} << (exponent_i - 5'd1);
   always @(posedge clk) begin
     if (!rst_n || arm_i) begin
       stage1_block_pass <= 0;
@@ -85,6 +67,7 @@ module threshold_compare(
       noise_chunk2 <= 0;
       stage1_signal <= 0;
       stage1_exponent <= 0;
+      stage1_power <= 0;
     end else if (valid_i) begin
       stage1_valid <= 1;
       noise_chunk0 <= noise_magnitude_i[19:0];
@@ -92,6 +75,7 @@ module threshold_compare(
       noise_chunk2 <= noise_magnitude_i[58:40];
       stage1_signal <= signal_magnitude_i;
       stage1_exponent <= exponent_i;
+      stage1_power <= power_i;
     end else begin
       stage1_valid <= 0;
     end
@@ -102,6 +86,7 @@ module threshold_compare(
   (* use_dsp = "yes" *) reg [34:0] product2;
   reg [58:0] stage2_signal;
   reg [4:0] stage2_exponent;
+  reg stage2_power;
 
   always @(posedge clk) begin
     if (!rst_n || arm_i) begin
@@ -111,13 +96,15 @@ module threshold_compare(
       product2 <= 0;
       stage2_signal <= 0;
       stage2_exponent <= 0;
+      stage2_power <= 0;
     end else if (stage1_valid) begin
       stage2_valid <= 1;
-      product0 <= noise_chunk0 * threshold;
-      product1 <= noise_chunk1 * threshold;
-      product2 <= noise_chunk2 * threshold;
+      product0 <= noise_chunk0 * threshold_i;
+      product1 <= noise_chunk1 * threshold_i;
+      product2 <= noise_chunk2 * threshold_i;
       stage2_signal <= stage1_signal;
       stage2_exponent <= stage1_exponent;
+      stage2_power <= stage1_power;
     end else begin
       stage2_valid <= 0;
     end
@@ -130,6 +117,7 @@ module threshold_compare(
   reg [74:0] scaled_noise;
   reg [58:0] stage3_signal;
   reg [4:0] stage3_exponent;
+  reg stage3_power;
 
   always @(posedge clk) begin
     if (!rst_n || arm_i) begin
@@ -137,11 +125,13 @@ module threshold_compare(
       scaled_noise <= 0;
       stage3_signal <= 0;
       stage3_exponent <= 0;
+      stage3_power <= 0;
     end else if (stage2_valid) begin
       stage3_valid <= 1;
       scaled_noise <= scaled_sum;
       stage3_signal <= stage2_signal;
       stage3_exponent <= stage2_exponent;
+      stage3_power <= stage2_power;
     end else begin
       stage3_valid <= 0;
     end
@@ -153,30 +143,35 @@ module threshold_compare(
   reg stage4_valid;
   reg signed [75:0] margin;
   reg [4:0] stage4_exponent;
+  reg stage4_power;
 
   always @(posedge clk) begin
     if (!rst_n || arm_i) begin
       stage4_valid <= 0;
       margin <= 0;
       stage4_exponent <= 0;
+      stage4_power <= 0;
     end else if (stage3_valid) begin
       stage4_valid <= 1;
       margin <= margin_next;
       stage4_exponent <= stage3_exponent;
+      stage4_power <= stage3_power;
     end else begin
       stage4_valid <= 0;
     end
   end
 
   wire odd_even_pass = ~margin[75];
-  wire passed = odd_even_pass & (~block_en | stage4_block_pass);
+  wire passed = odd_even_pass & (~block_en_i | stage4_block_pass);
   assign verdict_valid_o = stage4_valid & ~arm_i;
   assign verdict_passed_o = passed;
-  wire eligible = ((32'd1 << stage4_exponent) >= n_min);
+  assign verdict_power_o = stage4_power;
+  assign verdict_exponent_o = stage4_exponent;
+  wire eligible = ((32'd1 << stage4_exponent) >= n_min_i);
 
   reg [2:0] pass_streak;
 
-  wire [2:0] confirm_minus_one = (confirm == 0) ? 3'd0 : (confirm - 3'd1);
+  wire [2:0] confirm_minus_one = (confirm_i == 0) ? 3'd0 : (confirm_i - 3'd1);
   wire confirmed = passed & (pass_streak >= confirm_minus_one);
 
   reg signed [75:0] previous_margin;
@@ -202,7 +197,7 @@ module threshold_compare(
       stop_o <= enable_i & confirmed & eligible;
       stop_exponent_o <= stage4_exponent;
       pass_streak <= passed ? ((pass_streak == 3'd7) ? 3'd7 : (pass_streak + 3'd1)) : 3'd0;
-      if (~odd_even_pass & eligible) begin
+      if (stage4_power & ~odd_even_pass & eligible) begin
         saturated_o <= saturated_o | (not_improving & previous_not_improving);
         previous_margin <= margin;
         previous_not_improving <= not_improving;

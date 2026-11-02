@@ -1,377 +1,158 @@
-module axi_slv_adaptive_sweep
-   (
-      input    wire              s_axi_aclk     ,
-      input    wire              s_axi_aresetn  ,
+`timescale 1ns / 1ps
 
-      // Write Address Channel.
-      input    wire  [7:0]    s_axi_awaddr   ,
-      input    wire  [2:0]    s_axi_awprot   ,
-      input    wire              s_axi_awvalid  ,
-      output   wire              s_axi_awready  ,
+module axi_slv_adaptive_sweep(
+  input s_axi_aclk,
+  input s_axi_aresetn,
 
-      // Write Data Channel.
-      input    wire  [31:0]      s_axi_wdata    ,
-      input    wire  [3:0]    s_axi_wstrb    ,
-      input    wire              s_axi_wvalid   ,
-      output   wire              s_axi_wready   ,
+  input [7:0] s_axi_awaddr,
+  input [2:0] s_axi_awprot,
+  input s_axi_awvalid,
+  output s_axi_awready,
 
-      // Write Response Channel.
-      output   wire  [1:0]    s_axi_bresp    ,
-      output   wire              s_axi_bvalid   ,
-      input    wire              s_axi_bready   ,
+  input [31:0] s_axi_wdata,
+  input [3:0] s_axi_wstrb,
+  input s_axi_wvalid,
+  output s_axi_wready,
 
-      // Read Address Channel.
-      input    wire  [7:0]       s_axi_araddr   ,
-      input    wire  [2:0]       s_axi_arprot   ,
-      input    wire              s_axi_arvalid  ,
-      output   wire              s_axi_arready  ,
+  output [1:0] s_axi_bresp,
+  output s_axi_bvalid,
+  input s_axi_bready,
 
-      // Read Data Channel.
-      output   wire  [31:0]      s_axi_rdata    ,
-      output   wire  [1:0]    s_axi_rresp    ,
-      output   wire              s_axi_rvalid   ,
-      input    wire              s_axi_rready   ,
+  input [7:0] s_axi_araddr,
+  input [2:0] s_axi_arprot,
+  input s_axi_arvalid,
+  output s_axi_arready,
 
-      // REG0..REG3 are written by the host and read back; REG4..REG7 are
-      // read-only and return whatever register_bank drives on the *_IN ports.
-      output   wire  [31:0]      REG0_REG       ,
-      output   wire  [31:0]      REG1_REG       ,
-      output   wire  [31:0]      REG2_REG       ,
-      output   wire  [31:0]      REG3_REG       ,
-      input    wire  [31:0]      REG4_IN        ,
-      input    wire  [31:0]      REG5_IN        ,
-      input    wire  [31:0]      REG6_IN        ,
-      input    wire  [31:0]      REG7_IN
+  output [31:0] s_axi_rdata,
+  output [1:0] s_axi_rresp,
+  output s_axi_rvalid,
+  input s_axi_rready,
+
+  output [31:0] REG0_REG,
+  output [31:0] REG1_REG,
+  output [31:0] REG2_REG,
+  input [31:0] REG3_IN,
+  input [31:0] REG4_IN,
+  input [31:0] REG5_IN,
+  input [31:0] REG6_IN
 );
 
-// Width of S_AXI data bus
-localparam integer C_S_AXI_DATA_WIDTH  = 32;
-// Width of S_AXI address bus
-localparam integer C_S_AXI_ADDR_WIDTH  = 8;
+  reg awready;
+  reg bvalid;
+  reg aw_en;
+  reg [2:0] waddr;
 
-// AXI4LITE signals
-reg [C_S_AXI_ADDR_WIDTH-1 : 0]   axi_awaddr;
-reg   axi_awready;
-reg   axi_wready;
-reg [1 : 0]    axi_bresp;
-reg   axi_bvalid;
-reg [C_S_AXI_ADDR_WIDTH-1 : 0]   axi_araddr;
-reg   axi_arready;
-reg [C_S_AXI_DATA_WIDTH-1 : 0]   axi_rdata;
-reg [1 : 0]    axi_rresp;
-reg   axi_rvalid;
+  reg arready;
+  reg rvalid;
+  reg [2:0] raddr;
+  reg [31:0] rdata;
 
-// Example-specific design signals
-// local parameter for addressing 32 bit / 64 bit C_S_AXI_DATA_WIDTH
-// ADDR_LSB is used for addressing 32/64 bit registers/memories
-// ADDR_LSB = 2 for 32 bits (n downto 2)
-// ADDR_LSB = 3 for 64 bits (n downto 3)
-localparam integer ADDR_LSB = (C_S_AXI_DATA_WIDTH/32) + 1;
-localparam integer OPT_MEM_ADDR_BITS = 2;
+  reg toggle;
+  reg [4:0] target;
+  reg [31:0] payload;
+  reg [3:0] read_sel;
 
-//-- Number of Slave Registers 8: four writable (REG0..REG3) and four
-//-- read-only (REG4..REG7, driven by the *_IN ports since 2026-10-24).
-//-- Trimmed from the template's 64 on 2026-08-23: only REG0..REG7
-//-- leave this module, so the other 56 were unreachable flops plus a
-//-- 64-way read mux.  Word addresses above 0x1C now alias down into
-//-- 0x00..0x1C, which is the template's behaviour at any width and is
-//-- harmless here - nothing addresses them.
-reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg0;
-reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg1;
-reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg2;
-reg [C_S_AXI_DATA_WIDTH-1:0]  slv_reg3;
-wire   slv_reg_rden;
-wire   slv_reg_wren;
-reg [C_S_AXI_DATA_WIDTH-1:0]   reg_data_out;
-integer   byte_index;
-reg    aw_en;
+  wire aw_take = ~awready & s_axi_awvalid & s_axi_wvalid & aw_en;
+  wire wren = awready & s_axi_awvalid & s_axi_wvalid;
+  wire ar_take = ~arready & s_axi_arvalid & ~rvalid;
+  wire rden = arready & s_axi_arvalid & ~rvalid;
 
-// I/O Connections assignments
+  assign s_axi_awready = awready;
+  assign s_axi_wready = awready;
+  assign s_axi_bresp = 2'b00;
+  assign s_axi_bvalid = bvalid;
+  assign s_axi_arready = arready;
+  assign s_axi_rdata = rdata;
+  assign s_axi_rresp = 2'b00;
+  assign s_axi_rvalid = rvalid;
 
-assign s_axi_awready = axi_awready;
-assign s_axi_wready  = axi_wready;
-assign s_axi_bresp   = axi_bresp;
-assign s_axi_bvalid  = axi_bvalid;
-assign s_axi_arready = axi_arready;
-assign s_axi_rdata   = axi_rdata;
-assign s_axi_rresp   = axi_rresp;
-assign s_axi_rvalid  = axi_rvalid;
-// Implement axi_awready generation
-// axi_awready is asserted for one s_axi_aclk clock cycle when both
-// s_axi_awvalid and s_axi_wvalid are asserted. axi_awready is
-// de-asserted when reset is low.
+  assign REG0_REG = {toggle, 10'd0, target, 16'd0};
+  assign REG1_REG = payload;
+  assign REG2_REG = {28'd0, read_sel};
 
-always @( posedge s_axi_aclk )
-begin
-  if ( s_axi_aresetn == 1'b0 )
-    begin
-      axi_awready <= 1'b0;
-      aw_en <= 1'b1;
+  always @(posedge s_axi_aclk) begin
+    if (!s_axi_aresetn) begin
+      awready <= 0;
+      aw_en <= 1;
+      waddr <= 0;
+    end else if (aw_take) begin
+      awready <= 1;
+      aw_en <= 0;
+      waddr <= s_axi_awaddr[4:2];
+    end else begin
+      awready <= 0;
+      if (s_axi_bready & bvalid)
+        aw_en <= 1;
     end
-  else
-    begin
-      if (~axi_awready && s_axi_awvalid && s_axi_wvalid && aw_en)
-        begin
-          // slave is ready to accept write address when
-          // there is a valid write address and write data
-          // on the write address and data bus. This design
-          // expects no outstanding transactions.
-          axi_awready <= 1'b1;
-          aw_en <= 1'b0;
-        end
-        else if (s_axi_bready && axi_bvalid)
-            begin
-              aw_en <= 1'b1;
-              axi_awready <= 1'b0;
-            end
-      else
-        begin
-          axi_awready <= 1'b0;
-        end
-    end
-end
-
-// Implement axi_awaddr latching
-// This process is used to latch the address when both
-// s_axi_awvalid and s_axi_wvalid are valid.
-
-always @( posedge s_axi_aclk )
-begin
-  if ( s_axi_aresetn == 1'b0 )
-    begin
-      axi_awaddr <= 0;
-    end
-  else
-    begin
-      if (~axi_awready && s_axi_awvalid && s_axi_wvalid && aw_en)
-        begin
-          // Write Address latching
-          axi_awaddr <= s_axi_awaddr;
-        end
-    end
-end
-
-// Implement axi_wready generation
-// axi_wready is asserted for one s_axi_aclk clock cycle when both
-// s_axi_awvalid and s_axi_wvalid are asserted. axi_wready is
-// de-asserted when reset is low.
-
-always @( posedge s_axi_aclk )
-begin
-  if ( s_axi_aresetn == 1'b0 )
-    begin
-      axi_wready <= 1'b0;
-    end
-  else
-    begin
-      if (~axi_wready && s_axi_wvalid && s_axi_awvalid && aw_en )
-        begin
-          // slave is ready to accept write data when
-          // there is a valid write address and write data
-          // on the write address and data bus. This design
-          // expects no outstanding transactions.
-          axi_wready <= 1'b1;
-        end
-      else
-        begin
-          axi_wready <= 1'b0;
-        end
-    end
-end
-
-// Implement memory mapped register select and write logic generation
-// The write data is accepted and written to memory mapped registers when
-// axi_awready, s_axi_wvalid, axi_wready and s_axi_wvalid are asserted. Write strobes are used to
-// select byte enables of slave registers while writing.
-// These registers are cleared when reset (active low) is applied.
-// Slave register write enable is asserted when valid address and data are available
-// and the slave is ready to accept the write address and write data.
-assign slv_reg_wren = axi_wready && s_axi_wvalid && axi_awready && s_axi_awvalid;
-
-always @( posedge s_axi_aclk )
-begin
-  if ( s_axi_aresetn == 1'b0 )
-    begin
-      slv_reg0 <= 0;
-      slv_reg1 <= 0;
-      slv_reg2 <= 0;
-      slv_reg3 <= 0;
-    end
-  else begin
-    if (slv_reg_wren)
-      begin
-        case ( axi_awaddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB] )
-          3'h0:
-            for ( byte_index = 0; byte_index <= (C_S_AXI_DATA_WIDTH/8)-1; byte_index = byte_index+1 )
-              if ( s_axi_wstrb[byte_index] == 1 ) begin
-                // Respective byte enables are asserted as per write strobes
-                // Slave register 0
-                slv_reg0[(byte_index*8) +: 8] <= s_axi_wdata[(byte_index*8) +: 8];
-              end
-          3'h1:
-            for ( byte_index = 0; byte_index <= (C_S_AXI_DATA_WIDTH/8)-1; byte_index = byte_index+1 )
-              if ( s_axi_wstrb[byte_index] == 1 ) begin
-                // Respective byte enables are asserted as per write strobes
-                // Slave register 1
-                slv_reg1[(byte_index*8) +: 8] <= s_axi_wdata[(byte_index*8) +: 8];
-              end
-          3'h2:
-            for ( byte_index = 0; byte_index <= (C_S_AXI_DATA_WIDTH/8)-1; byte_index = byte_index+1 )
-              if ( s_axi_wstrb[byte_index] == 1 ) begin
-                // Respective byte enables are asserted as per write strobes
-                // Slave register 2
-                slv_reg2[(byte_index*8) +: 8] <= s_axi_wdata[(byte_index*8) +: 8];
-              end
-          3'h3:
-            for ( byte_index = 0; byte_index <= (C_S_AXI_DATA_WIDTH/8)-1; byte_index = byte_index+1 )
-              if ( s_axi_wstrb[byte_index] == 1 ) begin
-                // Respective byte enables are asserted as per write strobes
-                // Slave register 3
-                slv_reg3[(byte_index*8) +: 8] <= s_axi_wdata[(byte_index*8) +: 8];
-              end
-          default : begin
-                    end
-        endcase
-      end
   end
-end
 
-// Implement write response logic generation
-// The write response and response valid signals are asserted by the slave
-// when axi_wready, s_axi_wvalid, axi_wready and s_axi_wvalid are asserted.
-// This marks the acceptance of address and indicates the status of
-// write transaction.
+  always @(posedge s_axi_aclk) begin
+    if (!s_axi_aresetn)
+      bvalid <= 0;
+    else if (wren & ~bvalid)
+      bvalid <= 1;
+    else if (s_axi_bready & bvalid)
+      bvalid <= 0;
+  end
 
-always @( posedge s_axi_aclk )
-begin
-  if ( s_axi_aresetn == 1'b0 )
-    begin
-      axi_bvalid  <= 0;
-      axi_bresp   <= 2'b0;
-    end
-  else
-    begin
-      if (axi_awready && s_axi_awvalid && ~axi_bvalid && axi_wready && s_axi_wvalid)
-        begin
-          // indicates a valid write response is available
-          axi_bvalid <= 1'b1;
-          axi_bresp  <= 2'b0; // 'OKAY' response
-        end                   // work error responses in future
-      else
-        begin
-          if (s_axi_bready && axi_bvalid)
-            //check if bready is asserted while bvalid is high)
-            //(there is a possibility that bready is always asserted high)
-            begin
-              axi_bvalid <= 1'b0;
-            end
+  always @(posedge s_axi_aclk) begin
+    if (!s_axi_aresetn) begin
+      toggle <= 0;
+      target <= 0;
+      payload <= 0;
+      read_sel <= 0;
+    end else if (wren) begin
+      case (waddr)
+        3'd0: begin
+          if (s_axi_wstrb[3]) toggle <= s_axi_wdata[31];
+          if (s_axi_wstrb[2]) target <= s_axi_wdata[20:16];
         end
-    end
-end
-
-// Implement axi_arready generation
-// axi_arready is asserted for one s_axi_aclk clock cycle when
-// s_axi_arvalid is asserted. axi_awready is
-// de-asserted when reset (active low) is asserted.
-// The read address is also latched when s_axi_arvalid is
-// asserted. axi_araddr is reset to zero on reset assertion.
-
-always @( posedge s_axi_aclk )
-begin
-  if ( s_axi_aresetn == 1'b0 )
-    begin
-      axi_arready <= 1'b0;
-      axi_araddr  <= 32'b0;
-    end
-  else
-    begin
-      if (~axi_arready && s_axi_arvalid)
-        begin
-          // indicates that the slave has acceped the valid read address
-          axi_arready <= 1'b1;
-          // Read address latching
-          axi_araddr  <= s_axi_araddr;
+        3'd1: begin
+          if (s_axi_wstrb[0]) payload[7:0] <= s_axi_wdata[7:0];
+          if (s_axi_wstrb[1]) payload[15:8] <= s_axi_wdata[15:8];
+          if (s_axi_wstrb[2]) payload[23:16] <= s_axi_wdata[23:16];
+          if (s_axi_wstrb[3]) payload[31:24] <= s_axi_wdata[31:24];
         end
-      else
-        begin
-          axi_arready <= 1'b0;
+        3'd2: begin
+          if (s_axi_wstrb[0]) read_sel <= s_axi_wdata[3:0];
         end
-    end
-end
-
-// Implement axi_arvalid generation
-// axi_rvalid is asserted for one s_axi_aclk clock cycle when both
-// s_axi_arvalid and axi_arready are asserted. The slave registers
-// data are available on the axi_rdata bus at this instance. The
-// assertion of axi_rvalid marks the validity of read data on the
-// bus and axi_rresp indicates the status of read transaction.axi_rvalid
-// is deasserted on reset (active low). axi_rresp and axi_rdata are
-// cleared to zero on reset (active low).
-always @( posedge s_axi_aclk )
-begin
-  if ( s_axi_aresetn == 1'b0 )
-    begin
-      axi_rvalid <= 0;
-      axi_rresp  <= 0;
-    end
-  else
-    begin
-      if (axi_arready && s_axi_arvalid && ~axi_rvalid)
-        begin
-          // Valid read data is available at the read data bus
-          axi_rvalid <= 1'b1;
-          axi_rresp  <= 2'b0; // 'OKAY' response
-        end
-      else if (axi_rvalid && s_axi_rready)
-        begin
-          // Read data is accepted by the master
-          axi_rvalid <= 1'b0;
-        end
-    end
-end
-
-// Implement memory mapped register select and read logic generation
-// Slave register read enable is asserted when valid address is available
-// and the slave is ready to accept the read address.
-assign slv_reg_rden = axi_arready & s_axi_arvalid & ~axi_rvalid;
-always @(*)
-begin
-      // Address decoding for reading registers
-      case ( axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB] )
-        3'h0   : reg_data_out <= slv_reg0;
-        3'h1   : reg_data_out <= slv_reg1;
-        3'h2   : reg_data_out <= slv_reg2;
-        3'h3   : reg_data_out <= slv_reg3;
-        3'h4   : reg_data_out <= REG4_IN;
-        3'h5   : reg_data_out <= REG5_IN;
-        3'h6   : reg_data_out <= REG6_IN;
-        3'h7   : reg_data_out <= REG7_IN;
-        default : reg_data_out <= 0;
       endcase
-end
-
-// Output register or memory read data
-always @( posedge s_axi_aclk )
-begin
-  if ( s_axi_aresetn == 1'b0 )
-    begin
-      axi_rdata  <= 0;
     end
-  else
-    begin
-      // When there is a valid read address (s_axi_arvalid) with
-      // acceptance of read address by the slave (axi_arready),
-      // output the read dada
-      if (slv_reg_rden)
-        begin
-          axi_rdata <= reg_data_out;     // register read data
-        end
-    end
-end
+  end
 
-assign REG0_REG = slv_reg0 [31:0];
-assign REG1_REG = slv_reg1 [31:0];
-assign REG2_REG = slv_reg2 [31:0];
-assign REG3_REG = slv_reg3 [31:0];
+  always @(posedge s_axi_aclk) begin
+    if (!s_axi_aresetn) begin
+      arready <= 0;
+      raddr <= 0;
+    end else if (ar_take) begin
+      arready <= 1;
+      raddr <= s_axi_araddr[4:2];
+    end else begin
+      arready <= 0;
+    end
+  end
+
+  always @(posedge s_axi_aclk) begin
+    if (!s_axi_aresetn)
+      rvalid <= 0;
+    else if (rden)
+      rvalid <= 1;
+    else if (rvalid & s_axi_rready)
+      rvalid <= 0;
+  end
+
+  always @(posedge s_axi_aclk) begin
+    if (!s_axi_aresetn)
+      rdata <= 0;
+    else if (rden)
+      case (raddr)
+        3'd0: rdata <= REG0_REG;
+        3'd3: rdata <= REG3_IN;
+        3'd4: rdata <= REG4_IN;
+        3'd5: rdata <= REG5_IN;
+        3'd6: rdata <= REG6_IN;
+        default: rdata <= 32'd0;
+      endcase
+  end
 
 endmodule

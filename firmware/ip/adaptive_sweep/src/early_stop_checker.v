@@ -5,6 +5,7 @@ module early_stop_checker(
   input rst_n,
 
   input arm_i,
+  input flush_i,
   input shot_i,
   input enable_i,
   input [4:0] avg_shift_i,
@@ -32,7 +33,7 @@ module early_stop_checker(
   output stopped_early_o,
   output [31:0] shots_used_o,
 
-  output [15:0] log_entry_o,
+  output [9:0] log_entry_o,
   output reg signed [31:0] point_i_o,
   output reg signed [31:0] point_q_o,
   output [31:0] debug_o
@@ -41,7 +42,6 @@ module early_stop_checker(
   wire check;
   wire [4:0] check_exponent;
   wire short_check;
-  wire [31:0] sample_count;
   wire retire;
   wire stopping;
   wire [4:0] retire_shift;
@@ -56,12 +56,39 @@ module early_stop_checker(
   wire [4:0] short_exponent;
   wire signed [57:0] short_snapshot_i;
   wire signed [57:0] short_snapshot_q;
+  wire restart = arm_i | flush_i;
+  wire sample;
+
   reg short_mode;
+  reg short_enabled;
+  reg [15:0] threshold;
+  reg [31:0] n_min;
+  reg [2:0] confirm;
+  reg block_en;
+  reg [31:0] block_tol;
+
   always @(posedge clk) begin
-    if (!rst_n) short_mode <= 0;
-    else if (arm_i) short_mode <= short_confirm_i;
+    if (!rst_n) begin
+      short_mode <= 0;
+      short_enabled <= 0;
+      threshold <= 0;
+      n_min <= 0;
+      confirm <= 0;
+      block_en <= 0;
+      block_tol <= 0;
+    end else if (restart) begin
+      short_mode <= short_confirm_i;
+      short_enabled <= enable_i & short_confirm_i & ~block_en_i;
+      threshold <= threshold_i;
+      n_min <= n_min_i;
+      confirm <= confirm_i;
+      block_en <= block_en_i;
+      block_tol <= block_tol_i;
+    end
   end
-  assign stop = ~arm_i & (short_mode ? short_stop : legacy_stop);
+
+  assign sample = check | (short_enabled & short_check);
+  assign stop = ~restart & (short_mode ? short_stop : legacy_stop);
   assign stop_exponent = short_mode ? short_exponent : legacy_exponent;
 
   wire magnitude_valid;
@@ -70,13 +97,22 @@ module early_stop_checker(
   wire [59:0] block_magnitude;
   wire block_valid;
   wire [4:0] magnitude_exponent;
+  wire magnitude_power;
+  wire verdict_valid;
+  wire verdict_passed;
+  wire verdict_power;
+  wire [4:0] verdict_exponent;
   wire signed [57:0] snapshot_i;
   wire signed [57:0] snapshot_q;
+  wire signed [57:0] bank_i;
+  wire signed [57:0] bank_q;
+  wire bank_select;
 
   shot_counter counter(
     .clk(clk),
     .rst_n(rst_n),
     .arm_i(arm_i),
+    .flush_i(flush_i),
     .shot_i(shot_i),
     .avg_shift_i(avg_shift_i),
     .warmup_shots_i(warmup_shots_i),
@@ -90,7 +126,6 @@ module early_stop_checker(
     .check_o(check),
     .check_exponent_o(check_exponent),
     .short_check_o(short_check),
-    .sample_count_o(sample_count),
     .retire_o(retire),
     .stopping_o(stopping),
     .emit_o(emit_o),
@@ -105,55 +140,73 @@ module early_stop_checker(
   magnitude_calculator magnitude(
     .clk(clk),
     .rst_n(rst_n),
-    .arm_i(arm_i),
+    .arm_i(restart),
+    .sample_i(sample),
     .check_i(check),
     .check_exponent_i(check_exponent),
-    .snapshot_exponent_i(stop_exponent),
+    .snapshot_select_i(stop_exponent[0]),
+    .bank_select_i(bank_select),
     .sum_i_i(sum_i_i),
     .sum_q_i(sum_q_i),
     .diff_i_i(diff_i_i),
     .diff_q_i(diff_q_i),
     .snapshot_i_o(snapshot_i),
     .snapshot_q_o(snapshot_q),
+    .bank_i_o(bank_i),
+    .bank_q_o(bank_q),
     .valid_o(magnitude_valid),
     .signal_magnitude_o(signal_magnitude),
     .noise_magnitude_o(noise_magnitude),
     .block_magnitude_o(block_magnitude),
     .block_valid_o(block_valid),
-    .exponent_o(magnitude_exponent)
+    .exponent_o(magnitude_exponent),
+    .power_o(magnitude_power)
   );
 
   threshold_compare compare(
     .clk(clk),
     .rst_n(rst_n),
-    .arm_i(arm_i),
+    .arm_i(restart),
     .enable_i(enable_i),
-    .threshold_i(threshold_i),
-    .block_en_i(block_en_i),
-    .block_tol_i(block_tol_i),
-    .n_min_i(n_min_i),
-    .confirm_i(confirm_i),
+    .threshold_i(threshold),
+    .block_en_i(block_en),
+    .block_tol_i(block_tol),
+    .n_min_i(n_min),
+    .confirm_i(confirm),
     .valid_i(magnitude_valid),
     .signal_magnitude_i(signal_magnitude),
     .noise_magnitude_i(noise_magnitude),
     .block_magnitude_i(block_magnitude),
     .block_valid_i(block_valid),
     .exponent_i(magnitude_exponent),
+    .power_i(magnitude_power),
     .stop_o(legacy_stop),
     .stop_exponent_o(legacy_exponent),
-    .saturated_o(saturated)
+    .saturated_o(saturated),
+    .verdict_valid_o(verdict_valid),
+    .verdict_passed_o(verdict_passed),
+    .verdict_power_o(verdict_power),
+    .verdict_exponent_o(verdict_exponent)
   );
 
   short_confirmation short_confirm(
-    .clk(clk), .rst_n(rst_n), .arm_i(arm_i),
-    .enable_i(enable_i & short_confirm_i), .block_en_i(block_en_i),
-    .threshold_i(threshold_i), .n_min_i(n_min_i), .confirm_i(confirm_i),
-    .check_i(short_check), .power_check_i(check),
-    .power_exponent_i(check_exponent), .sample_count_i(sample_count),
-    .sum_i_i(sum_i_i), .sum_q_i(sum_q_i),
-    .diff_i_i(diff_i_i), .diff_q_i(diff_q_i),
-    .stop_o(short_stop), .stop_exponent_o(short_exponent),
-    .snapshot_i_o(short_snapshot_i), .snapshot_q_o(short_snapshot_q)
+    .clk(clk),
+    .rst_n(rst_n),
+    .arm_i(restart),
+    .enable_i(short_enabled),
+    .n_min_i(n_min),
+    .confirm_i(confirm),
+    .verdict_valid_i(verdict_valid),
+    .verdict_passed_i(verdict_passed),
+    .verdict_power_i(verdict_power),
+    .verdict_exponent_i(verdict_exponent),
+    .bank_i_i(bank_i),
+    .bank_q_i(bank_q),
+    .bank_select_o(bank_select),
+    .stop_o(short_stop),
+    .stop_exponent_o(short_exponent),
+    .snapshot_i_o(short_snapshot_i),
+    .snapshot_q_o(short_snapshot_q)
   );
 
   reg signed [57:0] retire_num_i;
@@ -205,8 +258,7 @@ module early_stop_checker(
     end
   end
 
-  assign log_entry_o = {6'd0, saturated_latched, converged, retire_exponent,
-                        converged ? 3'd0 : 3'd4};
+  assign log_entry_o = {saturated_latched, converged, retire_exponent, converged ? 3'd0 : 3'd4};
   assign debug_o = {counter_debug[31:2], short_mode, counter_debug[0]};
 
 endmodule

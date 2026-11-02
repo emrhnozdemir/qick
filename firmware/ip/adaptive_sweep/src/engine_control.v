@@ -5,6 +5,7 @@ module engine_control(
   input rst_n,
 
   input start_i,
+  input abort_i,
   input freq_ack_i,
   input amp_valid_i,
 
@@ -13,6 +14,7 @@ module engine_control(
   input stop_i,
   input cap_i,
   input pless_i,
+  input fless_i,
 
   input [63:0] p_i,
   input [63:0] g_i,
@@ -41,8 +43,7 @@ module engine_control(
   input [6:0] lead_d_i,
   input go_up_i,
 
-  output [3:0] state_o,
-  output [3:0] phase_o,
+  output [4:0] state_o,
   output reg [67:0] pa_o,
   output reg [67:0] pb_o,
   output reg psub_o,
@@ -50,28 +51,30 @@ module engine_control(
   output reg [33:0] fb_o,
   output reg fsub_o,
 
-  output reg freq_valid_o,
+  output freq_valid_o,
   output reg probe_arm_o,
   output measuring_o,
-  output reg busy_o,
+  output busy_o,
   output reg done_o,
-  output reg converged_o,
-  output reg capped_o,
-  output reg nothing_o,
-  output [3:0] decision_o
+  output converged_o,
+  output capped_o,
+  output nothing_o,
+  output window_o,
+  output [2:0] decision_o
 );
 
-  localparam S_IDLE = 4'd0, S_PRESENT = 4'd1, S_MEASURE = 4'd2, S_START = 4'd3,
-             S_PMAX = 4'd4, S_GRID1 = 4'd5, S_GRID2 = 4'd6, S_GRID_END = 4'd7,
-             S_SEEN = 4'd8, S_NOISE = 4'd9, S_BAR = 4'd10, S_BETTER = 4'd11,
-             S_WIDTH = 4'd12, S_PLAN = 4'd13, S_GO = 4'd14, S_DONE = 4'd15;
+  localparam S_IDLE = 5'd0, S_PRESENT = 5'd1, S_MEASURE = 5'd2, S_PMAX = 5'd3,
+             S_GRID1 = 5'd4, S_GRID2 = 5'd5, S_GRID_END = 5'd6, S_SEEN = 5'd7,
+             S_NOISE = 5'd8, S_BAR = 5'd9, S_BETTER = 5'd10, S_WIDTH = 5'd11,
+             S_PLAN0 = 5'd12, S_PLAN1 = 5'd13, S_PLAN2 = 5'd14, S_PLAN3 = 5'd15,
+             S_PLAN4 = 5'd16, S_PLAN5 = 5'd17, S_PLAN6 = 5'd18, S_PLAN7 = 5'd19,
+             S_PLAN8 = 5'd20, S_PLAN9 = 5'd21, S_GO = 5'd22, S_DONE = 5'd23;
 
-  localparam E_NONE = 4'd0, E_GRID = 4'd1, E_BETTER = 4'd2, E_BORDER = 4'd3,
-             E_CONVERGED = 4'd4, E_CAPPED = 4'd5, E_NOTHING = 4'd6;
+  localparam E_NONE = 3'd0, E_GRID = 3'd1, E_BETTER = 3'd2, E_BORDER = 3'd3,
+             E_CONVERGED = 3'd4, E_CAPPED = 3'd5, E_NOTHING = 3'd6, E_WINDOW = 3'd7;
 
-  reg [3:0] state, next_state;
-  reg [3:0] phase;
-  reg [3:0] decision;
+  reg [4:0] state, next_state;
+  reg [2:0] decision;
 
   always @(posedge clk) begin
     if (!rst_n)
@@ -81,34 +84,36 @@ module engine_control(
   end
 
   always @(*) begin
-    case (state)
-      S_IDLE: next_state = start_i ? S_START : S_IDLE;
-      S_START: next_state = S_PRESENT;
-      S_PRESENT: next_state = freq_ack_i ? S_MEASURE : S_PRESENT;
-      S_MEASURE: next_state = amp_valid_i ? S_PMAX : S_MEASURE;
-      S_PMAX: next_state = seen_i ? S_NOISE : S_GRID1;
-      S_GRID1: next_state = S_GRID2;
-      S_GRID2: next_state = grid_last_i ? S_GRID_END : S_PRESENT;
-      S_GRID_END: next_state = S_SEEN;
-      S_SEEN: next_state = S_WIDTH;
-      S_NOISE: next_state = S_BAR;
-      S_BAR: next_state = S_BETTER;
-      S_BETTER: next_state = S_WIDTH;
-      S_WIDTH: next_state = nothing_o ? S_DONE : S_PLAN;
-      S_PLAN: begin
-        if (phase == 4'd6 && cap_i)
-          next_state = S_DONE;
-        else if (phase == 4'd7 && stop_i)
-          next_state = S_GO;
-        else if (phase == 4'd9)
-          next_state = S_GO;
-        else
-          next_state = S_PLAN;
-      end
-      S_GO: next_state = stop_i ? S_DONE : S_PRESENT;
-      S_DONE: next_state = S_IDLE;
-      default: next_state = S_IDLE;
-    endcase
+    if (start_i)
+      next_state = S_PRESENT;
+    else if (abort_i)
+      next_state = S_IDLE;
+    else
+      case (state)
+        S_PRESENT: next_state = freq_ack_i ? S_MEASURE : S_PRESENT;
+        S_MEASURE: next_state = amp_valid_i ? S_PMAX : S_MEASURE;
+        S_PMAX: next_state = seen_i ? S_NOISE : S_GRID1;
+        S_GRID1: next_state = S_GRID2;
+        S_GRID2: next_state = grid_last_i ? S_GRID_END : S_PRESENT;
+        S_GRID_END: next_state = S_SEEN;
+        S_SEEN: next_state = S_WIDTH;
+        S_NOISE: next_state = S_BAR;
+        S_BAR: next_state = S_BETTER;
+        S_BETTER: next_state = S_WIDTH;
+        S_WIDTH: next_state = nothing_o ? S_DONE : S_PLAN0;
+        S_PLAN0: next_state = fless_i ? S_DONE : S_PLAN1;
+        S_PLAN1: next_state = fless_i ? S_DONE : S_PLAN2;
+        S_PLAN2: next_state = S_PLAN3;
+        S_PLAN3: next_state = S_PLAN4;
+        S_PLAN4: next_state = S_PLAN5;
+        S_PLAN5: next_state = S_PLAN6;
+        S_PLAN6: next_state = cap_i ? S_DONE : S_PLAN7;
+        S_PLAN7: next_state = stop_i ? S_GO : S_PLAN8;
+        S_PLAN8: next_state = S_PLAN9;
+        S_PLAN9: next_state = S_GO;
+        S_GO: next_state = stop_i ? S_DONE : S_PRESENT;
+        default: next_state = S_IDLE;
+      endcase
   end
 
   always @(*) begin
@@ -148,39 +153,30 @@ module engine_control(
         pb_o = {4'd0, g_i};
         psub_o = 1'b1;
       end
-      S_PLAN: begin
-        case (phase)
-          4'd0: begin
-            pa_o = {4'd0, gb_i};
-            pb_o = {4'd0, gl_i};
-            psub_o = 1'b1;
-          end
-          4'd1: begin
-            pa_o = {4'd0, gb_i};
-            pb_o = {4'd0, gh_i};
-            psub_o = 1'b1;
-          end
-          4'd2: begin
-            pa_o = {4'd0, dl_i};
-            pb_o = {4'd0, dr_i};
-            psub_o = 1'b0;
-          end
-          4'd3: begin
-            pa_o = {4'd0, dl_i};
-            pb_o = {4'd0, dr_i};
-            psub_o = 1'b1;
-          end
-          4'd4: begin
-            pa_o = 68'd0;
-            pb_o = acc_i;
-            psub_o = 1'b1;
-          end
-          default: begin
-            pa_o = 68'd0;
-            pb_o = 68'd0;
-            psub_o = 1'b0;
-          end
-        endcase
+      S_PLAN0: begin
+        pa_o = {4'd0, gb_i};
+        pb_o = {4'd0, gl_i};
+        psub_o = 1'b1;
+      end
+      S_PLAN1: begin
+        pa_o = {4'd0, gb_i};
+        pb_o = {4'd0, gh_i};
+        psub_o = 1'b1;
+      end
+      S_PLAN2: begin
+        pa_o = {4'd0, dl_i};
+        pb_o = {4'd0, dr_i};
+        psub_o = 1'b0;
+      end
+      S_PLAN3: begin
+        pa_o = {4'd0, dl_i};
+        pb_o = {4'd0, dr_i};
+        psub_o = 1'b1;
+      end
+      S_PLAN4: begin
+        pa_o = 68'd0;
+        pb_o = acc_i;
+        psub_o = 1'b1;
       end
       default: begin
         pa_o = 68'd0;
@@ -202,64 +198,55 @@ module engine_control(
         fb_o = {2'd0, lo_i};
         fsub_o = 1'b1;
       end
-      S_PLAN: begin
-        case (phase)
-          4'd0: begin
-            fa_o = {2'd0, b_i};
-            fb_o = {2'd0, lo_i};
-            fsub_o = 1'b1;
-          end
-          4'd1: begin
-            fa_o = {2'd0, hi_i};
-            fb_o = {2'd0, b_i};
-            fsub_o = 1'b1;
-          end
-          4'd2: begin
-            fa_o = {2'd0, sr_i};
-            fb_o = {2'd0, sl_i};
-            fsub_o = 1'b1;
-          end
-          4'd3: begin
-            fa_o = {short_side_i, 2'b00};
-            fb_o = {2'd0, long_side_i};
-            fsub_o = 1'b1;
-          end
-          4'd4: begin
-            fa_o = {2'd0, min_step_i};
-            fb_o = {2'd0, sl_i};
-            fsub_o = 1'b1;
-          end
-          4'd5: begin
-            fa_o = {2'd0, min_step_i};
-            fb_o = {2'd0, sr_i};
-            fsub_o = 1'b1;
-          end
-          4'd6: begin
-            fa_o = {27'd0, lead_s_i};
-            fb_o = {27'd0, lead_d_i};
-            fsub_o = 1'b1;
-          end
-          4'd7: begin
-            fa_o = {2'd0, span_i >> 2};
-            fb_o = {2'd0, span_i >> 3};
-            fsub_o = 1'b0;
-          end
-          4'd8: begin
-            fa_o = {2'd0, span_i};
-            fb_o = {1'b0, min_step_i, 1'b0};
-            fsub_o = 1'b1;
-          end
-          4'd9: begin
-            fa_o = {2'd0, min_step_i};
-            fb_o = {2'd0, step_i};
-            fsub_o = 1'b1;
-          end
-          default: begin
-            fa_o = 34'd0;
-            fb_o = 34'd0;
-            fsub_o = 1'b0;
-          end
-        endcase
+      S_PLAN0: begin
+        fa_o = {2'd0, b_i};
+        fb_o = {2'd0, lo_i};
+        fsub_o = 1'b1;
+      end
+      S_PLAN1: begin
+        fa_o = {2'd0, hi_i};
+        fb_o = {2'd0, b_i};
+        fsub_o = 1'b1;
+      end
+      S_PLAN2: begin
+        fa_o = {2'd0, sr_i};
+        fb_o = {2'd0, sl_i};
+        fsub_o = 1'b1;
+      end
+      S_PLAN3: begin
+        fa_o = {short_side_i, 2'b00};
+        fb_o = {2'd0, long_side_i};
+        fsub_o = 1'b1;
+      end
+      S_PLAN4: begin
+        fa_o = {2'd0, min_step_i};
+        fb_o = {2'd0, sl_i};
+        fsub_o = 1'b1;
+      end
+      S_PLAN5: begin
+        fa_o = {2'd0, min_step_i};
+        fb_o = {2'd0, sr_i};
+        fsub_o = 1'b1;
+      end
+      S_PLAN6: begin
+        fa_o = {27'd0, lead_s_i};
+        fb_o = {27'd0, lead_d_i};
+        fsub_o = 1'b1;
+      end
+      S_PLAN7: begin
+        fa_o = {2'd0, span_i >> 2};
+        fb_o = {2'd0, span_i >> 3};
+        fsub_o = 1'b0;
+      end
+      S_PLAN8: begin
+        fa_o = {2'd0, span_i};
+        fb_o = {1'b0, min_step_i, 1'b0};
+        fsub_o = 1'b1;
+      end
+      S_PLAN9: begin
+        fa_o = {2'd0, min_step_i};
+        fb_o = {2'd0, step_i};
+        fsub_o = 1'b1;
       end
       S_GO: begin
         fa_o = {2'd0, b_i};
@@ -276,77 +263,55 @@ module engine_control(
 
   always @(posedge clk) begin
     if (!rst_n) begin
-      phase <= 0;
       decision <= E_NONE;
-      freq_valid_o <= 0;
       probe_arm_o <= 0;
-      busy_o <= 0;
       done_o <= 0;
-      converged_o <= 0;
-      capped_o <= 0;
-      nothing_o <= 0;
     end else begin
       probe_arm_o <= 0;
       done_o <= 0;
-      case (state)
-        S_IDLE: begin
-          freq_valid_o <= 0;
-          if (start_i) begin
-            decision <= E_NONE;
-            busy_o <= 1;
-            converged_o <= 0;
-            capped_o <= 0;
-            nothing_o <= 0;
-          end
-        end
+      if (start_i)
+        decision <= E_NONE;
+      else if (!abort_i)
+        case (state)
+          S_PRESENT:
+            probe_arm_o <= freq_ack_i;
 
-        S_PRESENT: begin
-          freq_valid_o <= ~freq_ack_i;
-          probe_arm_o <= freq_ack_i;
-        end
+          S_GRID1:
+            decision <= E_GRID;
 
-        S_GRID1:
-          decision <= E_GRID;
+          S_SEEN:
+            if (!pless_i)
+              decision <= E_NOTHING;
 
-        S_SEEN:
-          if (!pless_i) begin
-            nothing_o <= 1;
-            decision <= E_NOTHING;
-          end
+          S_BETTER:
+            decision <= pless_i ? E_BETTER : E_BORDER;
 
-        S_BETTER:
-          decision <= pless_i ? E_BETTER : E_BORDER;
+          S_PLAN0, S_PLAN1:
+            if (fless_i)
+              decision <= E_WINDOW;
 
-        S_WIDTH:
-          phase <= 0;
+          S_PLAN6:
+            if (cap_i)
+              decision <= E_CAPPED;
 
-        S_PLAN: begin
-          phase <= phase + 4'd1;
-          if (phase == 4'd6 && cap_i) begin
-            capped_o <= 1;
-            decision <= E_CAPPED;
-          end
-          if (phase > 4'd9)
-            phase <= 0;
-        end
+          S_GO:
+            if (stop_i)
+              decision <= E_CONVERGED;
 
-        S_GO:
-          if (stop_i) begin
-            converged_o <= 1;
-            decision <= E_CONVERGED;
-          end
-
-        S_DONE: begin
-          busy_o <= 0;
-          done_o <= 1;
-        end
-      endcase
+          S_DONE:
+            done_o <= 1;
+        endcase
     end
   end
 
   assign state_o = state;
-  assign phase_o = phase;
+  assign freq_valid_o = (state == S_PRESENT);
   assign measuring_o = (state == S_MEASURE);
+  assign busy_o = (state != S_IDLE);
+  assign converged_o = (decision == E_CONVERGED);
+  assign capped_o = (decision == E_CAPPED);
+  assign nothing_o = (decision == E_NOTHING);
+  assign window_o = (decision == E_WINDOW);
   assign decision_o = decision;
 
 endmodule

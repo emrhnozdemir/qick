@@ -4,7 +4,7 @@ module search_points(
   input clk,
   input rst_n,
 
-  input [3:0] state_i,
+  input [4:0] state_i,
   input start_i,
   input dip_i,
   input [31:0] start_freq_i,
@@ -18,7 +18,7 @@ module search_points(
 
   input pless_i,
   input [31:0] falu_i,
-  input [6:0] enc_pos_i,
+  input [3:0] enc_pos_i,
   input side_i,
   input stop_i,
 
@@ -40,9 +40,8 @@ module search_points(
   output dip_o
 );
 
-  localparam S_IDLE = 4'd0, S_MEASURE = 4'd2, S_START = 4'd3, S_PMAX = 4'd4,
-             S_GRID1 = 4'd5, S_GRID2 = 4'd6, S_GRID_END = 4'd7, S_SEEN = 4'd8,
-             S_BETTER = 4'd11, S_GO = 4'd14;
+  localparam S_MEASURE = 5'd2, S_PMAX = 5'd3, S_GRID1 = 5'd4, S_GRID2 = 5'd5,
+             S_GRID_END = 5'd6, S_SEEN = 5'd7, S_BETTER = 5'd10, S_GO = 5'd22;
 
   reg dip;
   reg grid_mode;
@@ -91,94 +90,91 @@ module search_points(
       need_right <= 0;
       seen <= 0;
     end else begin
-      case (state_i)
-        S_IDLE:
-          if (start_i) begin
-            dip <= dip_i;
-            grid_mode <= (n_points_i >= 16'd2);
-            last_idx <= (n_points_i >= 16'd2) ? (n_points_i - 16'd1) : 16'd2;
-            x0 <= x0_i;
-            f_hi <= f_hi_i;
-            target <= (n_points_i >= 16'd2) ? start_freq_i : f_lo_i;
-            idx <= 0;
-            pmax <= 0;
-            worst <= 64'hFFFFFFFFFFFFFFFF;
-            need_right <= 0;
-            seen <= 0;
+      if (start_i) begin
+        dip <= dip_i;
+        grid_mode <= (n_points_i >= 16'd2);
+        last_idx <= (n_points_i >= 16'd2) ? (n_points_i - 16'd1) : 16'd2;
+        x0 <= x0_i;
+        f_hi <= f_hi_i;
+        target <= (n_points_i >= 16'd2) ? start_freq_i : f_lo_i;
+        idx <= 0;
+        pmax <= 0;
+        worst <= 64'hFFFFFFFFFFFFFFFF;
+        need_right <= 0;
+        seen <= 0;
+      end else begin
+        case (state_i)
+          S_MEASURE:
+            if (amp_valid_i)
+              p <= amp_data_i;
+
+          S_PMAX:
+            if (pless_i)
+              pmax <= p;
+
+          S_GRID1: begin
+            noise_shift <= enc_pos_i;
+            if (first | pless_i) begin
+              lo <= first ? target : prev_f;
+              gl <= first ? g : prev_g;
+              b <= target;
+              gb <= g;
+              need_right <= 1;
+            end else if (need_right) begin
+              hi <= target;
+              gh <= g;
+              need_right <= 0;
+            end
+            prev_f <= target;
+            prev_g <= g;
           end
 
-        S_START:
-          noise_shift <= enc_pos_i[3:0];
-
-        S_MEASURE:
-          if (amp_valid_i)
-            p <= amp_data_i;
-
-        S_PMAX:
-          if (pless_i)
-            pmax <= p;
-
-        S_GRID1: begin
-          if (first | pless_i) begin
-            lo <= first ? target : prev_f;
-            gl <= first ? g : prev_g;
-            b <= target;
-            gb <= g;
-            need_right <= 1;
-          end else if (need_right) begin
-            hi <= target;
-            gh <= g;
-            need_right <= 0;
-          end
-          prev_f <= target;
-          prev_g <= g;
-        end
-
-        S_GRID2: begin
-          if (~pless_i)
-            worst <= g;
-          idx <= idx + 16'd1;
-          if (idx != last_idx)
-            target <= grid_mode ? falu_i : (first ? x0 : f_hi);
-        end
-
-        S_GRID_END:
-          if (need_right) begin
-            hi <= b;
-            gh <= gb;
+          S_GRID2: begin
+            if (~pless_i)
+              worst <= g;
+            idx <= idx + 16'd1;
+            if (idx != last_idx)
+              target <= grid_mode ? falu_i : (first ? x0 : f_hi);
           end
 
-        S_SEEN:
-          if (pless_i)
-            seen <= 1;
-
-        S_BETTER:
-          if (pless_i) begin
-            if (side_i) begin
-              lo <= b;
-              gl <= gb;
-            end else begin
+          S_GRID_END:
+            if (need_right) begin
               hi <= b;
               gh <= gb;
             end
-            b <= target;
-            gb <= g;
-          end else begin
-            if (side_i) begin
-              hi <= target;
-              gh <= g;
-            end else begin
-              lo <= target;
-              gl <= g;
-            end
-          end
 
-        S_GO:
-          if (stop_i)
-            b <= falu_i;
-          else
-            target <= falu_i;
-      endcase
+          S_SEEN:
+            if (pless_i)
+              seen <= 1;
+
+          S_BETTER:
+            if (pless_i) begin
+              if (side_i) begin
+                lo <= b;
+                gl <= gb;
+              end else begin
+                hi <= b;
+                gh <= gb;
+              end
+              b <= target;
+              gb <= g;
+            end else begin
+              if (side_i) begin
+                hi <= target;
+                gh <= g;
+              end else begin
+                lo <= target;
+                gl <= g;
+              end
+            end
+
+          S_GO:
+            if (stop_i)
+              b <= falu_i;
+            else
+              target <= falu_i;
+        endcase
+      end
     end
   end
 

@@ -160,9 +160,6 @@ class QP2Accel:
         Registry key, as passed to ``adaptive_sweep(accel=...)``.
     rtl_source : str
         Repo-relative path of the RTL this table was transcribed from.
-    rtl_template : str
-        Repo-relative path of the authoring template, where one exists and
-        differs from what is synthesized.  May not be present in a checkout.
     ops : dict
         Mnemonic -> :class:`QP2Op`.
     status_bits : tuple of Field
@@ -198,7 +195,6 @@ class QP2Accel:
     name: str
     rtl_source: str
     ops: Dict[str, QP2Op]
-    rtl_template: str = ""
     status_bits: Tuple[Field, ...] = ()
     algorithms: Tuple[str, ...] = ("grid",)
     calcs: Tuple[str, ...] = ()
@@ -277,11 +273,6 @@ def pack_op(accel, mnemonic, **values):
             f.check(val, where)
             words[idx] |= f.pack(val)
     return op.number, [w & MASK32 for w in words]
-
-
-def unpack_fields(fields, word):
-    """Decode a tuple of :class:`Field` out of one 32-bit word."""
-    return {f.name: f.unpack(word) for f in fields}
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +356,15 @@ FINE_TUNING_SWEEP = QP2Accel(
 # from f_lo, x0, f_hi), then probes one word at a time inside the border
 # around the best point.  RUN_KW dt2 (lambda), CFG_GDKW dt3/dt4 (m_min,
 # m_max) and AXI target 5 (patience) are gone.
+#
+# ABI 5 (2026-11-01): opcodes unchanged. The AXI map lost the spare REG3, so
+# status, the view pair and IDENT moved to words 3..6; AXI target 3 (CTRL) is
+# gone, CTRL comes only from CFG_ACQ. RUN_KW ends with bad_window (response
+# dt2 bit 3, GET_STATUS bit 9) when its best point is not inside [lo, hi]
+# (start points out of order or a wrapping grid). START and RUN_KW restart
+# both searches from any state. The debug views (driver only) changed in the
+# same ABI: the view select is 4 bits (views 0..15) and the engine state is
+# one 5-bit code (the plan phases are states PLAN0..PLAN9).
 _AS_OPS = {
     "CFG_WINDOW": QP2Op(
         number=0, mnemonic="CFG_WINDOW",
@@ -455,8 +455,9 @@ _AS_OPS = {
               "dt2": (Field("converged", 1, 0),
                       Field("capped", 1, 1),
                       Field("nothing_seen", 1, 2),
+                      Field("bad_window", 1, 3),
                       Field("iter", 16, 16))},
-        doc="border search (gradient_engine, ABI 4). Start: with CFG_WINDOW "
+        doc="border search (gradient_engine, ABI 5). Start: with CFG_WINDOW "
             "n_points >= 2 the engine walks that grid (start + i*step) itself; "
             "otherwise it measures f_lo, x0, f_hi (CFG_GDKW, dt1). The best "
             "point and its two neighbours are the border lo < b < hi. Each "
@@ -470,8 +471,10 @@ _AS_OPS = {
             "on its side. Converged when both sides are <= min_step: x_final "
             "is b moved by one more vertex step; capped after max_iter probes "
             "(x_final = b); nothing_seen when the best start point is not "
-            "8 * (pmax >> flog2(D)) above the worst. D is the early-stop "
-            "threshold register; iter counts the probes after the start",
+            "8 * (pmax >> flog2(D)) above the worst; bad_window when the best "
+            "point is not inside [lo, hi] (start points out of order or a "
+            "wrapping grid). D is the early-stop threshold register; iter "
+            "counts the probes after the start",
     ),
     "GET_FREQ": QP2Op(
         number=16, mnemonic="GET_FREQ", responds=True,
@@ -536,12 +539,13 @@ AS_DIAG_FIELDS = (
 
 # status_word, built inline in adaptive_sweep.v (the status_word assign):
 #   {point_idx[15:0], eng_freq_valid, eng_busy, eng_converged, eng_capped,
-#    dest, estop_en, 1'b0, early_stop, warmup_done, 3'd0, mode,
-#    busy, finish_seen, dest & eng_nothing}
+#    dest, estop_en, eng_window, early_stop, warmup_done, 3'd0, mode,
+#    pf_waiting, finish_seen, dest & eng_nothing}
 # Bit 0 reports a KW search that ended nothing-seen (until ABI 3 it was the
-# GD movement guard's stall). Bits 6:4
-# (reduce_sel) and 9 (prescale_en) are hardwired 0 as well since the
-# 2026-08-24 rebuild; their Fields stay so unpack_status keeps its keys.
+# GD movement guard's stall). Bit 2 (busy) is peak_finder's waiting bit.
+# Bits 6:4 (reduce_sel) are hardwired 0 since the 2026-08-24 rebuild; the
+# Field stays so unpack_status keeps its key. Bit 9 is bad_window since
+# ABI 5 (it was prescale_en, hardwired 0).
 _AS_STATUS = (
     Field("nothing_seen", 1, 0),
     Field("finish_seen", 1, 1),
@@ -550,7 +554,7 @@ _AS_STATUS = (
     Field("reduce_sel", 3, 4),
     Field("warmup_done", 1, 7),
     Field("early_stop", 1, 8),
-    Field("prescale_en", 1, 9),
+    Field("bad_window", 1, 9),
     Field("estop_en", 1, 10),
     Field("dest", 1, 11),
     Field("capped", 1, 12),
@@ -562,10 +566,7 @@ _AS_STATUS = (
 
 ADAPTIVE_SWEEP = QP2Accel(
     name="adaptive_sweep",
-    # the shipped IP is the authority; rtl_templates/adaptive_sweep_top.v is a
-    # pre-unification snapshot and no longer matches this table
     rtl_source="firmware/ip/adaptive_sweep/src/adaptive_sweep.v",
-    rtl_template="",
     ops=_AS_OPS,
     status_bits=_AS_STATUS,
     algorithms=("grid", "kw"),
@@ -593,7 +594,7 @@ ADAPTIVE_SWEEP = QP2Accel(
     # threshold register, which describes a probe's precision only when the
     # probe stopped on it: the search needs the split early stop
     gdkw_calcs=("split",),
-    abi=4,
+    abi=5,
 )
 
 
@@ -756,7 +757,6 @@ CFG_SRC_QPB = 0x05
 CTRL_CLR_QPB = 0x20_0000
 #: The internal multiply unit, as a peripheral source select and status bits.
 CFG_SRC_ARITH = 0x01
-BIT_ARITH_RDY = 0x0001
 BIT_ARITH_NEW = 0x0002
 CTRL_CLR_ARITH = 0x1_0000
 #: The ack word.  s_cfg and s_ctrl are the SAME register (s2), so acking with a
@@ -884,7 +884,6 @@ def _sweep_inward_endpoint(prog, freq, gen_ch, ro_ch, direction):
     unwrapped = ticks * gquant
     actual = float(Fraction(mixer) + ticks * quantum)
 
-    gen_freq_word(prog, actual, gen_ch, ro_ch)
     drive = to_s32(unwrapped % (1 << gencfg['b_dds']))
     readout = to_s32(ro_freq_word(prog, actual, ro_ch, gen_ch))
     return drive, readout, unwrapped
@@ -1655,6 +1654,9 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                      "a kw search starting from a grid needs at least two "
                      "points (got %d); give x0= to start from f_lo, x0, f_hi"
                      % (n_points,))
+            _require(step > 0,
+                     "a kw coarse grid must run upward in drive words without "
+                     "wrapping (start < stop, step > 0)")
     else:
         _require(stop is not None and start < stop,
                  "kw requires start < stop")
@@ -1669,7 +1671,7 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
     plan.stop_mhz = float(stop)
     plan.step_mhz = float(step)
     plan.n_points = n_points
-    plan.gen_direction = 1 if step > 0 or plan.handshake else -1
+    plan.gen_direction = 1 if step > 0 else -1
     plan.gen_start, plan.ro_start, first_coordinate = _sweep_inward_endpoint(
         prog, start, gen_ch, ro_ch, plan.gen_direction)
     plan.gen_start_unwrapped = first_coordinate
@@ -1779,6 +1781,12 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
                  "estop_thr=%g needs D=round(1/thr)=%d, past the 16-bit "
                  "threshold register's 65535; the finest threshold the "
                  "register can express is %g" % (req, d, 1.0 / 0xFFFF))
+        _require(algorithm != "kw" or d >= 16,
+                 "estop_thr=%g gives D=%d, but the kw search needs D >= 16 "
+                 "(estop_thr <= 1/16): it calls the line seen only when the best "
+                 "start point beats the worst by 8 * (pmax >> lead(D)), which is "
+                 "pmax or more for D < 8 and about pmax for D < 16, so the "
+                 "search would always end nothing_seen" % (req, d))
         plan.estop_thr_requested = req
         plan.estop_d = d
         plan.estop_thr = 1.0 / d
@@ -1797,27 +1805,10 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         _require(0 <= plan.n_min <= avg,
                  "n_min=%s exceeds avg=%d, so the early stop could never fire "
                  "and every point would run to the cap" % (n_min, avg))
-        if emit_mode is None:
-            if algorithm == "grid" and not interrupt:
-                emit_mode = "drain"
-            else:
-                emit_mode = "immediate"
-        _require(emit_mode == "immediate",
+        _require(emit_mode in (None, "immediate"),
                  "early_stop interrupts the shot loop and requires immediate emission; "
                  "use early_stop=False for a fixed-shot comparison")
-        _require(emit_mode in ("immediate", "drain"),
-                 "emit_mode must be 'immediate' or 'drain', got %r" % (emit_mode,))
-        if algorithm == "grid" and emit_mode == "immediate" and not interrupt:
-            raise ValueError(
-                "emit_mode='immediate' breaks the grid lockstep: the IP would "
-                "advance to the next point as soon as a point converges, while "
-                "the tProc keeps firing its fixed avg shots per point, and the "
-                "two desynchronise. Use emit_mode='drain' under "
-                "algorithm='grid' - the stop is still logged and the mean is "
-                "exact either way - or interrupt=True, which aborts the "
-                "tProc's shot loop when the point converges - or serve each "
-                "frequency through algorithm='kw'.")
-        plan.emit_mode = 1 if emit_mode == "drain" else 0
+        plan.emit_mode = 0
         plan.confirm = plan.calc_fields.get("confirm", 0)
         plan.block_tol = None if block_tol is None else int(block_tol)
     else:
@@ -5624,7 +5615,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             carries ``observed_shots``.
         early_stop : bool
             Enable the split test and its tProcessor interrupt together.
-            Defaults to False unless a split/adaptive preset was requested.
+            Defaults to True for algorithm='kw' (and for calc='split'),
+            False otherwise.
             Requires a dedicated readout trigger and matching firmware with
             PB15 selective trigger cancellation. Multiple stages share one
             interrupt vector, dispatched using the active stage's register.
@@ -5690,7 +5682,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             name=name, schedule=schedule, kwargs=dict(accel=accel, **kwargs)))
 
     def kw_sweep(self, name, *, accel='adaptive_sweep', **kwargs):
-        """Run the hardware Kiefer-Wolfowitz search; see :meth:`adaptive_sweep`."""
+        """Run the hardware border search (opcode RUN_KW); see :meth:`adaptive_sweep`."""
         self.adaptive_sweep(name, accel, algorithm='kw', **kwargs)
 
     def get_sweep_plan(self, name):
@@ -5984,7 +5976,6 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             self.compile()
         counter, _ = self._sweep_completion_spec()
         settings = [p for p in self._sweep_plans.values() if p.estop_d]
-        searches = [p for p in settings if p.handshake]
         if settings:
             first = settings[0]
             signature = lambda p: (p.estop_d, p.block_tol)
@@ -5996,6 +5987,9 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             _require(accelerator is not None,
                      "pass the adaptive-sweep driver as accelerator=, or expose "
                      "it on the board as adaptive_sweep_0")
+            check_abi = getattr(accelerator, 'check_abi', None)
+            if check_abi is not None:
+                check_abi()
         self.config_all(soc, load_envelopes=load_envelopes, load_mem=False)
         self.config_bufs(soc, enable_avg=True, enable_buf=False)
         if settings:
@@ -6052,6 +6046,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                 out['converged'] = bool(words[RESULT_STATUS] & 0x1)
                 out['capped'] = bool((words[RESULT_STATUS] >> 1) & 0x1)
                 out['nothing_seen'] = bool((words[RESULT_STATUS] >> 2) & 0x1)
+                out['bad_window'] = bool((words[RESULT_STATUS] >> 3) & 0x1)
                 out['iterations'] = (words[RESULT_STATUS] >> 16) & 0xFFFF
             elif plan.accel.status_bits:
                 out.update(plan.accel.unpack_status(words[RESULT_STATUS]))
@@ -6081,6 +6076,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
             out['stop_reason'] = 'incomplete'
         elif plan.handshake:
             out['stop_reason'] = ('converged' if out.get('converged')
+                                  else 'bad_window' if out.get('bad_window')
                                   else 'nothing_seen' if out.get('nothing_seen')
                                   else 'max_iterations' if out.get('capped')
                                   else 'finished')
