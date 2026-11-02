@@ -1811,6 +1811,26 @@ def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
         plan.emit_mode = 0
         plan.confirm = plan.calc_fields.get("confirm", 0)
         plan.block_tol = None if block_tol is None else int(block_tol)
+        # Power-of-two mode checks at 4, 8, ..., avg/2 (never at the cap) and
+        # stops at the checkpoint that completes `confirm` consecutive passes.
+        # The odd/even test can first pass at 4; the block test needs the
+        # previous checkpoint, so it can first pass at 8. The earliest stop is
+        # therefore 4 << (confirm - 1), or 8 << (confirm - 1) with block_tol,
+        # raised to the first power of two at or above n_min.
+        if (plan.calc_fields.get("estop_en") and confirmation_policy == "power_of_two"
+                and exponent_cap):
+            first = 8 if block_tol is not None else 4
+            earliest = max(first << (max(plan.confirm, 1) - 1),
+                           1 << max(plan.n_min - 1, 0).bit_length())
+            _require(earliest <= avg // 2,
+                     "the early stop can never fire: with confirm=%d%s%s the "
+                     "earliest stop is at %d shots, but checkpoints only run "
+                     "up to avg/2 = %d. Use avg >= %d%s."
+                     % (max(plan.confirm, 1),
+                        ", block_tol" if block_tol is not None else "",
+                        ", n_min=%d" % plan.n_min if plan.n_min else "",
+                        earliest, avg // 2, 2 * earliest,
+                        " or a smaller confirm" if plan.confirm > 1 else ""))
     else:
         _require(n_min is None, "n_min only applies to calc='split'")
         _require(emit_mode is None, "emit_mode only applies to calc='split'")
