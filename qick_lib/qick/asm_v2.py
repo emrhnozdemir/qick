@@ -3387,10 +3387,24 @@ class KwSweep(AdaptiveSweep):
         self._add(prog, asm)
 
 class AdaptiveSweepProgramV2(AveragerProgramV2):
-    """Use this as a base class for programs where the adaptive_sweep peripheral searches for a resonance.
-    You write _initialize() and _body() as for AveragerProgramV2: the content of your _body() is a shot, and it is played "reps" times at every frequency.
+    """Use this class for programs where the adaptive_sweep peripheral searches for a resonance.
+    A shot is played "reps" times at every frequency.
     The peripheral gets every shot from the averaging buffer of the readout, averages the shots of a frequency, and keeps the frequency with the largest (or smallest) power.
 
+    You can use the class as it is: it searches with one constant pulse and one readout, and the configuration dictionary says how.
+
+    * The shot: gen_ch, ro_ch, nqz (default 1), pulse_len (us) and gain of the pulse, ro_len (us) of the readout,
+      and trig_time (us), the time of the readout trigger after the start of the pulse.
+    * The band: start and stop (MHz), and mode, "peak" (default) or "dip".
+    * steps: the frequency step (MHz) of each grid of a coarse-to-fine tuning, see coarse_to_fine_sweep().
+      [50, 5, 0.5] is three grids, and one step is a plain grid over the band. windows is optional.
+    * kw: True to start the kw search after the last grid, see kw_sweep(); it needs min_step (MHz) and max_iter.
+      With x0 (MHz) instead of steps the search starts from start, x0 and stop.
+    * early_stop: True to let the peripheral stop a frequency early, see adaptive_sweep(); n_min, confirm, short_confirm and block_en are optional.
+      The kw search always uses the early stop.
+    * mean_addr: if given, the program ends by storing the mean I and Q of the winner, as the peripheral holds them, at this address of the data memory (2 words).
+
+    For another shot you write _initialize() and _body() as for AveragerProgramV2: the content of your _body() is a shot.
     In _initialize() you declare the search, with one of these:
 
     * adaptive_sweep(): the peripheral watches a loop that you made with add_loop() and that sweeps the frequency of a pulse.
@@ -3852,6 +3866,51 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
         if hasattr(sweep, 'stages'):
             return dict(results[-1], name=name, stages=results)
         return results[0]
+
+    def _initialize(self, cfg):
+        """Declare one constant pulse, one readout and the search, as the configuration dictionary says (see the class).
+        The sweep is named "sweep". Write your own _initialize() and _body() for another shot.
+
+        User code should not call this method; it's called by make_program().
+        """
+        self.declare_gen(ch=cfg['gen_ch'], nqz=cfg.get('nqz', 1))
+        self.declare_readout(ch=cfg['ro_ch'], length=cfg['ro_len'])
+        # the frequency can be any value: the search rewrites it
+        self.add_pulse(ch=cfg['gen_ch'], name="probe", ro_ch=cfg['ro_ch'], style="const", length=cfg['pulse_len'], freq=cfg['start'], phase=0, gain=cfg['gain'])
+        self.add_readoutconfig(ch=cfg['ro_ch'], name="ro", freq=cfg['start'], gen_ch=cfg['gen_ch'])
+        kw = cfg.get('kw', False)
+        # the kw search always uses the early stop
+        early_stop = kw or cfg.get('early_stop', False)
+        opts = {k: cfg[k] for k in ['windows', 'mode'] if k in cfg}
+        if early_stop:
+            opts.update({k: cfg[k] for k in ['n_min', 'confirm', 'short_confirm', 'block_en'] if k in cfg})
+        if kw:
+            self.kw_sweep("sweep", pulse="probe", ro_cfg="ro", start=cfg['start'], stop=cfg['stop'], min_step=cfg['min_step'], max_iter=cfg['max_iter'],
+                          steps=cfg.get('steps'), x0=cfg.get('x0'), **opts)
+        else:
+            self.coarse_to_fine_sweep("sweep", pulse="probe", ro_cfg="ro", start=cfg['start'], stop=cfg['stop'], steps=cfg['steps'], early_stop=early_stop, **opts)
+
+    def _body(self, cfg):
+        """Play a shot: the pulse, and the readout at the frequency of the pulse.
+
+        User code should not call this method; it's called by make_program().
+        """
+        self.pulse(ch=cfg['gen_ch'], name="probe", t=0)
+        self.send_readoutconfig(ch=cfg['ro_ch'], name="ro", t=0)
+        self.trigger(ros=[cfg['ro_ch']], t=cfg['trig_time'])
+
+    def _cleanup(self, cfg):
+        """Store the mean I and Q of the winner in data memory, if the configuration dictionary gives mean_addr.
+
+        User code should not call this method; it's called by make_program().
+        """
+        if cfg.get('mean_addr') is not None:
+            # GET_MEAN: the mean of the best frequency, as the peripheral holds it
+            self.qpb_cmd(AdaptiveSweep.GET_MEAN)
+            self.qpb_wait('new')
+            self.write_dmem(addr=cfg['mean_addr'], src='s_core_r1')
+            self.write_dmem(addr=cfg['mean_addr'] + 1, src='s_core_r2')
+            self.qpb_ack()
 
     def make_program(self):
         # play the initialization
