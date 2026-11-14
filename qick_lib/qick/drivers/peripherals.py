@@ -3,7 +3,6 @@ Drivers for qick_processor Peripherals.
 2024-5-22
 """
 from pynq.buffer import allocate
-from numbers import Integral
 import numpy as np
 from qick.ip import SocIP
 
@@ -915,62 +914,37 @@ class QICK_XTalk_Compensation(SocIP):
 
 class Adaptive_Sweep(SocIP):
     """
-    Adaptive_Sweep host-side port.
+    Adaptive_Sweep class
 
-    Two jobs.  First, the settings the generated tProc program does NOT
-    itself send: the early-stop threshold and the block tolerance (CTRL is
-    always sent by the program's CFG_ACQ).  Call
-    :meth:`load_tables` with the
-    sweep's plan (or the individual setters) before starting a program that
-    needs them.  Second, the debug views of the running IP:
-    :meth:`print_status`, :meth:`print_debug`, :meth:`read_view` and
-    :meth:`errors`.
+    AXI side of the adaptive_sweep peripheral: the settings that are registers of the peripheral
+    (the threshold of the early stop and the tolerance of its block test), and its debug views.
+    Everything else is sent by the tProc program, see AdaptiveSweepProgramV2.
 
-    The early-stop threshold lives here rather than in the program image so a
-    threshold sweep needs no rebuild - :meth:`set_estop_thr` retargets a
-    loaded program between runs.  It is a scalar, not a table: the IP holds
-    the integer reciprocal ``D = round(1/thr)`` in one 16-bit register and
-    tests ``(|dI|+|dQ|)*D <= |SI|+|SQ|`` at each checkpoint.  The register
-    comes out of reset at ``D=64``, so an unwritten register behaves as
-    ``thr=1/64`` rather than disabling the early stop.
-
-    Register map (ABI 5), in words: ``REG0`` (``tbl_ctrl``) is
-    ``{[31] toggle, [30:21] zero, [20:16] target, [15:0] zero}``,
-    with target 2 = early-stop threshold and 4 = absolute block tolerance
-    (every other target is a bad target; 3 wrote CTRL until ABI 4);
-    ``REG1`` (``tbl_d0``) is the payload word; ``REG2`` (``read_sel``)
-    selects the debug view (4 bits, views 0..15), a plain level. ``REG3``
-    (``status``) returns the
-    GET_STATUS word, ``REG4``/``REG5`` (``dbg_dt1``/``dbg_dt2``) the selected
-    view pair, and ``REG6`` (``ident``) ``{"AS", abi, reserved}``; those four
-    are read-only. Until ABI 4 a spare REG3 sat before them.
-
-    Write protocol: the payload register is written first, then REG0 twice -
-    once with the target and the toggle UNCHANGED, once with REG0[31]
-    FLIPPED.  The toggle edge is synchronized into the fabric clock and
-    commits exactly one write; writing the target a transaction earlier keeps
-    it settled before that edge crosses.
+    Registers:
+    tbl_ctrl : write command, [31] toggle, [20:16] target (2 threshold, 4 block tolerance)
+    tbl_d0   : the value to write
+    read_sel : selects the debug view, 0 to 15
+    status   : the status word, as the tProc reads it with GET_STATUS
+    dbg_dt1, dbg_dt2 : the two words of the selected debug view
+    ident    : "AS", then the version of the command and register map
     """
     bindto = ['emrhnozdemir:QICK:adaptive_sweep:1.0']
 
-    #: The ABI (opcode map, response layout and AXI register map) this driver
-    #: and asm_v2's registry are written for. The IP reports its own in
-    #: ``ident`` bits 15:8 (:meth:`check_abi`).
+    # version of the command and register map that this driver and AdaptiveSweepProgramV2 are written for
     ABI = 5
 
-    #: The border search's state, view 1 bits 16:12 and view 0 bits 18:14.
+    # state names of the kw search (view 1 bits 16:12, view 0 bits 18:14) and its last decision (view 1 bits 23:21)
     ENGINE_STATES = ['IDLE', 'PRESENT', 'MEASURE', 'PMAX', 'GRID1', 'GRID2',
                      'GRID_END', 'SEEN', 'NOISE', 'BAR', 'BETTER', 'WIDTH',
                      'PLAN0', 'PLAN1', 'PLAN2', 'PLAN3', 'PLAN4', 'PLAN5',
                      'PLAN6', 'PLAN7', 'PLAN8', 'PLAN9', 'GO', 'DONE']
-    #: The border search's last decision, view 1 bits 23:21.
     ENGINE_DECISIONS = ['NONE', 'GRID', 'BETTER', 'BORDER', 'CONVERGED',
                         'CAPPED', 'NOTHING', 'WINDOW']
-    #: Debug views, by REG2 value: each returns a (dt1, dt2) word pair.
+    # debug views, by read_sel value
     VIEWS = ['top', 'engine', 'engine_x', 'engine_border', 'power', 'mean',
              'diag', 'acq', 'cfg_window', 'cfg_grid', 'cfg_acq', 'cfg_band',
              'cfg_ctrl', 'cfg_tol', 'drain', 'response']
-    #: Sticky error bits of view 0 dt2, cleared by the next START/RUN_*.
+    # error bits of view 0, second word; they stay set until the next START or RUN_KW
     ERROR_BITS = ['start_busy', 'unknown_op', 'read_held', 'bad_target',
                   'stray_power']
     _TOP_BITS = ['ac_armed', 'pf_freq_valid', 'eng_freq_valid', 'tvalid',
@@ -993,101 +967,94 @@ class Adaptive_Sweep(SocIP):
         }
 
     def _init_firmware(self):
-        # REG0[31] is a toggle, not a strobe: learn its current state instead
-        # of writing it, so re-initializing the driver cannot commit a stray
-        # table write.
+        # tbl_ctrl[31] is a toggle: read its state instead of writing it, so that a new driver object does not make a write
         self._toggle = (self.tbl_ctrl >> 31) & 1
 
     def _tbl_commit(self, target):
         word = (target & 0x1F) << 16
-        # the target first, with the toggle unchanged...
+        # first the target, then the toggle: the peripheral makes one write when the toggle changes
         self.tbl_ctrl = (self._toggle << 31) | word
-        # ...then the flip commits the write
         self._toggle ^= 1
         self.tbl_ctrl = (self._toggle << 31) | word
 
     def set_estop_d(self, d):
-        """Write the raw early-stop reciprocal D (16-bit, 1..65535).
+        """Set the threshold of the early stop as the number D that the peripheral holds.
+        A check of the early stop passes when (|dI|+|dQ|) * D <= |SI|+|SQ|, where S is the sum of the shots of the point and d is the odd shots minus the even shots.
+        A larger D is stricter and takes more shots. After a reset D is 64.
 
-        The split test passes a checkpoint iff
-        ``(|dI|+|dQ|) * D <= |SI|+|SQ|``, so D is the signal-to-noise ratio
-        the point must reach.  Prefer :meth:`set_estop_thr` unless you want
-        the register value itself.
+        Parameters
+        ----------
+        d : int
+            1 to 65535
         """
         d = int(d)
         if not 1 <= d <= 0xFFFF:
-            raise ValueError("early-stop D must be in [1, 65535], got %d"
-                             % (d,))
+            raise RuntimeError("D must be 1 to 65535, got %d"%(d))
         self.tbl_d0 = d
         self._tbl_commit(2)
 
     def set_estop_thr(self, thr):
-        """Set the early-stop threshold as a noise/signal ratio in (0, 1].
+        """Set the threshold of the early stop as a ratio: the odd and the even shots of a point must agree to this fraction of the signal.
+        The peripheral holds D = round(1/thr), see set_estop_d().
 
-        Returns the realized threshold ``1/round(1/thr)``, which differs from
-        the requested one only where an integer reciprocal cannot express it
-        (coarse near 1, exact for any ``thr = 1/D``).
+        Parameters
+        ----------
+        thr : float
+            larger than 0, at most 1
+
+        Returns
+        -------
+        float
+            the threshold that was set, 1/D
         """
-        thr = float(thr)
-        if not 0.0 < thr <= 1.0:
-            raise ValueError("estop_thr is a noise/signal ratio and must be "
-                             "in (0, 1], got %r" % (thr,))
-        d = int(round(1.0 / thr))
-        if d > 0xFFFF:
-            raise ValueError("estop_thr=%g needs D=%d, past the 16-bit "
-                             "register's 65535; the finest threshold it can "
-                             "express is %g" % (thr, d, 1.0 / 0xFFFF))
+        if not 0 < thr <= 1:
+            raise RuntimeError("the threshold must be larger than 0 and at most 1, got %f"%(thr))
+        d = int(round(1/thr))
         self.set_estop_d(d)
-        return 1.0 / d
+        return 1/d
 
     def set_block_tol(self, value):
-        """Set the unsigned absolute L1 tolerance of consecutive I/Q means.
+        """Set the tolerance of the block test of the early stop (the block_en option of a sweep).
+        The test compares the mean of the first half of the shots of a point with the mean of the second half:
+        |dI|+|dQ| of the two means must be at most this value. Units are the I/Q words of one shot. After a reset it is 0.
 
-        Units are integrated I/Q words per shot, before host normalization.
-        Zero requires exact agreement; enable is separately controlled by
-        CTRL bit 7. At N shots the hardware compares the block-sum difference
-        against ``(N/2) * value`` using a shift.
+        Parameters
+        ----------
+        value : int
+            0 to 2**32-1
         """
-        if (not isinstance(value, Integral) or isinstance(value, (bool, np.bool_))
-                or not 0 <= value <= 0xFFFFFFFF):
-            raise ValueError("block_tol must be an integer in [0, 4294967295]")
-        self.tbl_d0 = int(value)
+        value = int(value)
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise RuntimeError("the block tolerance must be 0 to 2**32-1, got %d"%(value))
+        self.tbl_d0 = value
         self._tbl_commit(4)
 
-    def load_tables(self, plan):
-        """Load the plan's early-stop threshold and block tolerance."""
-        if plan.estop_d:
-            self.set_estop_d(plan.estop_d)
-            self.set_block_tol(getattr(plan, 'block_tol', None) or 0)
-
-    # --- debug views -------------------------------------------------------
+    # debug views
 
     @property
     def abi(self):
-        """The opcode-map ABI the loaded bitstream reports (``ident`` 15:8)."""
+        """Version of the command and register map of the peripheral in the loaded bitstream (ident bits 15:8)."""
         return (int(self.ident) >> 8) & 0xFF
 
     def check_abi(self):
-        """Raise unless the bitstream's opcode map is the one this driver expects."""
+        """Raise an error if the peripheral in the loaded bitstream is not the version this software is written for."""
         ident = int(self.ident)
-        if (ident >> 16) != 0x4153:
-            raise RuntimeError(
-                "adaptive_sweep IDENT register (word 6) reads 0x%08x: this "
-                "bitstream predates ABI 5, whose AXI map moved IDENT from word "
-                "7 to word 6, and does not match the ABI %d programs this "
-                "software compiles" % (ident, self.ABI))
-        if self.abi != self.ABI:
-            raise RuntimeError(
-                "adaptive_sweep bitstream carries opcode-map ABI %d, this "
-                "software expects ABI %d" % (self.abi, self.ABI))
+        if (ident >> 16) != 0x4153 or self.abi != self.ABI:
+            raise RuntimeError("the adaptive_sweep peripheral of this bitstream reports ident 0x%08x, this software expects version %d (0x4153%02x..)"%(ident, self.ABI, self.ABI))
 
     def read_view(self, sel):
-        """Select a debug view (0..15, or a name from :attr:`VIEWS`).
+        """Read a debug view.
+        The two words of a view are two AXI reads of a running peripheral, so they are read until two reads in a row agree.
 
-        Returns the ``(dt1, dt2)`` word pair.  The select is a level: it
-        crosses into the fabric clock and the view crosses back well within
-        one AXI read, so no wait is needed.  The two words are two AXI reads
-        of a live view, so the pair is read until two reads in a row agree.
+        Parameters
+        ----------
+        sel : int or str
+            View number 0 to 15, or its name in VIEWS
+
+        Returns
+        -------
+        tuple of int
+            The two words of the view
         """
         if isinstance(sel, str):
             sel = self.VIEWS.index(sel)
@@ -1101,7 +1068,7 @@ class Adaptive_Sweep(SocIP):
         raise RuntimeError("debug view %d did not hold still for two reads" % sel)
 
     def errors(self):
-        """The sticky error bits of view 0, as a dict (cleared by START/RUN_*)."""
+        """The error bits of the peripheral, as a dict. They are cleared by the next START or RUN_KW."""
         _, word = self.read_view(0)
         out = {name: bool((word >> i) & 1) for i, name in enumerate(self.ERROR_BITS)}
         out['getfreq_idle_count'] = word >> 16
@@ -1115,13 +1082,14 @@ class Adaptive_Sweep(SocIP):
         return names[index] if index < len(names) else 'UNDEFINED(%d)' % index
 
     def print_status(self):
-        """Print the STATUS word, the handshake view and the error bits."""
-        from qick.asm_v2 import ADAPTIVE_SWEEP
+        """Print the status word, the handshake view and the error bits."""
+        # the status word is the one the tProc program reads, its fields are defined with the program
+        from qick.asm_v2 import AdaptiveSweep
         word = int(self.status)
         print('---------------------------------------------')
         print('--- adaptive_sweep IDENT 0x%08x: abi %d' % (int(self.ident), self.abi))
         print('--- STATUS (REG3) 0x%08x' % word)
-        for name, value in ADAPTIVE_SWEEP.unpack_status(word).items():
+        for name, value in AdaptiveSweep.unpack(word, AdaptiveSweep.STATUS).items():
             self._show(name, value)
         top, _ = self.read_view('top')
         print('--- handshake (view 0)')
@@ -1135,8 +1103,8 @@ class Adaptive_Sweep(SocIP):
             self._show(name, value)
 
     def print_debug(self):
-        """Print every debug view, decoded where the layout is fixed."""
-        from qick.asm_v2 import AS_DIAG_FIELDS
+        """Print all debug views."""
+        from qick.asm_v2 import AdaptiveSweep
         self.print_status()
         flags, points_iter = self.read_view('engine')
         print('--- engine (view 1)')
@@ -1164,8 +1132,8 @@ class Adaptive_Sweep(SocIP):
         self._show('mean_q', int(np.int32(mean_q)))
         n_used, diag = self.read_view('diag')
         self._show('n_used', n_used)
-        for f in AS_DIAG_FIELDS:
-            self._show('diag.' + f.name, f.unpack(diag))
+        for name, value in AdaptiveSweep.unpack(diag, AdaptiveSweep.DIAG).items():
+            self._show('diag.' + name, value)
         acq, best = self.read_view('acq')
         self._show('shot_count', acq >> 16)
         self._show('check_bit', (acq >> 11) & 0x1F)

@@ -1577,7 +1577,7 @@ wire        as_interrupt;
    endtask
 
    // Any table target: REG1 = payload, then the REG0 toggle with the target,
-   // as Adaptive_Sweep.load_tables() does on the board.
+   // as Adaptive_Sweep._tbl_commit() does on the board.
    task automatic as_write_table(input [4:0] target, input [31:0] data);
       begin
          as_axi_write(8'h04, data);

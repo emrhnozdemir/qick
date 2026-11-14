@@ -5,12 +5,10 @@ import textwrap
 from collections import OrderedDict, defaultdict
 from collections.abc import Mapping
 from types import SimpleNamespace
-from typing import Callable, NamedTuple, Union, Dict, List, Optional, Tuple
+from typing import Callable, NamedTuple, Union, Dict
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from fractions import Fraction
 import copy
-import warnings
 from numbers import Number, Integral
 
 from .tprocv2_assembler import Assembler
@@ -18,2014 +16,6 @@ from .qick_asm import AbsQickProgram, AcquireMixin
 from .helpers import to_int, check_bytes, check_keys
 
 logger = logging.getLogger(__name__)
-
-# =========================================================================
-# QP2 accelerator registry
-# =========================================================================
-# The tProc-v2 talks to a custom peripheral on the "QPeriphB" bus with a single
-# instruction:  PB <op> <r1> <r2> <r3> <r4>.  There are no immediates, so every
-# value has to be staged into a data register first.
-#
-# Each accelerator therefore has an *opcode map*: for every operation, which
-# named fields live in which dt word and at which bit offset.  That map is pure
-# data, so it is kept as data, adding an accelerator, or an operation on an
-# existing one, means adding a table entry rather than writing code.
-#
-# The two entries below are transcribed from the RTL, not from documentation:
-#   fine_tuning_sweep  firmware/ip/fine_tuning_sweep/src/fine_tuning_sweep.v
-#   adaptive_sweep     firmware/ip/adaptive_sweep/src/adaptive_sweep.v
-
-MASK32 = 0xFFFFFFFF
-
-
-def to_u32(val):
-    """Wrap a Python int into an unsigned 32-bit word (two's complement)."""
-    return int(val) & MASK32
-
-
-def to_s32(val):
-    """Interpret the low 32 bits of ``val`` as a signed 32-bit int."""
-    val = int(val) & MASK32
-    return val - (1 << 32) if val & 0x80000000 else val
-
-
-@dataclass(frozen=True)
-class Field:
-    """One named bit field inside a 32-bit ``dt`` word.
-
-    Parameters
-    ----------
-    name : str
-        Field name, as used in the keyword arguments of :func:`pack_op`.
-    bits : int
-        Field width in bits.
-    lsb : int
-        Position of the field's least significant bit within the word.
-    signed : bool
-        If True, the value is allowed to be negative and is packed as two's
-        complement.  Frequency words and steps are signed; counts are not.
-    """
-
-    name: str
-    bits: int
-    lsb: int
-    signed: bool = False
-
-    @property
-    def mask(self):
-        """The field's mask, positioned at bit 0."""
-        return (1 << self.bits) - 1
-
-    def check(self, value, where=""):
-        """Raise ValueError if ``value`` does not fit this field."""
-        value = int(value)
-        if self.signed:
-            lo, hi = -(1 << (self.bits - 1)), (1 << (self.bits - 1)) - 1
-            # a value already given as an unsigned 32-bit word is fine too
-            if self.bits == 32 and 0 <= value <= MASK32:
-                return
-        else:
-            lo, hi = 0, (1 << self.bits) - 1
-        if not lo <= value <= hi:
-            raise ValueError(
-                "%s: field '%s' is %d bits, so its value must be in [%d, %d], "
-                "but got %d" % (where or "pack_op", self.name, self.bits, lo, hi, value))
-
-    def pack(self, value):
-        """Return ``value`` masked and shifted into place."""
-        return (int(value) & self.mask) << self.lsb
-
-    def unpack(self, word):
-        """Extract this field from ``word``, sign-extending if signed."""
-        raw = (int(word) >> self.lsb) & self.mask
-        if self.signed and self.bits < 32 and raw & (1 << (self.bits - 1)):
-            raw -= (1 << self.bits)
-        elif self.signed and self.bits == 32:
-            raw = to_s32(raw)
-        return raw
-
-
-# a whole 32-bit word, one field
-def _word(name, signed=False):
-    return (Field(name, 32, 0, signed),)
-
-
-@dataclass(frozen=True)
-class QP2Op:
-    """One QP2 operation.
-
-    Parameters
-    ----------
-    number : int
-        The 5-bit opcode (the ``C_OP`` of the ``PB`` instruction).
-    mnemonic : str
-        Human-readable name, used as the key in the accelerator's op table.
-    args : dict
-        Maps ``"dt1"`` .. ``"dt4"`` to a tuple of :class:`Field`.  Words that
-        the RTL ignores are simply absent.
-    resp : dict
-        For operations that produce a response, maps ``"dt1"``/``"dt2"`` (the
-        peripheral's ``qtag_dt1_o``/``qtag_dt2_o``, readable from ``s_core_r1``
-        and ``s_core_r2``) to a tuple of :class:`Field`.
-    blocking : bool
-        True if issuing this op drops the peripheral's READY line (i.e. it
-        starts a job that completes asynchronously).
-    responds : bool
-        True if the op raises ``qtag_vld_o`` (``bit_qpb_new`` in ``s_status``),
-        which the program must acknowledge.
-    doc : str
-        One-line description.
-    """
-
-    number: int
-    mnemonic: str
-    args: Dict[str, Tuple[Field, ...]] = field(default_factory=dict)
-    resp: Dict[str, Tuple[Field, ...]] = field(default_factory=dict)
-    blocking: bool = False
-    responds: bool = False
-    doc: str = ""
-
-    def field_names(self):
-        """All argument field names accepted by this op."""
-        return [f.name for word in self.args.values() for f in word]
-
-
-@dataclass(frozen=True)
-class QP2Accel:
-    """One QP2 accelerator: its opcode map, status word, and capabilities.
-
-    Parameters
-    ----------
-    name : str
-        Registry key, as passed to ``adaptive_sweep(accel=...)``.
-    rtl_source : str
-        Repo-relative path of the RTL this table was transcribed from.
-    ops : dict
-        Mnemonic -> :class:`QP2Op`.
-    status_bits : tuple of Field
-        Layout of the status word, where the accelerator has one.
-    algorithms : tuple of str
-        Search algorithms this accelerator implements.
-    calcs : tuple of str
-        Names of the measurement schemes this accelerator can be configured
-        into.  These are presets over the CTRL word, not a hardware select:
-        one shared datapath implements all of them (see ``calc_ctrl``).
-    calc_ctrl : dict
-        Calc name -> the CTRL field values that select it.  ``adaptive_sweep``
-        has ONE datapath, so a calc name is a CTRL preset, not an index.
-        Since 2026-08-24 the RTL IGNORES ``reduce_sel`` (CTRL[3:1]) and
-        ``prescale_en`` (CTRL[5]): early stopping is selected by ``estop_en``,
-        ``confirm``, ``block_en`` and ``short_confirm``. So "shift" and "welford" are the
-        same hardware configuration -- the Welford running-mean pipeline was
-        deleted, and "welford" is kept only as a deprecated alias -- and
-        "split" differs from them by one bit.  The names are kept because
-        programs and notebooks use them, and because ``reduce_sel == 3`` is
-        still what gates ``dump_log``.  See MODULE_GUIDE.txt section 7.3.
-    gdkw_calcs : tuple of str
-        Subset of ``calcs`` usable with the KW search engine.  The search
-        takes its noise gate and tie threshold from the early-stop threshold
-        register, which describes a probe's precision only when the probe
-        stopped on it, so only the early-stopping scheme qualifies.
-    abi : int
-        Version of the opcode map.  ``adaptive_sweep`` reports the ABI it was
-        built with in its AXI IDENT register, so a bitstream compiled against
-        another map can be refused before a program is run (0 = none).
-    """
-
-    name: str
-    rtl_source: str
-    ops: Dict[str, QP2Op]
-    status_bits: Tuple[Field, ...] = ()
-    algorithms: Tuple[str, ...] = ("grid",)
-    calcs: Tuple[str, ...] = ()
-    calc_ctrl: Dict[str, Dict[str, int]] = field(default_factory=dict)
-    gdkw_calcs: Tuple[str, ...] = ()
-    abi: int = 0
-
-    def op(self, mnemonic):
-        """Look up an op by mnemonic, with a helpful error."""
-        try:
-            return self.ops[mnemonic]
-        except KeyError:
-            raise ValueError(
-                "accelerator '%s' has no operation '%s'; it supports %s"
-                % (self.name, mnemonic, sorted(self.ops))) from None
-
-    def has_op(self, mnemonic):
-        """True if this accelerator implements ``mnemonic``."""
-        return mnemonic in self.ops
-
-    def calc_fields(self, calc):
-        """Map a calc name to the CTRL field values that select it.
-
-        Returns a dict suitable for ``**`` into :func:`pack_op` for CFG_ACQ.
-        It is empty for an accelerator whose datapath is hardwired.
-        """
-        if calc not in self.calcs:
-            raise ValueError(
-                "accelerator '%s' does not support calc=%r; it supports %s"
-                % (self.name, calc, list(self.calcs)))
-        return dict(self.calc_ctrl.get(calc, {}))
-
-    def unpack_status(self, word):
-        """Decode a status word into a dict of named fields."""
-        return {f.name: f.unpack(word) for f in self.status_bits}
-
-
-def pack_op(accel, mnemonic, **values):
-    """Pack named field values into the four ``dt`` words of a QP2 operation.
-
-    Parameters
-    ----------
-    accel : QP2Accel
-        The accelerator whose opcode map to use.
-    mnemonic : str
-        Operation mnemonic (a key of ``accel.ops``).
-    **values
-        Field values, by name.  Every field named in the op's ``args`` may be
-        given; omitted fields pack as zero.  Passing an unknown name is an
-        error (it is almost always a typo or a wrong-accelerator mistake).
-
-    Returns
-    -------
-    int
-        The opcode number, for the ``PB`` instruction's ``C_OP``.
-    list of int
-        Four unsigned 32-bit words, ``[dt1, dt2, dt3, dt4]``.
-    """
-    op = accel.op(mnemonic)
-    known = set(op.field_names())
-    unknown = set(values) - known
-    if unknown:
-        raise ValueError(
-            "%s.%s: unknown field(s) %s; this op takes %s"
-            % (accel.name, mnemonic, sorted(unknown), sorted(known)))
-
-    words = [0, 0, 0, 0]
-    where = "%s.%s" % (accel.name, mnemonic)
-    for idx, key in enumerate(("dt1", "dt2", "dt3", "dt4")):
-        for f in op.args.get(key, ()):
-            if f.name not in values:
-                continue
-            val = values[f.name]
-            if val is None:
-                continue
-            f.check(val, where)
-            words[idx] |= f.pack(val)
-    return op.number, [w & MASK32 for w in words]
-
-
-# ---------------------------------------------------------------------------
-# fine_tuning_sweep
-# ---------------------------------------------------------------------------
-# Transcribed from firmware/ip/fine_tuning_sweep/src/fine_tuning_sweep.v.
-# The whole opcode surface is three ops: the RTL decodes only op 0, 1 and 2
-# (lines 35, 58, 65).  There is NO status-read op, the only response the IP
-# ever produces is the end-of-sweep one (lines 91-94: on pf_finish, dt1_o gets
-# the peak/dip freq word, dt2_o is zero, vld_o rises).  A program therefore
-# learns the result by polling READY high, then bit_qpb_new, then reading
-# s_core_r1.
-_FTS_OPS = {
-    "CFG_WINDOW": QP2Op(
-        number=0, mnemonic="CFG_WINDOW",
-        args={
-            "dt1": _word("start_freq", signed=True),
-            "dt2": _word("step", signed=True),
-            "dt3": _word("n_points"),
-            "dt4": _word("averager_value"),
-        },
-        doc="latch the grid: start word, step word, point count, shots/point",
-    ),
-    "START": QP2Op(
-        number=1, mnemonic="START", blocking=True, responds=True,
-        resp={"dt1": _word("freq_at_best", signed=True), "dt2": _word("zero")},
-        doc="start the grid sweep; READY drops now and rises at finish, when "
-            "dt1_o carries the peak/dip frequency word",
-    ),
-    "CFG_ACQ": QP2Op(
-        number=2, mnemonic="CFG_ACQ",
-        args={
-            "dt1": _word("nsamp"),
-            "dt2": (Field("mode", 1, 0),),
-        },
-        doc="latch nsamp (raw samples folded per shot) and mode (0 peak/1 dip)",
-    ),
-}
-
-FINE_TUNING_SWEEP = QP2Accel(
-    name="fine_tuning_sweep",
-    rtl_source="firmware/ip/fine_tuning_sweep/src/fine_tuning_sweep.v",
-    ops=_FTS_OPS,
-    status_bits=(),
-    algorithms=("grid",),
-    # one hardwired amplitude_calculator (the two-stage round-shift scheme);
-    # this IP has no CTRL word, so only "shift" is selectable and it packs
-    # no extra CFG_ACQ fields.
-    calcs=("shift",),
-    calc_ctrl={"shift": {}},
-    gdkw_calcs=(),
-)
-
-
-# ---------------------------------------------------------------------------
-# adaptive_sweep
-# ---------------------------------------------------------------------------
-# Transcribed from firmware/ip/adaptive_sweep/src/adaptive_sweep.v (opcode
-# decode, field wiring and the status_word assign) and src/register_bank.v
-# (the CTRL word and the dt slices it latches).  The prose description of
-# every module is in personal_files/adaptive_sweep/MODULE_GUIDE.txt.
-#
-# Opcode map ABI 2 (2026-10-24): the top two bits of the 5-bit PB selector
-# are the class - 0 configure (0..7), 1 control (8..15), 2 read (16..23),
-# 3 debug (24..31).  15 is CFG_INTERRUPT, decoded by the processor and
-# ignored by the IP; 24 is reserved for GET_DEBUG and not decoded yet.
-# The IP reports the ABI it was built for in its AXI IDENT register
-# (Adaptive_Sweep.check_abi).  GET_GDKW_DIAG (old 8) was deleted: its two
-# words are debug view 1 of the Adaptive_Sweep driver.
-#
-# Opcode map ABI 3 (2026-10-29): the fixed-step GD/KW engine was replaced by
-# the difference-proportional KW search.  RUN_GD (9) was removed and the
-# control ops after it moved down one (2026-10-30): RUN_KW 9, CLR_RESULT 10,
-# REARM 11; 12..14 are free, CFG_INTERRUPT stays 15 (the processor decodes
-# it) and the read class stays 16..19.  RUN_KW lost its patience field
-# (patience is AXI target 5, like the early-stop threshold) and its response
-# bit 2 / status bit 0 mean nothing_seen instead of the GD guard's stalled.
-#
-# Opcode map ABI 4 (2026-10-31): the KW engine became the border search.
-# RUN_KW walks the CFG_WINDOW grid itself (n_points >= 2; otherwise it starts
-# from f_lo, x0, f_hi), then probes one word at a time inside the border
-# around the best point.  RUN_KW dt2 (lambda), CFG_GDKW dt3/dt4 (m_min,
-# m_max) and AXI target 5 (patience) are gone.
-#
-# ABI 5 (2026-11-01): opcodes unchanged. The AXI map lost the spare REG3, so
-# status, the view pair and IDENT moved to words 3..6; AXI target 3 (CTRL) is
-# gone, CTRL comes only from CFG_ACQ. RUN_KW ends with bad_window (response
-# dt2 bit 3, GET_STATUS bit 9) when its best point is not inside [lo, hi]
-# (start points out of order or a wrapping grid). START and RUN_KW restart
-# both searches from any state. The debug views (driver only) changed in the
-# same ABI: the view select is 4 bits (views 0..15) and the engine state is
-# one 5-bit code (the plan phases are states PLAN0..PLAN9).
-_AS_OPS = {
-    "CFG_WINDOW": QP2Op(
-        number=0, mnemonic="CFG_WINDOW",
-        args={
-            "dt1": _word("start_freq", signed=True),
-            "dt2": _word("step", signed=True),
-            "dt3": (Field("n_points", 16, 0),),
-            "dt4": (Field("avg_shift", 5, 0),),
-        },
-        doc="grid window; 'n_points' is 16 bits (register_bank.v n_points_o "
-            "<= dt3_i[15:0]; peak_finder treats 0 as 1, so 65536 would run "
-            "as a one-point sweep - plan_sweep bounds it to 65535); 'step' "
-            "with start and n_points also gives the coarse grid a KW search "
-            "walks first (n_points < 2 starts it from f_lo, x0, f_hi), and "
-            "'avg_shift' is the "
-            "log2 of the shot count folded per armed point. It is an EXPONENT, "
-            "not a count: shot_counter watches bit avg_shift of the shot "
-            "number, so the cap is exactly 1 << avg_shift (register_bank.v "
-            "avg_shift_o <= dt4_i[4:0]). Sending a raw count aliases - 32 "
-            "would land as dt4[4:0]=0, a one-shot cap.",
-    ),
-    "START": QP2Op(
-        number=8, mnemonic="START", blocking=True, responds=True,
-        resp={"dt1": _word("freq_at_best", signed=True), "dt2": _word("zero")},
-        doc="start the grid sweep (peak_finder walks the grid)",
-    ),
-    "CFG_ACQ": QP2Op(
-        number=1, mnemonic="CFG_ACQ",
-        args={
-            "dt2": (Field("mode", 1, 0),
-                    Field("reduce_sel", 3, 1),
-                    Field("estop_hold", 1, 4),
-                    Field("prescale_en", 1, 5),
-                    Field("estop_en", 1, 6),
-                    Field("block_en", 1, 7),
-                    Field("short_confirm", 1, 8),
-                    Field("confirm", 3, 17)),
-            "dt3": _word("n0"),
-            "dt4": _word("n_min"),
-        },
-        doc="the CTRL word in dt2 (dt1, once nsamp, is not read by the RTL): "
-            "mode (0 peak/1 dip); reduce_sel "
-            "(IGNORED BY THE RTL since 2026-08-24 - there is one datapath; "
-            "still set because reduce_sel==3 gates dump_log on the Python "
-            "side); estop_hold (0 immediate emit / 1 "
-            "freeze-and-drain); prescale_en (IGNORED since 2026-08-24 - the "
-            "raw 32-bit shot sum goes straight into the 58-bit "
-            "accumulators); estop_en (enable early stopping); block_en "
-            "(also require consecutive-half I/Q agreement, with absolute "
-            "tolerance in AXI target 4; first complete test is at 8 shots); "
-            "the odd/even test uses a reciprocal threshold: "
-            "its threshold is not in this word - it lives in the IP's AXI "
-            "register, written by the Adaptive_Sweep driver); "
-            "confirm (total consecutive passes required to stop); "
-            "short_confirm=0 checks the doubling grid 4, 8, 16, ... "
-            "and returns the final confirming estimate (default confirm=2). "
-            "short_confirm=1 checks at an eligible power-of-two N, then "
-            "N+2, N+4, ... and returns the saved first-N estimate "
-            "(default confirm=3); it cannot be combined with block_en. "
-            "CTRL[16:14] held an "
-            "`nmul` field for the {1,3}/{1,3,5,7} grids until 2026-08-23 and "
-            "is now reserved. dt3 = n0 "
-            "(running-mean warmup), dt4 = n_min (eligibility floor, any "
-            "value, 0 makes every checkpoint eligible; short confirmation "
-            "requires its first candidate N to meet this floor)",
-    ),
-    "GET_STATUS": QP2Op(
-        number=17, mnemonic="GET_STATUS", responds=True,
-        resp={"dt1": _word("status"), "dt2": _word("freq_at_max", signed=True)},
-        doc="status read -> dt1_o = status word, dt2_o = freq_at_max",
-    ),
-    "GET_DIAG": QP2Op(
-        number=18, mnemonic="GET_DIAG", responds=True,
-        resp={"dt1": _word("n_used"), "dt2": _word("diag")},
-        doc="diag read -> dt1 = n_used (shots folded into the last emitted "
-            "estimate, excluding additional short-confirmation shots); "
-            "dt2 = {nconv_count[15:0], 6'd0, sat, conv, k[4:0], "
-            "type[2:0]} - decode with AS_DIAG_FIELDS",
-    ),
-    "RUN_KW": QP2Op(
-        number=9, mnemonic="RUN_KW", blocking=True, responds=True,
-        args={
-            "dt1": _word("x0", signed=True),
-            "dt3": _word("min_step"),
-            "dt4": (Field("max_iter", 16, 0),),
-        },
-        resp={"dt1": _word("x_final", signed=True),
-              "dt2": (Field("converged", 1, 0),
-                      Field("capped", 1, 1),
-                      Field("nothing_seen", 1, 2),
-                      Field("bad_window", 1, 3),
-                      Field("iter", 16, 16))},
-        doc="border search (gradient_engine, ABI 5). Start: with CFG_WINDOW "
-            "n_points >= 2 the engine walks that grid (start + i*step) itself; "
-            "otherwise it measures f_lo, x0, f_hi (CFG_GDKW, dt1). The best "
-            "point and its two neighbours are the border lo < b < hi. Each "
-            "iteration measures ONE word inside the border: toward the higher "
-            "border value, step = (span >> 1) >> k with k = lead(dl + dr) - "
-            "lead(|dl - dr|), dl/dr how far b sits above lo/hi (the "
-            "power-of-two three-point vertex, never past half the span); an "
-            "unbalanced border (one side over 4x the other) probes its long "
-            "side at (span >> 2) + (span >> 3). A probe above b by more than "
-            "pmax >> flog2(D) becomes the best, otherwise it becomes the border "
-            "on its side. Converged when both sides are <= min_step: x_final "
-            "is b moved by one more vertex step; capped after max_iter probes "
-            "(x_final = b); nothing_seen when the best start point is not "
-            "8 * (pmax >> flog2(D)) above the worst; bad_window when the best "
-            "point is not inside [lo, hi] (start points out of order or a "
-            "wrapping grid). D is the early-stop threshold register; iter "
-            "counts the probes after the start",
-    ),
-    "GET_FREQ": QP2Op(
-        number=16, mnemonic="GET_FREQ", responds=True,
-        resp={"dt1": _word("freq_word", signed=True),
-              "dt2": (Field("freq_pending", 1, 0),)},
-        doc="KW probe handshake: returns the probe word; reading it while "
-            "pending acks the engine and arms the amp_calc for this probe's "
-            "averager_value shots",
-    ),
-    "CLR_RESULT": QP2Op(
-        number=10, mnemonic="CLR_RESULT",
-        doc="release a finished job's answer and drop the response-valid bit. "
-            "Between a job finishing and this op, every read is held off so it "
-            "cannot overwrite the answer: READY reaches the tProc a couple of "
-            "cycles late, so a program that was still polling can get a read "
-            "in after completion",
-    ),
-    "CFG_GDKW": QP2Op(
-        number=2, mnemonic="CFG_GDKW",
-        args={
-            "dt1": _word("f_lo", signed=True),
-            "dt2": _word("f_hi", signed=True),
-        },
-        doc="KW search window [f_lo, f_hi]: the two outer start points when "
-            "the search starts from x0 (CFG_WINDOW n_points < 2); unused by a "
-            "search that starts from a grid",
-    ),
-    "GET_MEAN": QP2Op(
-        number=19, mnemonic="GET_MEAN", responds=True,
-        resp={"dt1": _word("mean_i", signed=True),
-              "dt2": _word("mean_q", signed=True)},
-        doc="32-bit mean I/Q read-back: the winning grid point's means when "
-            "the last job was a grid sweep, the last probe's for kw (the "
-            "truncating window sum[retire_shift +: 32], for every calc)",
-    ),
-    "REARM": QP2Op(
-        number=11, mnemonic="REARM",
-        doc="early-stop interrupt handshake. Sent once before START it enables "
-            "the protocol: from then on an early stop raises interrupt_o and "
-            "parks the IP, dropping every arrival, instead of arming the next "
-            "point straight away. Sent again from the program's landing block, "
-            "after the quiet window that lets the last committed shot drain, it "
-            "releases the park and arms the point the sweep had already moved "
-            "on to. Fire-and-forget: no response, no ack",
-    ),
-    "CFG_INTERRUPT": QP2Op(
-        number=15, mnemonic="CFG_INTERRUPT",
-        args={"dt1": _word("trigger_mask")},
-        doc="configure the tProcessor's early-stop trigger cancellation mask; "
-            "decoded by the processor, with no separate log memory",
-    ),
-}
-
-# GET_DIAG dt2 for the split early stop
-AS_DIAG_FIELDS = (
-    Field("type", 3, 0),
-    Field("k", 5, 3),
-    Field("converged", 1, 8),
-    Field("saturated", 1, 9),
-    Field("nconv_count", 16, 16),
-)
-
-# status_word, built inline in adaptive_sweep.v (the status_word assign):
-#   {point_idx[15:0], eng_freq_valid, eng_busy, eng_converged, eng_capped,
-#    dest, estop_en, eng_window, early_stop, warmup_done, 3'd0, mode,
-#    pf_waiting, finish_seen, dest & eng_nothing}
-# Bit 0 reports a KW search that ended nothing-seen (until ABI 3 it was the
-# GD movement guard's stall). Bit 2 (busy) is peak_finder's waiting bit.
-# Bits 6:4 (reduce_sel) are hardwired 0 since the 2026-08-24 rebuild; the
-# Field stays so unpack_status keeps its key. Bit 9 is bad_window since
-# ABI 5 (it was prescale_en, hardwired 0).
-_AS_STATUS = (
-    Field("nothing_seen", 1, 0),
-    Field("finish_seen", 1, 1),
-    Field("busy", 1, 2),
-    Field("mode", 1, 3),
-    Field("reduce_sel", 3, 4),
-    Field("warmup_done", 1, 7),
-    Field("early_stop", 1, 8),
-    Field("bad_window", 1, 9),
-    Field("estop_en", 1, 10),
-    Field("dest", 1, 11),
-    Field("capped", 1, 12),
-    Field("converged", 1, 13),
-    Field("gdkw_busy", 1, 14),
-    Field("freq_pending", 1, 15),
-    Field("point_idx", 16, 16),
-)
-
-ADAPTIVE_SWEEP = QP2Accel(
-    name="adaptive_sweep",
-    rtl_source="firmware/ip/adaptive_sweep/src/adaptive_sweep.v",
-    ops=_AS_OPS,
-    status_bits=_AS_STATUS,
-    algorithms=("grid", "kw"),
-    # One shared datapath (src/amplitude_calculator.v): 58-bit S and D
-    # accumulators, one early_stop_checker, one square_summer.  A calc name is
-    # a CTRL preset, not a hardware index -- and since the 2026-08-24 rebuild
-    # reduce_sel and prescale_en are ignored (see calc_ctrl above).
-    calcs=("shift", "welford", "split"),
-    calc_ctrl={
-        "shift":   dict(reduce_sel=1, prescale_en=1, estop_en=0),
-        # deprecated alias of "shift" (plan_sweep warns): same hardware, and
-        # its n0 only feeds the warmup_done status bit
-        "welford": dict(reduce_sel=2, prescale_en=1, estop_en=0),
-        # repetition-axis early stop: raw 32-bit shot sums into the mean32
-        # reduction (exact divide by the realized shot count at retirement).
-        # The threshold is NOT in the CTRL word - it is an AXI register the
-        # Adaptive_Sweep driver writes, so a threshold sweep needs no program
-        # rebuild.  2026-08-23: the "hsplit" and "quarter" presets (the
-        # half- and quarter-octave checkpoint grids) were REMOVED with the
-        # m = 3, 5, 7 reciprocal lookup they retired through.  The grid is
-        # the doubling grid with confirm 2 unless confirmation_policy='short'.
-        "split":   dict(reduce_sel=3, prescale_en=0, estop_en=1, confirm=2),
-    },
-    # the KW search takes its noise gate and tie threshold from the early-stop
-    # threshold register, which describes a probe's precision only when the
-    # probe stopped on it: the search needs the split early stop
-    gdkw_calcs=("split",),
-    abi=5,
-)
-
-
-ACCELS = {a.name: a for a in (FINE_TUNING_SWEEP, ADAPTIVE_SWEEP)}
-
-
-def get_accel(name):
-    """Look up an accelerator by name.
-
-    Parameters
-    ----------
-    name : str
-        Registry key, e.g. ``"adaptive_sweep"``.
-
-    Returns
-    -------
-    QP2Accel
-    """
-    if isinstance(name, QP2Accel):
-        return name
-    try:
-        return ACCELS[name]
-    except KeyError:
-        raise ValueError(
-            "unknown accelerator %r; known accelerators are %s"
-            % (name, sorted(ACCELS))) from None
-
-
-# =========================================================================
-# Public adaptive-sweep mode names
-# =========================================================================
-# The RTL has exactly two bits that decide how a sweep behaves, and both live
-# in the CTRL word written by CFG_ACQ (register_bank.v lines 227-230):
-#
-#   search_mode  CTRL[0]  0 = keep the LARGEST power seen, 1 = keep the
-#                         smallest.  It reaches peak_finder as dip_i and
-#                         gradient_engine as dip_i; peak_finder seeds its
-#                         running best with 0 for a peak and all-ones for a
-#                         dip (peak_finder.v line 98).
-#   estop_en     CTRL[6]  0 = every point runs the full 1 << avg_shift shots,
-#                         1 = the split test may retire a point early
-#                         (threshold_compare.v line 167 gates stop_o on it).
-#
-# Those two bits are orthogonal, so there are four real hardware behaviours.
-# ``sweep_mode`` names them.  It is a shorthand over the existing ``calc`` and
-# ``mode`` arguments, not a new hardware select: "adaptive" means the preset
-# that sets estop_en (calc='split'), "fixed" means the one that does not
-# (calc='shift'), and "peak"/"dip" is search_mode.
-
-#: Public sweep-mode name -> the encoded values it selects.  ``calc`` and
-#: ``mode`` are the existing keyword arguments; ``search_mode`` and
-#: ``estop_en`` are the CTRL bits those end up as, and are what the
-#: machine-readable contract records.
-SWEEP_MODES = OrderedDict([
-    ("fixed_peak",    dict(calc="shift", mode="peak", search_mode=0, estop_en=0)),
-    ("fixed_dip",     dict(calc="shift", mode="dip",  search_mode=1, estop_en=0)),
-    ("adaptive_peak", dict(calc="split", mode="peak", search_mode=0, estop_en=1)),
-    ("adaptive_dip",  dict(calc="split", mode="dip",  search_mode=1, estop_en=1)),
-])
-
-#: Accepted spellings of the ``mode`` argument -> the ``search_mode`` bit.
-#: The canonical names are "peak" and "dip"; the integers are the encoded
-#: values themselves, accepted so a value round-tripped through the contract
-#: or through a status word can be handed straight back.
-MODE_ALIASES = OrderedDict([
-    ("peak", 0), ("dip", 1),
-    ("max", 0), ("min", 1),
-    (0, 0), (1, 1),
-])
-
-#: Deprecated ``sweep_mode`` spellings -> the canonical name.  Kept working so
-#: existing programs do not break; they raise a DeprecationWarning, which is
-#: silent under Python's default filters.
-SWEEP_MODE_ALIASES = OrderedDict([
-    ("grid_peak", "fixed_peak"),
-    ("grid_dip", "fixed_dip"),
-    ("early_stop_peak", "adaptive_peak"),
-    ("early_stop_dip", "adaptive_dip"),
-])
-
-
-def resolve_mode(mode):
-    """Map a ``mode`` argument to the encoded ``search_mode`` bit.
-
-    Parameters
-    ----------
-    mode : str or int
-        ``"peak"``/``"dip"`` (canonical), ``"max"``/``"min"`` (aliases), or
-        the encoded value ``0``/``1``.
-
-    Returns
-    -------
-    int
-        0 for a peak search, 1 for a dip search.
-    """
-    key = mode.lower() if isinstance(mode, str) else mode
-    if isinstance(key, bool):
-        key = int(key)
-    try:
-        return MODE_ALIASES[key]
-    except (KeyError, TypeError):
-        raise ValueError(
-            "mode must be one of %s (or the encoded value 0/1), got %r"
-            % (sorted(k for k in MODE_ALIASES if isinstance(k, str)), mode)
-        ) from None
-
-
-def resolve_sweep_mode(sweep_mode):
-    """Map a public ``sweep_mode`` name to the values it selects.
-
-    Parameters
-    ----------
-    sweep_mode : str
-        One of :data:`SWEEP_MODES`, or a deprecated alias from
-        :data:`SWEEP_MODE_ALIASES`.
-
-    Returns
-    -------
-    dict
-        ``{'calc': ..., 'mode': ..., 'search_mode': ..., 'estop_en': ...}``.
-    """
-    if not isinstance(sweep_mode, str):
-        raise ValueError(
-            "sweep_mode must be a string naming one of %s, got %r"
-            % (list(SWEEP_MODES), sweep_mode))
-    key = sweep_mode.lower()
-    if key in SWEEP_MODE_ALIASES:
-        canonical = SWEEP_MODE_ALIASES[key]
-        warnings.warn(
-            "sweep_mode=%r is a deprecated alias of %r; the behaviour is "
-            "unchanged" % (sweep_mode, canonical),
-            DeprecationWarning, stacklevel=3)
-        key = canonical
-    if key not in SWEEP_MODES:
-        raise ValueError(
-            "unknown sweep_mode %r; accepted values are %s (deprecated "
-            "aliases: %s)"
-            % (sweep_mode, list(SWEEP_MODES), list(SWEEP_MODE_ALIASES)))
-    return dict(SWEEP_MODES[key])
-
-
-def sweep_mode_name(calc, mode):
-    """The public :data:`SWEEP_MODES` name for a ``(calc, mode)`` pair.
-
-    Returns ``None`` for a combination that has no public name (a calc whose
-    preset is neither of the two the names cover).
-    """
-    bit = resolve_mode(mode)
-    for name, spec in SWEEP_MODES.items():
-        if spec["calc"] == calc and resolve_mode(spec["mode"]) == bit:
-            return name
-    return None
-
-
-# status-word bit masks the tProc tests directly, from tprocv2_assembler.py's
-# alias table (bit_qpb_rdy / bit_qpb_new) and the CTRL word used to ack.
-BIT_QPB_RDY = 0x0400
-BIT_QPB_NEW = 0x0800
-CFG_SRC_QPB = 0x05
-CTRL_CLR_QPB = 0x20_0000
-#: The internal multiply unit, as a peripheral source select and status bits.
-CFG_SRC_ARITH = 0x01
-BIT_ARITH_NEW = 0x0002
-CTRL_CLR_ARITH = 0x1_0000
-#: The ack word.  s_cfg and s_ctrl are the SAME register (s2), so acking with a
-#: bare clr_qpb would also wipe the peripheral source select and the next
-#: s_core_r1 read would return nothing.  Always rewrite the full word.
-QPB_ACK = CTRL_CLR_QPB | CFG_SRC_QPB
-#: Clear the ARITH response *and* hand the source select back to the QP2
-#: peripheral, in one write, for the same reason ``QPB_ACK`` keeps the select.
-ARITH_ACK_TO_QPB = CTRL_CLR_ARITH | CFG_SRC_QPB
-
-#: The nine forms of ``(D +/- A) * B +/- C`` the ARITH unit implements, mapped
-#: to the source registers each one needs, in ``R1..Rn`` order.
-ARITH_OPS = {
-    "T": ("A", "B"),
-    "TP": ("A", "B", "C"),
-    "TM": ("A", "B", "C"),
-    "PT": ("D", "A", "B"),
-    "MT": ("D", "A", "B"),
-    "PTP": ("D", "A", "B", "C"),
-    "PTM": ("D", "A", "B", "C"),
-    "MTP": ("D", "A", "B", "C"),
-    "MTM": ("D", "A", "B", "C"),
-}
-
-# =========================================================================
-# Accelerated-sweep planning: validation and unit conversion
-# =========================================================================
-# adaptive_sweep() is a declaration: it validates the user's physical-unit
-# parameters, converts them to the integer words the co-processor wants, and
-# records the result as a SweepPlan.  The AdaptiveSweep macro then reads the
-# plan and emits assembly.  Keeping the conversion separate from the macro
-# means the numbers a user sees in prog.get_sweep_plan(name) are exactly the
-# numbers the tProc and the IP get.
-#
-# Two frequency words per point, always.  The drive word and the readout DDC
-# word are produced by different clocks and do not scale alike, so a sweep has
-# to step both.  They are computed with the same cross-rounding idiom
-# add_pulse and add_readoutconfig use, so the words agree with the waveform
-# memory the program plays.
-
-#: Offsets inside the result block written to data memory.
-RESULT_FREQ = 0        #: best/final drive frequency word
-RESULT_START = 1       #: actual drive start word (also for winner-centered stages)
-RESULT_STATUS = 2      #: accelerator status word (only if it has a status read)
-RESULT_DIAG = 3        #: n_used, when debug=True
-RESULT_BLOCK = 4       #: words reserved per sweep
-
-#: Largest data-memory address a *literal* ``DMEM_WR [&N]`` can reach.  The
-#: address field is 11 bits, encoded signed (tprocv2_assembler.py:1320 calls
-#: ``integer2bin(..., 11)`` with the default signed flag).  Register-addressed
-#: accesses, which the staged table loop uses, are not limited this way.
-LITERAL_DMEM_MAX = 1023
-
-
-def gen_freq_word(prog, freq, gen_ch, ro_ch):
-    """The drive register word for ``freq`` MHz, matched to a readout.
-
-    Mirrors ``StandardGenManager.make_pulse`` (asm_v2.py:1974-1981), including
-    the digital-mixer offset when the generator has one.
-    """
-    gencfg = prog.soccfg["gens"][gen_ch]
-    f_dds = freq
-    if prog.ABSOLUTE_FREQS and gencfg["has_mixer"]:
-        f_dds = freq - prog.gen_chs[gen_ch]["mixer_freq"]["rounded"]
-    return int(prog.freq2reg(gen_ch=gen_ch, f=f_dds, ro_ch=ro_ch))
-
-
-def ro_freq_word(prog, freq, ro_ch, gen_ch):
-    """The readout DDC register word for ``freq`` MHz, matched to a generator.
-
-    Mirrors ``ReadoutManager.make_pulse`` (asm_v2.py:2134-2147), including the
-    mixer split and the downconversion sign flip.
-    """
-    mixer_freq = 0
-    if gen_ch is not None and prog.gen_chs[gen_ch].get("mixer_freq") is not None:
-        mixer_freq = prog.gen_chs[gen_ch]["mixer_freq"]["rounded"]
-        mixer_freq = prog.roundfreq(mixer_freq, [prog.soccfg["readouts"][ro_ch]])
-    f_dds = freq - mixer_freq if prog.ABSOLUTE_FREQS else freq
-    word = int(prog.freq2reg_adc(ro_ch=ro_ch, f=f_dds, gen_ch=gen_ch))
-    if mixer_freq:
-        word += int(prog.freq2reg_adc(ro_ch=ro_ch, f=mixer_freq))
-    if prog.FLIP_DOWNCONVERSION:
-        word *= -1
-    return word
-
-
-def _sweep_frequency_lattice(prog, gen_ch, ro_ch):
-    """Return the common DDS quantum in MHz and the two integer word steps."""
-    gencfg = prog.soccfg['gens'][gen_ch]
-    rocfg = prog.soccfg['readouts'][ro_ch]
-    gquant = int(prog.soccfg.calc_fstep_int(gencfg, [rocfg]))
-    rquant = int(prog.soccfg.calc_fstep_int(rocfg, [gencfg]))
-    quantum = Fraction(float(gencfg['f_dds'])) * gquant / (1 << gencfg['b_dds'])
-    return quantum, gquant, -rquant if prog.FLIP_DOWNCONVERSION else rquant
-
-
-def _sweep_step_words(prog, step, gen_ch, ro_ch):
-    """Round a delta's magnitude down on the shared DDS lattice, without an origin."""
-    _require(np.isfinite(step), "sweep step must be finite")
-    quantum, gquant, rquant = _sweep_frequency_lattice(prog, gen_ch, ro_ch)
-    ticks = int(Fraction(float(step)) / quantum)
-    drive = ticks * gquant
-    _require(-(1 << 31) < drive < (1 << 31),
-             "sweep step must fit a signed 32-bit drive-word delta")
-    return drive, to_s32(ticks * rquant)
-
-
-def _sweep_inward_endpoint(prog, freq, gen_ch, ro_ch, direction):
-    """Return paired words and an unwrapped drive coordinate inside a bound.
-
-    ``direction=1`` rounds a lower bound up; ``-1`` rounds an upper bound
-    down; ``0`` rounds a seed to nearest. Exact rational comparisons prevent
-    nearest rounding from putting a bound outside the requested MHz interval.
-    """
-    _require(np.isfinite(freq), "sweep frequency bounds must be finite")
-    quantum, gquant, _ = _sweep_frequency_lattice(prog, gen_ch, ro_ch)
-    gencfg = prog.soccfg['gens'][gen_ch]
-    mixer = 0.0
-    if prog.ABSOLUTE_FREQS and gencfg['has_mixer']:
-        mixer = float(prog.gen_chs[gen_ch]['mixer_freq']['rounded'])
-    coordinate = (Fraction(float(freq)) - Fraction(mixer)) / quantum
-    ticks = (-((-coordinate.numerator) // coordinate.denominator)
-             if direction > 0 else coordinate.numerator // coordinate.denominator
-             if direction < 0 else round(coordinate))
-    unwrapped = ticks * gquant
-    actual = float(Fraction(mixer) + ticks * quantum)
-
-    drive = to_s32(unwrapped % (1 << gencfg['b_dds']))
-    readout = to_s32(ro_freq_word(prog, actual, ro_ch, gen_ch))
-    return drive, readout, unwrapped
-
-
-#: The largest literal a TEST instruction encodes (24-bit signed); a loop
-#: bound past this is staged in a register instead.
-LOOP_IMM_MAX = (1 << 23) - 1
-
-
-# =========================================================================
-# Machine-readable QP2 / adaptive-sweep contract
-# =========================================================================
-# The tables above (QP2Accel / QP2Op / Field, the CTRL presets, the status
-# layout, the result-block offsets) are the authoritative Python description
-# of the encodings.  qp2_contract() serialises them, plus the few
-# adaptive-sweep facts that live outside them, into plain JSON-able data.
-#
-# IMPORTANT, and stated honestly: this is an EXPORT, not a generator.  Neither
-# Python nor the Verilog reads the JSON back; the RTL remains the hardware
-# authority and these tables remain the Python authority.  Nothing in this
-# module depends on the export existing - qp2_contract() only serialises what
-# is already here, so asm_v2.py runs identically whether or not a snapshot has
-# ever been written.  The snapshot and the checker that compares it against
-# both the tables above and the Verilog they were transcribed from live in
-# personal_files/adaptive_sweep/contract/.
-
-#: What register_bank.v decodes cfg_target (reg0[20:16]) as, and what the
-#: Adaptive_Sweep driver writes for each.
-AXI_TABLE_TARGETS = OrderedDict([
-    # targets 0 and 1 belonged to the removed gd/kw schedule LUTs
-    ("estop_threshold", 2), # the 16-bit reciprocal D
-    ("ctrl", 3),            # the CTRL word, same bits CFG_ACQ dt2 carries
-    ("block_tol", 4),
-    # target 5 held the KW patience until ABI 4
-])
-
-#: Named bits of the CTRL word.  CFG_ACQ dt2 IS this word (register_bank.v
-#: assigns ctrl from dt2_i), and the AXI target-3 write lands on the same
-#: register, so the two paths must agree bit for bit.
-CTRL_BITS = OrderedDict([
-    ("search_mode", (1, 0)),   # (width, lsb) - 0 peak / 1 dip
-    ("estop_hold", (1, 4)),    # 0 emit immediately / 1 freeze and drain
-    ("estop_en", (1, 6)),      # arm the split early stop
-    ("block_en", (1, 7)),
-    ("short_confirm", (1, 8)), # 0 doubling confirmations / 1 N+2, N+4, ...
-    ("confirm", (3, 17)),      # consecutive passing checkpoints needed
-])
-
-
-def _field_contract(f):
-    return {"name": f.name, "bits": f.bits, "lsb": f.lsb, "signed": bool(f.signed)}
-
-
-def _op_contract(op):
-    return {
-        "number": op.number,
-        "blocking": bool(op.blocking),
-        "responds": bool(op.responds),
-        "args": {k: [_field_contract(f) for f in v] for k, v in op.args.items()},
-        "resp": {k: [_field_contract(f) for f in v] for k, v in op.resp.items()},
-        "doc": " ".join(op.doc.split()),
-    }
-
-
-def _accel_contract(accel):
-    return {
-        "name": accel.name,
-        "rtl_source": accel.rtl_source,
-        "algorithms": list(accel.algorithms),
-        "calcs": list(accel.calcs),
-        "calc_ctrl": {k: dict(v) for k, v in accel.calc_ctrl.items()},
-        "gdkw_calcs": list(accel.gdkw_calcs),
-        "abi": accel.abi,
-        "ops": {m: _op_contract(op) for m, op in accel.ops.items()},
-        "status_bits": [_field_contract(f) for f in accel.status_bits],
-    }
-
-
-#: Bumped whenever the exported shape changes (not when a value changes).
-CONTRACT_VERSION = 8
-
-
-def qp2_contract():
-    """The QP2 / adaptive-sweep encodings as plain JSON-able data.
-
-    Returns
-    -------
-    dict
-        ``accelerators`` holds one entry per :data:`ACCELS` member: its opcode
-        map (numbers, per-``dt`` field names with width / lsb / signedness),
-        its response layout, its status-word layout, and its calc presets.
-        ``adaptive_sweep`` holds the facts that are not part of an opcode: the
-        CTRL bit map, the AXI table targets, the GET_DIAG payload, the public
-        sweep-mode names and what they encode to, the data-memory result
-        block, and the early-stop redirect contract with the tProcessor.
-
-    Notes
-    -----
-    This is a serialisation of the tables in this module, which were
-    transcribed from the RTL by hand.  It is a *contract*: a machine-readable
-    consistency checker, not a source of truth.  Nothing here or in the
-    Verilog consumes its output.  ``personal_files/adaptive_sweep/contract/
-    gen_contract.py`` writes the snapshot and checks it against both this
-    module and the RTL.
-    """
-    return {
-        "contract_version": CONTRACT_VERSION,
-        "generated_from": "qick_lib/qick/asm_v2.py",
-        "authority": "the RTL is the hardware authority; the Python tables in "
-                     "asm_v2.py are the software authority; this file is an "
-                     "export of the Python tables, checked against both",
-        "accelerators": {n: _accel_contract(a) for n, a in ACCELS.items()},
-        "adaptive_sweep": {
-            "ctrl_bits": {k: {"bits": w, "lsb": l}
-                          for k, (w, l) in CTRL_BITS.items()},
-            "ctrl_rtl_source": "firmware/ip/adaptive_sweep/src/register_bank.v",
-            "axi_table_targets": dict(AXI_TABLE_TARGETS),
-            "diag_fields": [_field_contract(f) for f in AS_DIAG_FIELDS],
-            "sweep_modes": {k: dict(v) for k, v in SWEEP_MODES.items()},
-            "sweep_mode_aliases": dict(SWEEP_MODE_ALIASES),
-            "mode_aliases": {str(k): v for k, v in MODE_ALIASES.items()},
-            "estop_threshold": {
-                "register_bits": 16,
-                "encoding": "D = round(1 / estop_thr)",
-                "reset_value": 64,
-                "test": "a checkpoint passes iff (|dI|+|dQ|) * D <= |SI|+|SQ|",
-                "units": "estop_thr is a dimensionless noise/signal ratio in (0, 1]",
-            },
-            "checkpoints": {
-                "grid": "candidate n = 4, 8, 16, ...; short confirmation "
-                        "also checks cumulative N+2, N+4, ... after a passing candidate",
-                "exponent_field": "k, the returned estimate's sample-count log2, reported in "
-                                  "GET_DIAG dt2 bits 7:3",
-                "cap": "1 << avg_shift shots, avg_shift clamped to 26",
-            },
-            "confirmation_policies": {
-                "enable": "CTRL bit 8 (short_confirm): 0 power_of_two, 1 short",
-                "confirm": "total passing checks required, 1 through 7",
-                "power_of_two": {
-                    "default_confirm": 2,
-                    "schedule": "N, 2N, 4N, ...",
-                    "estimate": "final confirming checkpoint",
-                    "n_min": "gates stopping; earlier passes contribute to the streak",
-                },
-                "short": {
-                    "default_confirm": 3,
-                    "schedule": "N, N+2, N+4, ...; a failed check cancels this candidate",
-                    "estimate": "saved first N samples; n_used and k describe this estimate",
-                    "n_min": "gates the first power-of-two candidate N",
-                    "block_stability": "unsupported; short_confirm and block_en cannot be combined",
-                },
-                "count_semantics": "n_used counts estimator samples, excluding extra short "
-                                   "confirmation acquisitions and discarded pipeline samples",
-            },
-            "kw_search": {
-                "opcode": "RUN_KW (9): the border search (ABI 4)",
-                "start": "CFG_WINDOW n_points >= 2: the engine measures the grid start + i*step itself; "
-                         "otherwise f_lo, x0, f_hi; all through GET_FREQ",
-                "border": "the best start point b and its neighbours lo < b < hi (b itself at a grid end)",
-                "probe": "one word per iteration inside the border: toward the higher border value, "
-                         "(span >> 1) >> k with k = flog2(dl + dr) - flog2(|dl - dr|) clamped to [0, 15], "
-                         "dl/dr = how far b sits above lo/hi; an unbalanced border (one side over 4x the "
-                         "other) probes its long side at (span >> 2) + (span >> 3); never below min_step "
-                         "while the side is at least 2*min_step",
-                "update": "a probe more than pmax >> flog2(D) above b becomes b (the old b the border on the "
-                          "other side), otherwise it becomes the border on its side",
-                "noise_gate": "seen = b more than 8 * (pmax >> flog2(D)) above the worst start point, D the "
-                              "early-stop threshold register; otherwise nothing_seen after the start",
-                "min_step": "converged when both border sides are <= min_step; plan_sweep requires "
-                            "2*min_step <= the start span",
-                "result": "converged: b moved by one more vertex step (no measurement); capped or "
-                          "nothing_seen: b",
-                "response": "dt2 = {iter[15:0], 13'd0, nothing_seen, capped, converged}, iter = probes after "
-                            "the start; GET_STATUS bit 0 = dest & nothing_seen",
-                "requires": "calc='split' with early_stop: the noise gate assumes every probe stopped on "
-                            "the threshold",
-            },
-            "block_stability": {
-                "register_bits": 32,
-                "reset_value": 0,
-                "enable": "CTRL bit 7, independent of tolerance value",
-                "test": "|SI_N-2*SI_half| + |SQ_N-2*SQ_half| <= (N/2)*block_tol",
-                "first_checkpoint": 8,
-                "units": "absolute L1 change in mean integrated I/Q words",
-                "confirmation": "odd/even and block tests must both pass before confirmation",
-            },
-            "result_block": {
-                "words": RESULT_BLOCK,
-                "freq": RESULT_FREQ,
-                "start": RESULT_START,
-                "status": RESULT_STATUS,
-                "diag": RESULT_DIAG,
-                "completion": "standard QICK external counter, not a DMEM sentinel",
-                "literal_dmem_max": LITERAL_DMEM_MAX,
-            },
-            "redirect": {
-                "name": "early-stop acquisition-abort redirect",
-                "request": "adaptive_sweep.v interrupt_o, a one-cycle pulse "
-                           "registered from ac_early_pulse AND int_en",
-                "arm_op": "REARM (opcode 11), sent once before START to arm and "
-                          "again from the landing block to release the park",
-                "destination": "the tProcessor TPROC_IPC register "
-                               "(qproc_axi_reg slv_reg9), loaded by the "
-                               "compiler with the active-stage dispatcher address",
-                "trigger_mask_op": "CFG_INTERRUPT (opcode 15), dt1 is a "
-                                   "32-bit dedicated-trigger cancellation mask",
-                "armed_when": "TPROC_IPC != 0",
-                "clock": "request and redirect use clk_core; selected output "
-                         "clear crosses into the dispatcher timing clock",
-                "doc": "personal_files/adaptive_sweep/docs/EARLY_STOP_REDIRECT.md",
-            },
-            "tproc_constants": {
-                "bit_qpb_rdy": BIT_QPB_RDY,
-                "bit_qpb_new": BIT_QPB_NEW,
-                "cfg_src_qpb": CFG_SRC_QPB,
-                "ctrl_clr_qpb": CTRL_CLR_QPB,
-                "qpb_ack": QPB_ACK,
-            },
-        },
-    }
-
-
-@dataclass
-class SweepPlan:
-    """Everything the code generator needs, in machine units.
-
-    Attributes are grouped: what the user asked for (``*_mhz``, ``avg``, ...),
-    what that became in register words (``gen_start``, ``ro_step``, ...), and
-    the algorithm-specific tables.
-    """
-
-    name: str
-    accel: QP2Accel
-    algorithm: str
-    calc: str
-    calc_fields: Dict[str, int]
-
-    gen_ch: int
-    ro_ch: int
-    pulse: str
-    ro_cfg: str
-    gen_wave: str = ""
-    ro_wave: str = ""
-
-    # grid geometry, user units
-    start_mhz: float = 0.0
-    stop_mhz: float = 0.0
-    step_mhz: float = 0.0
-    n_points: int = 0
-
-    # grid geometry, machine words
-    gen_start: int = 0
-    gen_step: int = 0
-    ro_start: int = 0
-    ro_step: int = 0
-    gen_limit: int = 0
-    ro_limit: int = 0
-    gen_span: int = 0
-    gen_direction: int = 1
-    gen_start_unwrapped: Optional[int] = None
-
-    avg: int = 1
-    avg_shift: int = 0
-    nsamp: int = 1
-    mode: int = 0
-    #: Public :data:`SWEEP_MODES` name for this (calc, mode) pair, empty for
-    #: a combination that has no public name.
-    sweep_mode: str = ""
-    trig_time: float = 0.0
-    shot_period: float = 0.0
-
-    # calc-specific
-    n0: int = 0
-    n_min: int = 0
-    emit_mode: int = 0
-    estop_thr_requested: float = 0.0
-    estop_thr: float = 0.0
-    estop_d: int = 0
-    confirm: int = 0
-    confirmation_policy: str = "power_of_two"
-    block_tol: Optional[int] = None
-    avg_requested: int = 0
-    avg_rounded: int = 0
-    dump_log: int = 0
-    log_addr: int = 0
-
-    # kw
-    x0_mhz: Optional[float] = None
-    x0: int = 0
-    ro_x0: int = 0
-    min_step_mhz: float = 0.0
-    min_step: int = 0
-    max_iter: int = 0
-    f_lo_mhz: float = 0.0
-    f_hi_mhz: float = 0.0
-    f_lo: int = 0
-    f_hi: int = 0
-
-    # readout-word tracking for the handshake path
-    ro_ratio: int = 0
-    ro_pre_shift: int = 0
-    ro_post_shift: int = 0
-    gen_base: int = 0
-    ro_base: int = 0
-
-    result_addr: int = 0
-    debug: bool = False
-    #: Set by the code generator: whether the program writes these result words
-    writes_status: bool = False
-    writes_diag: bool = False
-    count_shots: bool = False
-
-    # early-stop interrupt
-    interrupt: int = 0
-    #: Set by the code generator: label of the landing block the IPC points at
-    landing_label: Optional[str] = None
-    start_regs: Optional[Tuple[str, str]] = None
-
-    @property
-    def early_stop(self):
-        """Early retirement and processor interruption are enabled together."""
-        return bool(self.interrupt)
-
-    @property
-    def record_points(self):
-        """Whether the tProcessor writes point diagnostics to its own DMEM."""
-        return bool(self.dump_log)
-
-    @property
-    def handshake(self):
-        """True if the tProc gets each frequency through the QP2 handshake."""
-        return self.algorithm == "kw"
-
-    @property
-    def total_shots(self):
-        """Shots the tProc fires, for the fixed-schedule (grid) algorithms."""
-        if self.handshake:
-            return None
-        return self.n_points * self.avg
-
-    def freq_of_word(self, prog, word):
-        """Convert a drive register word back to MHz.
-
-        A DDS word names frequencies separated by a full DDS period. Resolve
-        that ambiguity using the requested band's inward start and sweep
-        direction, so a band crossing zero reports its negative frequencies
-        instead of their large positive aliases. Every accepted band is
-        shorter than one period. Refinement stages keep the original band
-        as their reference even when their actual start moves at runtime.
-
-        Note that the accelerator walks its grid as ``start + k*step`` in
-        register words, exactly as the tProcessor does, so the two never
-        disagree, but the realized step can differ slightly from the requested
-        MHz step. Decode that actual word spacing and restore the generator's
-        digital-mixer offset, which ``gen_freq_word`` subtracts.
-        """
-        gencfg = prog.soccfg["gens"][self.gen_ch]
-        period = 1 << gencfg['b_dds']
-        if self.gen_start_unwrapped is None:
-
-
-            coordinate = to_u32(word) % period
-        else:
-            distance = (self.gen_direction * (to_u32(word) - to_u32(self.gen_start))) % period
-            coordinate = self.gen_start_unwrapped + self.gen_direction * distance
-        freq = float(prog.soccfg.reg2freq(coordinate, gen_ch=self.gen_ch))
-        if prog.ABSOLUTE_FREQS and gencfg["has_mixer"]:
-            freq += prog.gen_chs[self.gen_ch]["mixer_freq"]["rounded"]
-        return freq
-
-    def index_of_word(self, word, start_word=None):
-        """The grid index whose drive word is ``word``, or None.
-
-        ``peak_finder`` walks ``start + k*step`` in 32-bit words, wrapping the
-        same way the tProcessor does, so the winning index is recoverable from
-        the winning word by replaying that walk.  It is *not* the ``point_idx``
-        the status word carries: that one stops at the last index visited, not
-        at the best one.  Returns None for a kw run (which revisits
-        frequencies, so a word does not name an index), for a degenerate step,
-        or for a word that is not on the grid.
-        """
-        if self.handshake or self.n_points <= 0 or self.gen_step == 0:
-            return None
-        target = to_u32(word)
-        here = to_u32(self.gen_start if start_word is None else start_word)
-        step = to_u32(self.gen_step)
-        for k in range(self.n_points):
-            if here == target:
-                return k
-            here = (here + step) & MASK32
-        return None
-
-    def describe(self):
-        """A short human-readable summary, for logging and notebooks."""
-        lines = ["adaptive_sweep '%s' on %s (%s/%s)"
-                 % (self.name, self.accel.name, self.algorithm, self.calc)]
-        if self.handshake:
-            if self.n_points >= 2:
-                lines.append("  coarse grid %.4f-%.4f MHz, %d points, step "
-                             "%.6f MHz, then the border search"
-                             % (self.start_mhz, self.stop_mhz, self.n_points,
-                                self.step_mhz))
-            else:
-                lines.append("  start f_lo %.4f / x0 %.4f / f_hi %.4f MHz, then "
-                             "the border search"
-                             % (self.f_lo_mhz, self.x0_mhz, self.f_hi_mhz))
-            lines.append("  min_step %.6f MHz (gen word %d), max_iter %d"
-                         % (self.min_step_mhz, self.min_step, self.max_iter))
-        else:
-            lines.append("  %.4f-%.4f MHz, %d points, step %.6f MHz"
-                         % (self.start_mhz, self.stop_mhz, self.n_points,
-                            self.step_mhz))
-            lines.append("  gen word %d step %d / ro word %d step %d"
-                         % (self.gen_start, self.gen_step,
-                            self.ro_start, self.ro_step))
-            lines.append("  %d shots/point -> %d shots total"
-                         % (self.avg, self.total_shots))
-        lines.append("  nsamp %d, mode %s%s, result at dmem[%d]"
-                     % (self.nsamp, "dip" if self.mode else "peak",
-                        " (%s)" % (self.sweep_mode,) if self.sweep_mode else "",
-                        self.result_addr))
-        return "\n".join(lines)
-
-
-def _require(cond, msg):
-    if not cond:
-        raise ValueError(msg)
-
-
-#: The ARITH unit is a 27x18 DSP macro: it truncates its A/D inputs to signed
-#: 27 bits and its B input to signed 18 bits, and produces a 46-bit product
-#: (firmware/ip/qick_processor/src/_qproc_ips.sv:905-908, 947-951).
-ARITH_A_BITS = 27
-ARITH_B_BITS = 18
-
-#: The ALU takes its shift amount from the low FOUR bits of the second operand
-#: (``wire [3:0] shift; assign shift = B_i[3:0];``,
-#: firmware/ip/qick_processor/src/_qproc_ips.sv:827-828).  That is a hardware
-#: truncation, so it applies to register operands too, not just to the
-#: assembler's literal check, a shift of 19 silently becomes a shift of 3.
-ALU_MAX_SHIFT = 15
-
-
-def _ratio_scaling(ratio, max_delta):
-    """Size the readout-tracking multiply for the ARITH unit.
-
-    The tProc's ALU has no multiplier, so the readout word is tracked through
-    the DSP::
-
-        ro_delta = ((gen_delta >>> pre) * ratio_word) >>> post
-
-    ``pre`` shrinks the drive delta into the DSP's 27-bit A input, and
-    ``ratio_word = round(ratio * 2**(pre+post))`` has to fit its 18-bit B
-    input.  Both shifts are chosen as small as those widths allow, which is
-    what keeps the error down: the pre-shift costs at most ``2**pre * ratio``
-    readout LSBs and the ratio rounding at most ``max_delta * 2**-(pre+post+1)``.
-
-    ``post`` is additionally constrained to ``[2, 15]``.  The upper bound is
-    the ALU's 4-bit shift field.  The lower bound is because recombining the
-    64-bit product needs the high word shifted left by ``32 - post``, which is
-    done as two shifts of at most 15 each, so ``32 - post`` must not exceed
-    30.
-
-    Returns
-    -------
-    tuple of int
-        ``(ratio_word, pre, post)``.
-    """
-    _require(ratio != 0,
-             "the readout word does not move with the drive word over this "
-             "window; check gen_ch/ro_ch")
-    pre = 0
-    while (int(max_delta) >> pre) >= (1 << (ARITH_A_BITS - 1)):
-        pre += 1
-    _require(pre <= ALU_MAX_SHIFT,
-             "the search window spans %d drive words, too wide to shrink into "
-             "the multiplier's 27-bit input with a single shift. Narrow "
-             "f_lo/f_hi, or use algorithm='grid', where both step words are "
-             "precomputed on the host." % (max_delta,))
-
-    # the ratio scale is capped so the post-shift stays inside the ALU's shift
-    # field; within that cap, take the largest scale the 18-bit B input allows
-    scale = min(ARITH_B_BITS - 1, pre + ALU_MAX_SHIFT)
-    while scale > 0 and abs(round(ratio * (1 << scale))) >= (1 << (ARITH_B_BITS - 1)):
-        scale -= 1
-    ratio_word = int(round(ratio * (1 << scale)))
-    _require(ratio_word != 0,
-             "the drive/readout word ratio %g is too small to represent in the "
-             "multiplier's 18-bit input; the readout would not track the drive"
-             % (ratio,))
-
-    post = scale - pre
-    _require(2 <= post <= ALU_MAX_SHIFT,
-             "the drive/readout word ratio %g cannot be tracked across this "
-             "search window: it needs a pre-shift of %d and leaves a "
-             "post-shift of %d, outside the ALU's usable range. Narrow "
-             "f_lo/f_hi, or use algorithm='grid', where both step words are "
-             "precomputed on the host." % (ratio, pre, post))
-    return ratio_word, pre, post
-
-
-def plan_sweep(prog, name, accel, algorithm="grid", calc=None, *,
-               gen_ch=None, ro_ch=None, pulse=None, ro_cfg=None,
-               start=None, stop=None, step=None, n_points=None,
-               avg=1, nsamp=None, mode=None, sweep_mode=None,
-               trig_time=0.0, shot_period=None,
-               n0=None, n_min=None, emit_mode=None,
-               estop_thr=None, block_tol=None,
-               x0=None, min_step=None, max_iter=None,
-               f_lo=None, f_hi=None,
-               result_addr=0, debug=False, count_shots=False,
-               dump_log=None, log_addr=None, interrupt=None,
-               early_stop=None, confirm=None, confirmation_policy=None,
-               record_points=None, points_addr=None):
-    """Validate a sweep declaration and convert it to machine units.
-
-    See :meth:`qick.asm_v2.QickProgramV2.adaptive_sweep` for the parameter
-    documentation; this function does the work behind it.
-
-    Returns
-    -------
-    SweepPlan
-    """
-    accel = get_accel(accel)
-
-    # --- public mode name --------------------------------------------------
-    # sweep_mode is shorthand over calc + mode, so resolve it before either is
-    # used.  Passing it together with a conflicting calc/mode is an error
-    # rather than a silent override.
-    if sweep_mode is not None:
-        spec = resolve_sweep_mode(sweep_mode)
-        if calc is not None and calc != spec["calc"]:
-            raise ValueError(
-                "sweep_mode=%r selects calc=%r, which contradicts the "
-                "calc=%r you passed; give one or the other"
-                % (sweep_mode, spec["calc"], calc))
-        if mode is not None and resolve_mode(mode) != resolve_mode(spec["mode"]):
-            raise ValueError(
-                "sweep_mode=%r selects mode=%r, which contradicts the "
-                "mode=%r you passed; give one or the other"
-                % (sweep_mode, spec["mode"], mode))
-        calc = spec["calc"]
-        mode = spec["mode"]
-    if mode is None:
-        mode = "peak"
-
-
-
-    if interrupt is not None:
-        warnings.warn("interrupt is deprecated; use early_stop", DeprecationWarning,
-                      stacklevel=3)
-        _require(early_stop is None or bool(early_stop) == bool(interrupt),
-                 "early_stop and interrupt disagree")
-        early_stop = bool(interrupt)
-    if early_stop is None:
-        # the KW search needs the early stop, so it is the default there
-        early_stop = (calc == "split") or (algorithm == "kw" and calc is None)
-    if early_stop:
-        _require(calc in (None, "split"), "early_stop=True requires calc='split'")
-        calc = "split"
-    else:
-        _require(calc != "split",
-                 "calc='split' enables early stopping; use early_stop=True, "
-                 "or calc='shift' for full-length averaging")
-    interrupt = bool(early_stop)
-    if record_points is not None:
-        _require(dump_log is None or bool(dump_log) == bool(record_points),
-                 "record_points and dump_log disagree")
-        dump_log = bool(record_points)
-    if points_addr is not None:
-        _require(log_addr is None or log_addr == points_addr,
-                 "points_addr and log_addr disagree")
-        log_addr = points_addr
-
-    # --- capability checks -------------------------------------------------
-    _require(algorithm != "gd",
-             "algorithm='gd' was removed with opcode-map ABI 3 (2026-10-29): "
-             "the one-sided pair x, x+c is the KW pair around x+c/2, and the "
-             "KW start measures a pair centred on x0. Use algorithm='kw'")
-    _require(algorithm in accel.algorithms,
-             "accelerator '%s' does not implement algorithm=%r; it implements "
-             "%s" % (accel.name, algorithm, list(accel.algorithms)))
-    if calc is None:
-        calc = accel.calcs[0] if len(accel.calcs) == 1 else "shift"
-    calc_fields = accel.calc_fields(calc)
-    _require(confirmation_policy in (None, "power_of_two", "short"),
-             "confirmation_policy must be None, 'power_of_two', or 'short'")
-    confirmation_policy = confirmation_policy or "power_of_two"
-    if confirmation_policy == "short":
-        _require(early_stop,
-                 "confirmation_policy='short' only applies with early_stop=True")
-        _require(accel.has_op('CFG_ACQ')
-                 and 'short_confirm' in accel.op('CFG_ACQ').field_names(),
-                 "this accelerator does not support short confirmation")
-        _require(block_tol is None,
-                 "confirmation_policy='short' does not support block_tol")
-        calc_fields['short_confirm'] = 1
-        calc_fields['confirm'] = 3
-    if block_tol is not None:
-        _require(early_stop, "block_tol only applies with early_stop=True")
-        _require(isinstance(block_tol, Integral) and not isinstance(block_tol, (bool, np.bool_))
-                 and 0 <= block_tol <= 0xFFFFFFFF,
-                 "block_tol must be an integer in [0, 4294967295]")
-        _require('block_en' in accel.op('CFG_ACQ').field_names(),
-                 "this accelerator does not support block stability checks")
-        calc_fields['block_en'] = 1
-    if confirm is not None:
-        _require(early_stop, "confirm only applies with early_stop=True")
-        _require(isinstance(confirm, Integral) and 1 <= confirm <= 7,
-                 "confirm must be an integer in [1, 7]")
-        calc_fields['confirm'] = int(confirm)
-    if algorithm == "kw":
-        _require(calc in accel.gdkw_calcs,
-                 "algorithm='kw' needs the early stop (early_stop=True, "
-                 "calc='split'), got calc=%r: the search takes its noise gate "
-                 "and tie threshold from the early-stop threshold, which "
-                 "describes a probe only when the probe stopped on it"
-                 % (calc,))
-
-    # --- channels and names ------------------------------------------------
-    _require(gen_ch is not None, "gen_ch is required")
-    _require(ro_ch is not None, "ro_ch is required")
-    _require(gen_ch in prog.gen_chs,
-             "gen_ch=%s is not declared; call declare_gen() first" % (gen_ch,))
-    _require(ro_ch in prog.ro_chs,
-             "ro_ch=%s is not declared; call declare_readout() first" % (ro_ch,))
-    _require(pulse is not None, "pulse is required: name the drive pulse "
-                                "declared with add_pulse()")
-    _require(ro_cfg is not None, "ro_cfg is required: name the readout config "
-                                 "declared with add_readoutconfig()")
-    _require(pulse in prog.pulses,
-             "pulse=%r has not been declared; add_pulse() must run before "
-             "adaptive_sweep(). Declared pulses: %s"
-             % (pulse, sorted(prog.pulses)))
-    _require(ro_cfg in prog.pulses,
-             "ro_cfg=%r has not been declared; add_readoutconfig() must run "
-             "before adaptive_sweep(). Declared: %s"
-             % (ro_cfg, sorted(prog.pulses)))
-
-    gen_waves = prog.pulses[pulse].get_wavenames()
-    ro_waves = prog.pulses[ro_cfg].get_wavenames()
-    _require(len(gen_waves) == 1,
-             "pulse=%r has %d waveforms; an accelerated sweep retunes exactly "
-             "one drive waveform, so use a single-waveform pulse style like "
-             "'const'" % (pulse, len(gen_waves)))
-    _require(len(ro_waves) == 1,
-             "ro_cfg=%r has %d waveforms, expected exactly 1" % (ro_cfg, len(ro_waves)))
-
-    gencfg = prog.soccfg["gens"][gen_ch]
-    _require("tproc_ch" in gencfg,
-             "gen_ch=%s has no tProc waveform port" % (gen_ch,))
-    _require("tproc_ctrl" in prog.soccfg["readouts"][ro_ch],
-             "ro_ch=%s is not a tProc-controlled readout, so its DDC cannot "
-             "track the drive" % (ro_ch,))
-
-    # --- shared acquisition parameters -------------------------------------
-    avg = int(avg)
-    _require(avg >= 1, "avg must be >= 1, got %d" % (avg,))
-    if nsamp is None:
-        nsamp = int(prog.ro_chs[ro_ch]["length"])
-    nsamp = int(nsamp)
-    _require(nsamp >= 1,
-             "nsamp must be >= 1; it is the number of raw ADC samples folded "
-             "per shot, and defaults to the declared readout window")
-    mode_bit = resolve_mode(mode)
-    _require(not debug or accel.has_op("GET_DIAG"),
-             "debug=True asks for the diagnostic counters, but accelerator "
-             "'%s' has no diagnostic read" % (accel.name,))
-
-    if shot_period is None:
-        ro_len_us = prog.ro_chs[ro_ch]["length"] / prog.soccfg["readouts"][ro_ch]["f_output"]
-        shot_period = trig_time + ro_len_us + 1.0
-    ro_len_us = prog.ro_chs[ro_ch]["length"] / prog.soccfg["readouts"][ro_ch]["f_output"]
-    _require(shot_period > trig_time + ro_len_us,
-             "shot_period (%g us) must exceed trig_time + readout length "
-             "(%g us), or shots would overlap"
-             % (shot_period, trig_time + ro_len_us))
-
-    plan = SweepPlan(
-        name=name, accel=accel, algorithm=algorithm, calc=calc,
-        calc_fields=calc_fields, gen_ch=gen_ch, ro_ch=ro_ch, pulse=pulse,
-        confirmation_policy=confirmation_policy,
-        ro_cfg=ro_cfg, gen_wave=gen_waves[0], ro_wave=ro_waves[0],
-        avg=avg, nsamp=nsamp, mode=mode_bit,
-        trig_time=trig_time, shot_period=shot_period,
-        result_addr=int(result_addr), debug=bool(debug),
-        count_shots=bool(count_shots),
-        interrupt=1 if interrupt else 0,
-        sweep_mode=sweep_mode_name(calc, mode_bit) or "",
-    )
-
-    if interrupt:
-        _require(accel.has_op('REARM'),
-                 "accelerator '%s' has no REARM op, so it cannot be told when "
-                 "the readout pipe has drained; interrupt=True needs one"
-                 % (accel.name,))
-        _require(calc_fields.get("estop_en", 0) == 1,
-                 "interrupt=True only does something for an early-stopping "
-                 "calc (one whose preset sets estop_en, i.e. 'split'): with "
-                 "calc=%r every point runs to avg shots and there is nothing "
-                 "to abort" % (calc,))
-        rocfg = prog.soccfg['readouts'][ro_ch]
-        _require(rocfg['trigger_type'] in ('trig', 'tport'),
-                 "early_stop currently requires a dedicated trigger port; "
-                 "shared digital-port triggers cannot be selectively cancelled")
-        _require(0 <= rocfg['trigger_port'] < 32,
-                 "early_stop trigger_port must fit the 32-bit cancellation mask")
-
-    def gw(f):
-        return to_s32(gen_freq_word(prog, f, gen_ch, ro_ch))
-
-    def rw(f):
-        return to_s32(ro_freq_word(prog, f, ro_ch, gen_ch))
-
-    # --- grid geometry -----------------------------------------------------
-    _require(start is not None, "start (MHz) is required")
-    _require(np.isfinite(start), "start must be finite")
-    stop_supplied = stop is not None
-    step_supplied = step is not None
-    count_supplied = n_points is not None
-    if stop_supplied:
-        _require(np.isfinite(stop), "stop must be finite")
-    if step_supplied:
-        _require(np.isfinite(step) and step != 0, "step must be finite and nonzero")
-    kw_grid = algorithm == "kw" and x0 is None
-    if algorithm == "grid" or kw_grid:
-        _require(stop is not None or (step is not None and n_points is not None),
-                 "give stop=, or both step= and n_points=")
-        if count_supplied:
-            _require(isinstance(n_points, Integral) and n_points > 0,
-                     "n_points must be a positive integer")
-            n_points = int(n_points)
-        if not count_supplied:
-            _require(step is not None, "step is required when n_points is not given")
-            ratio = ((Fraction(str(float(stop))) - Fraction(str(float(start))))
-                     / Fraction(str(float(step))))
-            _require(ratio >= 0, "step must point from start toward stop")
-            n_points = ratio.numerator // ratio.denominator + 1
-        elif step is None:
-            _require(stop is not None, "give stop= or step=")
-            _require(n_points > 1,
-                     "n_points must be > 1 when the step is derived from "
-                     "start/stop")
-            step = (stop - start) / (n_points - 1)
-            _require(step != 0, "start and stop must differ for a multi-point grid")
-        elif stop_supplied:
-            distance = Fraction(str(float(stop))) - Fraction(str(float(start)))
-            delta = Fraction(str(float(step)))
-            _require(distance * delta >= 0,
-                     "step must point from start toward stop")
-            _require(abs(delta) * (n_points - 1) <= abs(distance),
-                     "n_points and step exceed the requested start/stop range")
-        n_points = int(n_points)
-        # the field is as wide as the RTL slice (register_bank.v keeps
-        # dt3_i[15:0] on adaptive_sweep), and peak_finder runs a count of 0
-        # as one point, so an oversized request must be rejected, not packed
-        n_field = [f for word in accel.op("CFG_WINDOW").args.values()
-                   for f in word if f.name == "n_points"][0]
-        _require(1 <= n_points <= n_field.mask,
-                 "n_points must be in [1, %d] on accelerator '%s' (its "
-                 "CFG_WINDOW n_points field is %d bits wide), got %d"
-                 % (n_field.mask, accel.name, n_field.bits, n_points))
-        if stop is None:
-            stop = start + step * (n_points - 1)
-        if kw_grid:
-            _require(n_points >= 2,
-                     "a kw search starting from a grid needs at least two "
-                     "points (got %d); give x0= to start from f_lo, x0, f_hi"
-                     % (n_points,))
-            _require(step > 0,
-                     "a kw coarse grid must run upward in drive words without "
-                     "wrapping (start < stop, step > 0)")
-    else:
-        _require(stop is not None and start < stop,
-                 "kw requires start < stop")
-        _require(step is None and n_points is None,
-                 "a kw search started from x0 has no grid: drop step= and "
-                 "n_points= (or drop x0= to start from the coarse grid "
-                 "start..stop / step)")
-        step = stop - start
-        n_points = 0
-
-    plan.start_mhz = float(start)
-    plan.stop_mhz = float(stop)
-    plan.step_mhz = float(step)
-    plan.n_points = n_points
-    plan.gen_direction = 1 if step > 0 else -1
-    plan.gen_start, plan.ro_start, first_coordinate = _sweep_inward_endpoint(
-        prog, start, gen_ch, ro_ch, plan.gen_direction)
-    plan.gen_start_unwrapped = first_coordinate
-    plan.gen_limit, plan.ro_limit, last_coordinate = _sweep_inward_endpoint(
-        prog, stop, gen_ch, ro_ch, -plan.gen_direction)
-    plan.gen_span = plan.gen_direction * (last_coordinate - first_coordinate)
-    _require(plan.gen_span >= 0 or not stop_supplied,
-             "the requested range contains no frequency on the shared DDS lattice")
-    plan.gen_step, plan.ro_step = _sweep_step_words(prog, step, gen_ch, ro_ch)
-    if (algorithm == 'grid' or kw_grid) and stop_supplied and n_points > 1:
-
-
-
-        _, gquant, rquant = _sweep_frequency_lattice(prog, gen_ch, ro_ch)
-        ticks = min(abs(plan.gen_step) // gquant,
-                    plan.gen_span // ((n_points - 1) * gquant))
-        plan.gen_step = plan.gen_direction * ticks * gquant
-        plan.ro_step = to_s32(plan.gen_direction * ticks * rquant)
-    _require(plan.gen_step != 0,
-             "step=%g MHz rounds to a zero drive-word step; the sweep would "
-             "never move" % (step,))
-    if not stop_supplied:
-
-
-        plan.gen_limit = to_s32(plan.gen_start + (n_points - 1) * plan.gen_step)
-        plan.ro_limit = to_s32(plan.ro_start + (n_points - 1) * plan.ro_step)
-        plan.gen_span = (n_points - 1) * abs(plan.gen_step)
-    _require(plan.gen_span < (1 << gencfg['b_dds']),
-             "the drive DDS wraps inside start/stop (the range spans a full "
-             "DDS period); narrow the search window")
-
-    # The accelerator walks the grid in 32-bit arithmetic and the tProcessor
-    # steps the waveform register the same way, so a 32-bit wrap is harmless --
-    # both sides wrap identically and the generator plays the wrapped word.
-    # A generator narrower than 32 bits is different: there the generator wraps
-    # but the accelerator does not, so its reported word would decode to a
-    # frequency the tone never played.
-    b_dds = gencfg["b_dds"]
-    if b_dds < 32 and (algorithm == "grid" or kw_grid):
-        ends = (plan.gen_start, plan.gen_start + (n_points - 1) * plan.gen_step)
-        _require(0 <= min(ends) and max(ends) < (1 << b_dds),
-                 "the sweep runs from drive word %d to %d, outside this "
-                 "generator's %d-bit DDS range; the accelerator would report a "
-                 "frequency the tone never played. Narrow the band."
-                 % (min(ends), max(ends), b_dds))
-
-    # The accelerator's cap is a power of two by construction: shot_counter
-    # tests bit avg_shift of the shot number, so the cap IS 1 << avg_shift and
-    # CFG_WINDOW carries the exponent.  This holds for every calc, not just the
-    # early-stopping one, because the cap comes from the same counter.  A
-    # request that is not a power of two is rounded UP, never down - the caller
-    # asked for at least that many shots - and plan.avg is retargeted with it so
-    # the tProcessor's shot loop and the IP's cap stay the same number.
-    plan.avg_requested = avg
-    exponent_cap = 'avg_shift' in accel.op('CFG_WINDOW').field_names()
-    if exponent_cap and avg & (avg - 1):
-        rounded = 1 << avg.bit_length()
-        warnings.warn(
-            "avg=%d is not a power of two; the accelerator's shot cap is "
-            "1 << avg_shift, so it was rounded UP to %d (+%d shots per "
-            "point). plan.avg_requested keeps what you asked for, and "
-            "plan.avg_rounded flags that this happened."
-            % (avg, rounded, rounded - avg), stacklevel=3)
-        avg = rounded
-        plan.avg = rounded
-        plan.avg_rounded = 1
-    plan.avg_shift = avg.bit_length() - 1
-    _require(not exponent_cap or plan.avg_shift <= 26,
-             "avg=%d needs avg_shift=%d, above the 26 that shot_counter "
-             "clamps to (its cap tops out at 2**26 = %d shots)"
-             % (avg, plan.avg_shift, 1 << 26))
-
-    # --- calc-specific -----------------------------------------------------
-    if calc == "welford":
-        warnings.warn(
-            "calc='welford' is a deprecated alias of calc='shift': the Welford "
-            "running-mean pipeline was removed from adaptive_sweep on "
-            "2026-08-24, both presets configure the same datapath, and n0 "
-            "only drives the warmup_done status bit",
-            DeprecationWarning, stacklevel=3)
-        _require(n0 is not None,
-                 "calc='welford' needs n0= (the warmup shot count)")
-        _require(1 <= int(n0) <= avg,
-                 "n0 must be in [1, avg]=[1, %d], got %s" % (avg, n0))
-        plan.n0 = int(n0)
-    elif n0 is not None:
-        raise ValueError("n0 only applies to calc='welford'")
-
-    if calc == "split":
-        _require(avg <= 1 << 31,
-                 "avg=%d exceeds 2^31, the most the tProc's 32-bit shot "
-                 "loop can count" % (avg,))
-        # The stop test is |dI|+|dQ| <= estop_thr * (|SI|+|SQ|).  The IP does
-        # not hold the ratio, it holds the integer reciprocal
-        # D = round(1/estop_thr) in a 16-bit AXI register, and compares
-        # (|dI|+|dQ|)*D against |SI|+|SQ| - so any ratio is reachable, not
-        # just the powers of two the old CTRL shift could express, and the
-        # value that actually decides is 1/D.  It lives in a register rather
-        # than the program image so a threshold sweep needs no rebuild: write
-        # it with Adaptive_Sweep.set_estop_thr() (or load_tables(plan)).
-        req = 1.0 / 64 if estop_thr is None else float(estop_thr)
-        _require(0.0 < req <= 1.0,
-                 "estop_thr is a noise/signal ratio and must be in (0, 1], "
-                 "got %s" % (estop_thr,))
-        d = int(round(1.0 / req))
-        _require(d <= 0xFFFF,
-                 "estop_thr=%g needs D=round(1/thr)=%d, past the 16-bit "
-                 "threshold register's 65535; the finest threshold the "
-                 "register can express is %g" % (req, d, 1.0 / 0xFFFF))
-        _require(algorithm != "kw" or d >= 16,
-                 "estop_thr=%g gives D=%d, but the kw search needs D >= 16 "
-                 "(estop_thr <= 1/16): it calls the line seen only when the best "
-                 "start point beats the worst by 8 * (pmax >> lead(D)), which is "
-                 "pmax or more for D < 8 and about pmax for D < 16, so the "
-                 "search would always end nothing_seen" % (req, d))
-        plan.estop_thr_requested = req
-        plan.estop_d = d
-        plan.estop_thr = 1.0 / d
-        if abs(plan.estop_thr - req) > 0.01 * req:
-            warnings.warn(
-                "estop_thr=%g is not representable: D must be an integer, so "
-                "the realized threshold is 1/%d = %g, %.1f%% away from what "
-                "you asked for. Steps are coarse near thr=1 and fine below "
-                "thr=0.01; a threshold of the form 1/D is always exact."
-                % (req, d, plan.estop_thr,
-                   100.0 * abs(plan.estop_thr - req) / req), stacklevel=3)
-        # n_min is an eligibility floor, not an epoch index: any value is
-        # legal. It gates stopping in power_of_two mode, or the saved first
-        # candidate in short mode. 0 makes every checkpoint eligible.
-        plan.n_min = 0 if n_min is None else int(n_min)
-        _require(0 <= plan.n_min <= avg,
-                 "n_min=%s exceeds avg=%d, so the early stop could never fire "
-                 "and every point would run to the cap" % (n_min, avg))
-        _require(emit_mode in (None, "immediate"),
-                 "early_stop interrupts the shot loop and requires immediate emission; "
-                 "use early_stop=False for a fixed-shot comparison")
-        plan.emit_mode = 0
-        plan.confirm = plan.calc_fields.get("confirm", 0)
-        plan.block_tol = None if block_tol is None else int(block_tol)
-        # Power-of-two mode checks at 4, 8, ..., avg/2 (never at the cap) and
-        # stops at the checkpoint that completes `confirm` consecutive passes.
-        # The odd/even test can first pass at 4; the block test needs the
-        # previous checkpoint, so it can first pass at 8. The earliest stop is
-        # therefore 4 << (confirm - 1), or 8 << (confirm - 1) with block_tol,
-        # raised to the first power of two at or above n_min.
-        if (plan.calc_fields.get("estop_en") and confirmation_policy == "power_of_two"
-                and exponent_cap):
-            first = 8 if block_tol is not None else 4
-            earliest = max(first << (max(plan.confirm, 1) - 1),
-                           1 << max(plan.n_min - 1, 0).bit_length())
-            _require(earliest <= avg // 2,
-                     "the early stop can never fire: with confirm=%d%s%s the "
-                     "earliest stop is at %d shots, but checkpoints only run "
-                     "up to avg/2 = %d. Use avg >= %d%s."
-                     % (max(plan.confirm, 1),
-                        ", block_tol" if block_tol is not None else "",
-                        ", n_min=%d" % plan.n_min if plan.n_min else "",
-                        earliest, avg // 2, 2 * earliest,
-                        " or a smaller confirm" if plan.confirm > 1 else ""))
-    else:
-        _require(n_min is None, "n_min only applies to calc='split'")
-        _require(emit_mode is None, "emit_mode only applies to calc='split'")
-        _require(estop_thr is None, "estop_thr only applies to calc='split'")
-
-    # --- kw ----------------------------------------------------------------
-    if plan.handshake:
-        _require(accel.has_op("GET_FREQ"),
-                 "accelerator '%s' has no GET_FREQ handshake" % (accel.name,))
-
-        if kw_grid:
-            # the engine walks the grid first; its span is the window the
-            # border search stays inside, and the first probe is the grid start
-            _require(f_lo is None and f_hi is None,
-                     "f_lo/f_hi only apply to a kw search started from x0; a "
-                     "search from the coarse grid stays inside the grid")
-            last = to_s32(plan.gen_start + (n_points - 1) * plan.gen_step)
-            _require(plan.gen_step > 0 and to_u32(plan.gen_start) < to_u32(last),
-                     "a kw coarse grid must run upward in drive words without "
-                     "wrapping (start < stop, step > 0)")
-            plan.f_lo, plan.f_hi = plan.gen_start, last
-            plan.f_lo_mhz = plan.freq_of_word(prog, plan.gen_start)
-            plan.f_hi_mhz = plan.freq_of_word(prog, last)
-            plan.x0_mhz, plan.x0, plan.ro_x0 = plan.start_mhz, plan.gen_start, plan.ro_start
-        else:
-            f_lo = start if f_lo is None else f_lo
-            f_hi = stop if f_hi is None else f_hi
-            _require(np.isfinite(f_lo) and np.isfinite(f_hi),
-                     "f_lo and f_hi must be finite")
-            _require(f_lo < f_hi,
-                     "f_lo (%g MHz) must be below f_hi (%g MHz)" % (f_lo, f_hi))
-            _require(start <= f_lo < f_hi <= stop,
-                     "f_lo/f_hi must stay inside the requested start/stop range")
-            plan.f_lo_mhz, plan.f_hi_mhz = float(f_lo), float(f_hi)
-            plan.f_lo, low_readout, low_coordinate = _sweep_inward_endpoint(
-                prog, f_lo, gen_ch, ro_ch, 1)
-            plan.f_hi, high_readout, high_coordinate = _sweep_inward_endpoint(
-                prog, f_hi, gen_ch, ro_ch, -1)
-            _require(low_coordinate < high_coordinate,
-                     "f_lo/f_hi must contain at least two shared DDS frequencies")
-            _require(to_u32(plan.f_lo) < to_u32(plan.f_hi),
-                     "f_lo and f_hi map to drive words %d and %d, which are not in "
-                     "increasing order; the engine compares unsigned words, so "
-                     "the window must not wrap" % (plan.f_lo, plan.f_hi))
-            _require(np.isfinite(x0), "x0 must be finite")
-            _require(f_lo < x0 < f_hi,
-                     "x0=%g MHz must lie strictly inside the search window "
-                     "(%g, %g) MHz" % (x0, f_lo, f_hi))
-            plan.x0_mhz = float(x0)
-            plan.x0, plan.ro_x0, seed_coordinate = _sweep_inward_endpoint(
-                prog, x0, gen_ch, ro_ch, 0)
-            _require(low_coordinate < seed_coordinate < high_coordinate,
-                     "x0=%g MHz rounds onto a window edge; move it inside"
-                     % (x0,))
-
-        _require(min_step is not None,
-                 "kw needs min_step= (MHz): the search converges once the "
-                 "border is within min_step on both sides of the best point")
-        _require(np.isfinite(min_step) and min_step > 0,
-                 "min_step must be finite and positive")
-        plan.min_step_mhz = float(min_step)
-        plan.min_step = _sweep_step_words(prog, min_step, gen_ch, ro_ch)[0]
-        _require(plan.min_step > 0,
-                 "min_step=%g MHz rounds to a zero drive-word step" % (min_step,))
-        _require(2 * plan.min_step <= to_u32(plan.f_hi) - to_u32(plan.f_lo),
-                 "min_step=%g MHz is more than half the search window "
-                 "[%g, %g] MHz: the border would be converged before the "
-                 "first probe" % (min_step, plan.f_lo_mhz, plan.f_hi_mhz))
-
-        _require(max_iter is not None, "kw needs max_iter=")
-        _require(1 <= int(max_iter) < (1 << 16),
-                 "max_iter must be in [1, 65535], got %s" % (max_iter,))
-        plan.max_iter = int(max_iter)
-
-        # Readout tracking: the engine reports only the drive word, so the
-        # tProc derives the readout word from it.  Anchor at the middle of the
-        # window, which halves the largest delta the multiplier has to take.
-        f_mid = 0.5 * (plan.f_lo_mhz + plan.f_hi_mhz)
-        plan.gen_base = gw(f_mid)
-        plan.ro_base = rw(f_mid)
-
-
-
-        rocfg = prog.soccfg["readouts"][ro_ch]
-        ratio = ((gencfg["f_dds"] / rocfg["f_dds"])
-                 * 2.0 ** (rocfg["b_dds"] - gencfg["b_dds"]))
-        if prog.FLIP_DOWNCONVERSION:
-            ratio = -ratio
-
-
-
-        base = to_u32(plan.gen_base)
-        _require(plan.f_hi_mhz - plan.f_lo_mhz < gencfg["f_dds"]
-                 and to_u32(plan.f_lo) <= base <= to_u32(plan.f_hi),
-                 "the drive DDS wraps inside f_lo/f_hi; narrow the search window")
-        deltas = [to_u32(word) - base for word in (plan.f_lo, plan.f_hi)]
-        _require(all(-(1 << 31) <= delta < (1 << 31) for delta in deltas),
-                 "the search window needs drive deltas outside signed 32-bit "
-                 "range; narrow f_lo/f_hi")
-        max_delta = max(abs(to_s32(word - plan.gen_base))
-                        for word in (plan.f_lo, plan.f_hi))
-        plan.ro_ratio, plan.ro_pre_shift, plan.ro_post_shift = _ratio_scaling(
-            ratio, max_delta)
-    else:
-        for label, value in (("x0", x0), ("min_step", min_step),
-                             ("max_iter", max_iter),
-                             ("f_lo", f_lo), ("f_hi", f_hi)):
-            _require(value is None,
-                     "%s only applies to algorithm='kw'" % (label,))
-
-    # --- stop-log dump -----------------------------------------------------
-    if dump_log is None:
-        dump_log = (algorithm == "grid"
-                    and calc_fields.get("reduce_sel") == 3
-                    and bool(plan.interrupt)
-                    and accel.has_op("GET_DIAG"))
-    plan.dump_log = 1 if dump_log else 0
-    if plan.dump_log:
-        _require(algorithm == "grid",
-                 "dump_log applies to grid sweeps; a kw run revisits "
-                 "frequencies, so it has no grid index to file a stop under")
-        _require(calc_fields.get("reduce_sel") == 3
-                 and accel.has_op("GET_DIAG"),
-                 "dump_log needs a mean32 calc (split): only its points stop "
-                 "early, and only an early stop raises the interrupt that "
-                 "records one")
-        _require(plan.interrupt,
-                 "dump_log needs interrupt=True. The log is not a buffer "
-                 "inside the accelerator any more - it is written by the "
-                 "tProcessor's interrupt handler, one word at "
-                 "dmem[log_addr + point]. In drain mode the tProcessor is "
-                 "never told that a point stopped, so there is nothing to "
-                 "record.")
-        base = log_addr
-        if base is None:
-            base = plan.result_addr + RESULT_BLOCK
-        plan.log_addr = int(base)
-        _require(plan.log_addr >= plan.result_addr + RESULT_BLOCK
-                 or plan.log_addr + plan.n_points <= plan.result_addr,
-                 "the stop-log dump at %d would overlap the result block at "
-                 "%d" % (plan.log_addr, plan.result_addr))
-        limit = prog.tproccfg["dmem_size"]
-        _require(0 <= plan.log_addr
-                 and plan.log_addr + plan.n_points <= limit,
-                 "the stop-log dump needs %d words at address %d, past the "
-                 "end of data memory (%d)"
-                 % (plan.n_points, plan.log_addr, limit))
-    else:
-        _require(log_addr is None, "log_addr only applies with dump_log")
-
-    _require(plan.result_addr >= 0, "result_addr must be >= 0")
-    # the result block is written with literal DMEM_WR addresses, and a literal
-    # data-memory address encodes in 11 signed bits
-    # (tprocv2_assembler.py:1320), so it is capped well below dmem_size
-    limit = min(LITERAL_DMEM_MAX + 1, prog.tproccfg["dmem_size"])
-    _require(plan.result_addr + RESULT_BLOCK <= limit,
-             "result_addr=%d leaves no room for the %d-word result block: a "
-             "literal data-memory address is 11-bit signed, so the block must "
-             "end by address %d (this tProc's data memory is %d words, but "
-             "only the first %d are reachable by literal address)"
-             % (plan.result_addr, RESULT_BLOCK, limit,
-                prog.tproccfg["dmem_size"], limit))
-
-    # --- collisions with sweeps already declared in this program -----------
-    _check_no_overlap(prog, plan)
-    return plan
-
-
-def _blocks(plan):
-    """The data-memory ranges a plan writes, as ``(start, stop, what)``."""
-    out = [(plan.result_addr, plan.result_addr + RESULT_BLOCK, "result block")]
-    if plan.dump_log:
-        out.append((plan.log_addr, plan.log_addr + plan.n_points,
-                    "stop-log dump"))
-    return out
-
-
-def _check_no_overlap(prog, plan):
-    """Reject a sweep whose data memory collides with an earlier one.
-
-    ``result_addr`` defaults to 0, so two sweeps in one program silently
-    overwrite each other's answers unless the second one is given an address.
-    """
-    for other in getattr(prog, "_sweep_plans", {}).values():
-        if other.name == plan.name:
-            continue
-        for lo, hi, what in _blocks(plan):
-            for olo, ohi, owhat in _blocks(other):
-                _require(hi <= olo or ohi <= lo,
-                         "sweep %r puts its %s at data-memory [%d, %d) which "
-                         "overlaps sweep %r's %s at [%d, %d); give one of them "
-                         "a different result_addr"
-                         % (plan.name, what, lo, hi, other.name, owhat,
-                            olo, ohi))
-
 
 # user units, multi-dimension
 class QickParam:
@@ -2621,24 +611,19 @@ class IncReg(Macro):
         return insts
 
 class AluReg(Macro):
-    """Write the result of a general ALU operation into a register.
-
-    ``WriteReg`` copies and ``IncReg`` adds in place; this covers the rest of
-    the ALU, with an arbitrary destination.
-    """
+    # write the result of an operation on a register and a literal or register to a register
     # dst, arg1, op, arg2
     def expand(self, prog):
         insts = []
         dst = prog._get_reg(self.dst)
         arg1 = prog._get_reg(self.arg1)
-        if self.op is None:
-            return [AsmInst(inst={'CMD':"REG_WR", 'DST': dst, 'SRC':'op', 'OP': arg1}, addr_inc=1)]
         if isinstance(self.arg2, Integral):
-            # operation immediates are 24-bit; anything wider goes via scratch
+            # immediate arguments to operations must be 24-bit
             if check_bytes(self.arg2, 3):
                 arg2 = '#%d'%(self.arg2)
             else:
-                trunc = int(np.int64(self.arg2).astype(np.int32))
+                # constrain the value to signed 32-bit
+                trunc = np.int64(self.arg2).astype(np.int32)
                 prog.add_reg("scratch", allow_reuse=True)
                 insts.append(WriteReg(dst="scratch", src=trunc))
                 arg2 = prog._get_reg("scratch")
@@ -2646,59 +631,7 @@ class AluReg(Macro):
             arg2 = prog._get_reg(self.arg2)
         else:
             raise RuntimeError(f"invalid arg2: {self.arg2}")
-        insts.append(AsmInst(inst={'CMD':"REG_WR", 'DST': dst, 'SRC':'op', 'OP':'%s %s %s'%(arg1, self.op, arg2)}, addr_inc=1))
-        return insts
-
-class Arith(Macro):
-    """One ``ARITH`` instruction: a DSP multiply-accumulate.
-
-    The unit computes ``(D +/- A) * B +/- C`` and parks a 64-bit result inside
-    the peripheral.  Reading it means pointing the peripheral source select at
-    ARITH and reading ``s_core_r1`` (low) and ``s_core_r2`` (high), the same
-    registers the custom peripheral uses, so the two cannot be in flight at
-    once.
-    """
-    # op, r1, r2, r3, r4
-    def expand(self, prog):
-        if self.op not in ARITH_OPS:
-            raise ValueError("unknown ARITH operation %r; the unit implements %s"
-                             % (self.op, sorted(ARITH_OPS)))
-        inst = {'CMD': 'ARITH', 'C_OP': self.op}
-        for key, reg in (('R1', self.r1), ('R2', self.r2),
-                         ('R3', self.r3), ('R4', self.r4)):
-            if reg is not None:
-                inst[key] = prog._get_reg(reg)
-        return [AsmInst(inst=inst, addr_inc=1)]
-
-class LoopBack(Macro):
-    """Test a counter and jump back to a label, incrementing on the way.
-
-    The tail of a counted loop, in two instructions, the same form
-    ``CloseLoop`` uses, but for a loop this library builds internally rather
-    than one the user opened.
-
-    ``last`` is an int compared as a literal, or a register name for bounds
-    past the 24-bit signed TEST immediate (2^23 - 1).
-    """
-    # label, reg, last
-    def expand(self, prog):
-        insts = []
-        reg = prog._get_reg(self.reg)
-        big_pmem = prog.tproccfg['pmem_size'] > 2**11
-        if big_pmem:
-            # NOTE: to jump to address > 11bits, use s_addr/s15 reg
-            insts.append(WriteLabel(label=self.label))
-        if isinstance(self.last, str):
-            lim = prog._get_reg(self.last)
-            insts.append(AsmInst(inst={'CMD':'TEST', 'OP':'%s - %s'%(reg, lim)}, addr_inc=1))
-        else:
-            insts.append(AsmInst(inst={'CMD':'TEST', 'OP':'%s - #%d'%(reg, self.last)}, addr_inc=1))
-        jump = {'CMD':'JUMP', 'IF':'NZ', 'WR':'%s op'%(reg), 'OP':'%s + #1'%(reg)}
-        if big_pmem:
-            jump['ADDR'] = 's15'
-        else:
-            jump['LABEL'] = self.label
-        insts.append(AsmInst(inst=jump, addr_inc=1))
+        insts.append(AsmInst(inst={'CMD':"REG_WR", 'DST': dst, 'SRC':'op', 'OP': '%s %s %s'%(arg1, self.op, arg2)}, addr_inc=1))
         return insts
 
 class ReadWmem(Macro):
@@ -2808,672 +741,41 @@ class CondJump(Macro):
             insts.append(AsmInst(inst={'CMD': 'JUMP', 'IF': self.test, 'LABEL': self.label}, addr_inc=1))
         return insts
 
-# QP2 custom peripheral (the "PB" bus)
+# peripherals
 
 class PeriphB(Macro):
-    """One raw ``PB`` instruction, optionally followed by the mandatory NOP.
-
-    ``PB`` takes four register operands and no immediates.  R1/R2 are encoded
-    as "src_data" and R3/R4 as "src_addr" (tprocv2_assembler.py:154-172); all
-    four become ``qtag_dt1_i`` .. ``qtag_dt4_i`` at the peripheral.
-
-    The peripheral latches on the rising edge of its enable, so two ``PB``
-    instructions back to back would be seen as one; a NOP between them is
-    required.  Emitting it here (rather than leaving it to the caller) makes
-    that impossible to forget.
-    """
-    # op, r1, r2, r3, r4, nop
+    # send a command to the QPeriphB peripheral, using int literals or registers for its four data words
+    # op, args
     def expand(self, prog):
-        op = int(self.op)
-        if not 0 <= op <= 31:
-            raise ValueError("PB opcode must be in [0, 31], got %d" % (op))
-        # C_OP is parsed with int(s, 10), so it must be a decimal string
-        # (tprocv2_assembler.py:286)
-        inst = {'CMD': 'PB', 'C_OP': str(op)}
-        for key, reg in (('R1', self.r1), ('R2', self.r2),
-                         ('R3', self.r3), ('R4', self.r4)):
-            regname = prog._get_reg(reg)
-            if key in ('R3', 'R4') and regname.startswith('w'):
-                raise ValueError(
-                    "PB operand %s is an address-type operand and can't be a "
-                    "waveform register (got %s); use R1/R2 for w-registers"
-                    % (key, regname))
-            inst[key] = regname
-        insts = [AsmInst(inst=inst, addr_inc=1)]
-        if self.nop:
-            insts.append(AsmInst(inst={'CMD': 'NOP'}, addr_inc=1))
-        return insts
-
-class PeriphBOp(Macro):
-    """A named accelerator operation: stage the dt words, then issue the PB.
-
-    The four 32-bit ``dt`` words are packed from named fields by
-    :func:`pack_op`, written into scratch registers, and handed
-    to a :class:`PeriphB`.  Words that pack to zero use the hardwired ``s_zero``
-    register instead of burning an instruction.
-    """
-    # accel, mnemonic, values, nop
-    def expand(self, prog):
-        accel = get_accel(self.accel)
-        op, words = pack_op(accel, self.mnemonic, **self.values)
         insts = []
-        operands = []
-        for i, word in enumerate(words):
-            if word == 0:
-                operands.append('s_zero')
-                continue
-            name = 'qp2_dt%d' % (i + 1)
-            prog.add_reg(name, allow_reuse=True)
-            # REG_WR immediates are encoded as signed 32-bit
-            # (tprocv2_assembler.py:280-292), so present the word that way
-            insts.append(WriteReg(dst=name, src=to_s32(word)))
-            operands.append(name)
-        insts.append(PeriphB(op=op, r1=operands[0], r2=operands[1],
-                             r3=operands[2], r4=operands[3], nop=self.nop))
+        regs = []
+        for i, arg in enumerate(self.args):
+            if isinstance(arg, str):
+                regs.append(prog._get_reg(arg))
+            elif isinstance(arg, Integral):
+                if arg == 0:
+                    regs.append('s0')
+                else:
+                    # the instruction only takes registers, so a literal is written to a register first
+                    # constrain the value to signed 32-bit
+                    trunc = np.int64(arg).astype(np.int32)
+                    name = prog.add_reg("qpb_dt%d"%(i+1), allow_reuse=True)
+                    insts.append(WriteReg(dst=name, src=trunc))
+                    regs.append(prog._get_reg(name))
+            else:
+                raise RuntimeError(f"invalid arg: {arg}")
+        insts.append(AsmInst(inst={'CMD':'PB', 'C_OP':str(self.op), 'R1':regs[0], 'R2':regs[1], 'R3':regs[2], 'R4':regs[3]}, addr_inc=1))
+        # the peripheral takes a command on the rising edge of its enable, so two commands must not be back to back
+        insts.append(AsmInst(inst={'CMD':'NOP'}, addr_inc=1))
         return insts
 
-class QpbPoll(Macro):
-    """Spin on a bit of ``s_status`` until it reaches the wanted polarity.
-
-    Expands to a self-referencing label plus a masked ``TEST``/``JUMP`` pair.
-    The label is allocated from the program's counter at expansion time, so a
-    program containing several polls gets several distinct labels, and two
-    compiles of the same program produce the same names.
-    """
-    # mask, want, tag
+class WaitStatus(Macro):
+    # repeat a test on the status register for as long as it passes
+    # mask, test
     def expand(self, prog):
-        label = prog._next_auto_label(self.tag)
-        # jump back while the tested bit is NOT yet at the wanted polarity:
-        # want=1 -> keep looping while (status & mask) == 0  -> test Z
-        # want=0 -> keep looping while (status & mask) != 0  -> test NZ
-        test = 'Z' if self.want else 'NZ'
-        return [Label(label=label),
-                CondJump(label=label, arg1='s_status', op='&',
-                         arg2=int(self.mask), test=test)]
-
-# accelerated sweeps
-
-class AdaptiveSweep(Macro):
-    """A whole co-processor-accelerated sweep, as one macro.
-
-    ``expand()`` produces the entire sequence: configuration ops, the
-    waveform-memory seed, the RUN op, the service loop that fires shots, and the
-    result read-back into data memory. It does NOT load the early-stop
-    threshold or the block tolerance; those reach the IP
-    only over AXI-Lite, through the ``Adaptive_Sweep`` driver's
-    ``load_tables(plan)``.
-
-    The child macros are built during ``preprocess()`` rather than ``expand()``
-    because some of them are timed (``Pulse``, ``Trigger``, ``Delay``) and have
-    their own preprocessing to do, they need to walk the timeline in the same
-    pass as every other macro in the program.
-    """
-    # name, kwargs
-
-    def preprocess(self, prog):
-        _require(self.name not in prog._sweep_plans and self.name not in prog._sweep_groups,
-                 "sweep name %r is already declared" % self.name)
-        self.plan = plan_sweep(prog, name=self.name, **self.kwargs)
-        prog._sweep_plans[self.name] = self.plan
-        asm = AsmV2()
-        if self.plan.handshake:
-            self._emit_handshake(prog, asm, self.plan)
-        else:
-            self._emit_grid(prog, asm, self.plan)
-        self.children = asm.macro_list
-        for macro in self.children:
-            macro.preprocess(prog)
-
-    def expand(self, prog):
-        return self.children
-
-    #shared pieces -----------------------------------------------------
-
-    def _label(self, prog, what):
-        return prog._next_auto_label('%s_%s' % (self.name, what))
-
-    def _config(self, prog, asm, plan):
-        """Point the bus at the peripheral and latch the acquisition setup."""
-        accel = plan.accel
-        asm.qpb_select()
-        cfg = dict(mode=plan.mode)
-        if 'nsamp' in accel.op('CFG_ACQ').field_names():
-            cfg['nsamp'] = plan.nsamp
-        if 'reduce_sel' in accel.op('CFG_ACQ').field_names():
-            cfg.update(plan.calc_fields)
-            cfg.update(estop_hold=plan.emit_mode, n0=plan.n0, n_min=plan.n_min)
-        asm.qpb_send(accel, 'CFG_ACQ', **cfg)
-        if plan.interrupt:
-            plan.landing_label = self._label(prog, 'landing')
-            isr_id = len(prog._sweep_isr_targets)
-            prog._sweep_isr_targets.append(plan)
-            prog.add_reg('qp2_isr_id', allow_reuse=True)
-            asm.write_reg('qp2_isr_id', isr_id)
-            asm.qpb_send(accel, 'CFG_INTERRUPT', trigger_mask=
-                         1 << prog.soccfg['readouts'][plan.ro_ch]['trigger_port'])
-            # arms the IP's side of the protocol: from here an early stop parks
-            # it instead of walking straight on to the next point
-            asm.qpb_send(accel, 'REARM')
-
-    def _seed_wave(self, asm, wave, word):
-        """Overwrite a waveform's frequency field with an absolute word."""
-        asm.read_wmem(wave)
-        asm.write_reg(dst='w_freq', src=to_s32(word) if isinstance(word, Integral) else word)
-        asm.write_wmem(wave)
-
-    def _step_wave(self, asm, wave, delta):
-        """Advance a waveform's frequency field by a constant word delta."""
-        asm.read_wmem(wave)
-        asm.inc_reg(dst='w_freq', src=to_s32(delta))
-        asm.write_wmem(wave)
-
-    def _landing_block(self, prog, asm, plan, resume_label, reg_point=None):
-        """Where the IPC redirect lands when a point stops early.
-
-        The tProc gets here mid-shot-loop, having abandoned the rest of the
-        point.  Whatever it had already committed is still in flight: at most
-        one shot's trigger sits in the dispatcher queue or its readout window is
-        already open, and the IP is parked dropping everything that arrives.
-        This block restores the trigger line, waits out that last shot, tells
-        the IP the pipe is clean, and rejoins the loop one level up.
-
-        The wait is a deadline on the tProc's own timer, not a handshake:
-        ``shot_period`` past the end of a window that opens ``trig_time`` after
-        the reference and runs for the readout length.  Every term is a
-        scheduled quantity the program itself chose; the only unscheduled one,
-        the m2 path's fabric tail, is a few hundred nanoseconds against a
-        microsecond of slack.
-
-        Note the reference is one shot period ahead of the shot whose result
-        caused the stop, because the interrupt cannot arrive before that shot's
-        window has closed, i.e. after its iteration's ``delay``.  A shot the
-        program committed but has not measured therefore always started at the
-        *current* reference, which is what makes the deadline a constant.
-        """
-        ro_len_us = (prog.ro_chs[plan.ro_ch]['length']
-                     / prog.soccfg['readouts'][plan.ro_ch]['f_output'])
-        quiet = plan.trig_time + ro_len_us + plan.shot_period
-
-        end_label = self._label(prog, 'nolanding')
-        landing_label = plan.landing_label
-
-        # the normal path steps over the block; nothing but the redirect enters it
-        asm.jump(end_label)
-        asm.label(landing_label)
-        rocfg = prog.soccfg['readouts'][plan.ro_ch]
-        if rocfg['trigger_type'] == 'dport':
-            asm.asm_inst({'CMD': 'DPORT_WR', 'DST': str(rocfg['trigger_port']),
-                          'SRC': 'imm', 'DATA': '0', 'TIME': '@0'})
-        else:
-            asm.asm_inst({'CMD': 'TRIG', 'SRC': 'clr',
-                          'DST': str(rocfg['trigger_port']), 'TIME': '@0'})
-        # Take the verdict BEFORE spending the drain time, not after.  The IP
-        # is parked from the moment the interrupt fires - `draining` is set,
-        # no new point can be armed until REARM, and the stop registers hold
-        # until the next arm - so it is readable anywhere in this block.  It
-        # is read here because that is the earliest moment it is valid, and
-        # because a capture should not be sitting behind a wait it does not
-        # depend on.  GET_DIAG's dt2 carries the whole verdict - {nconv_count,
-        # saturated, converged, k, type} - and the shot count is 1 << k, so
-        # one word per point is the entire log.  It is filed under the grid
-        # index the tProcessor is already holding, which is why no frequency
-        # has to be sent back.
-        if plan.dump_log and reg_point is not None:
-            reg_a = prog.add_reg('qp2_log_a', allow_reuse=True)
-            asm.qpb_send(plan.accel, 'GET_DIAG')
-            asm.qpb_wait_new()
-            asm.append_macro(AluReg(dst=reg_a, arg1=reg_point, op='+',
-                                    arg2=plan.log_addr))
-            asm.write_dmem(addr=reg_a, src='s_core_r2')
-            asm.qpb_ack()
-        # The committed shot's TRIGGER was cancelled in hardware: int_take
-        # flushes the dispatcher's TRIGGER FIFO (qick_processor.sv ->
-        # qproc_dispatcher.sv), so that shot never opens a readout window and
-        # the averager never produces an m2 word for it.  Only the trigger
-        # queue is flushed - the PULSE still plays, which keeps the resonator's
-        # drive history identical to an ordinary shot.
-        #
-        # That cancellation only lands if the trigger had not already fired.
-        # s11 (s_usr_time = absolute - reference) is SIGNED, and while it is
-        # negative the reference is still ahead of real time, so nothing
-        # scheduled at it has gone out: not the pulse at t=0, and certainly not
-        # the trigger at t=trig_time.  Testing its sign is therefore a
-        # schedule-exact question, not a fabric-latency one, and it is
-        # conservative in the safe direction - if it fails we simply take the
-        # old deadline.  The failure mode is slower, never wrong.
-        skip_drain = self._label(prog, 'nodrain')
-        rearmed = self._label(prog, 'rearmed')
-        asm.append_macro(CondJump(label=skip_drain, arg1='s_usr_time',
-                                  op=None, arg2=None, test='S'))
-        # slow path: a window is already open, so wait for its word to land
-        asm.wait(quiet)
-        # the bus select survives: the interrupt can only fire from inside the
-        # shot loop, which never touches it
-        asm.qpb_send(plan.accel, 'REARM')
-        # the wait left the reference in the past; put it back ahead of real
-        # time so the next shot's pulse and trigger keep their spacing
-        asm.resync(plan.shot_period)
-        asm.jump(rearmed)
-        # fast path: nothing was ever measured, so there is nothing to drain.
-        # delay(), not resync(): the reference is still sitting on the cancelled
-        # shot's pulse, and advancing it by one shot_period puts the next pulse
-        # exactly one period after the one that played.  resync() would rebase
-        # on real time and close that gap.
-        asm.label(skip_drain)
-        asm.qpb_send(plan.accel, 'REARM')
-        asm.delay(plan.shot_period)
-        asm.label(rearmed)
-        asm.jump(resume_label)
-        asm.label(end_label)
-
-    def _shot_loop(self, prog, asm, plan, reg_shot):
-        """Fire exactly ``avg`` shots at whatever the waveform memory holds."""
-        label = self._label(prog, 'shot')
-        last = plan.avg - 1
-        if last > LOOP_IMM_MAX:
-            reg_lim = prog.add_reg('qp2_shotlim',
-                                   allow_reuse=True)
-            asm.write_reg(dst=reg_lim, src=to_s32(last))
-            last = reg_lim
-        asm.write_reg(dst=reg_shot, src=0)
-        asm.label(label)
-        asm.pulse(ch=plan.gen_ch, name=plan.pulse, t=0)
-        asm.send_readoutconfig(ch=plan.ro_ch, name=plan.ro_cfg, t=0)
-        asm.trigger(ros=[plan.ro_ch], t=plan.trig_time)
-        asm.wait_auto(0, gens=False, ros=True, no_warn=True)
-        asm.delay(plan.shot_period)
-        if plan.count_shots:
-            asm.inc_ext_counter(addr=1)
-        asm.append_macro(LoopBack(label=label, reg=reg_shot, last=last))
-
-    def _store_result(self, prog, asm, plan, status_src):
-        """Copy the response words into the result block.
-
-        The frequency word goes to data memory *before* any further peripheral
-        read, because a status read overwrites the response registers.
-        """
-        asm.write_dmem(addr=plan.result_addr + RESULT_FREQ, src='s_core_r1')
-        asm.write_dmem(addr=plan.result_addr + RESULT_START,
-                       src=plan.start_regs[0] if plan.start_regs else plan.gen_start)
-        if status_src is not None:
-            asm.write_dmem(addr=plan.result_addr + RESULT_STATUS,
-                           src=status_src)
-            plan.writes_status = True
-        asm.qpb_ack()
-        accel = plan.accel
-        # the answer is now safely in data memory, so release the peripheral's
-        # hold on it, until this, every read is refused so that a poll the
-        # program had already issued could not overwrite the answer
-        if accel.has_op('CLR_RESULT'):
-            asm.qpb_send(accel, 'CLR_RESULT')
-        if status_src is None and accel.has_op('GET_STATUS'):
-            asm.qpb_send(accel, 'GET_STATUS')
-            asm.qpb_wait_new()
-            asm.write_dmem(addr=plan.result_addr + RESULT_STATUS,
-                           src='s_core_r1')
-            asm.qpb_ack()
-            plan.writes_status = True
-        if plan.debug and accel.has_op('GET_DIAG'):
-            asm.qpb_send(accel, 'GET_DIAG')
-            asm.qpb_wait_new()
-            asm.write_dmem(addr=plan.result_addr + RESULT_DIAG,
-                           src='s_core_r1')
-            asm.qpb_ack()
-            plan.writes_diag = True
-        if plan.dump_log:
-            # The last grid point is the one the interrupt handler cannot
-            # record.  Its stop and the sweep's own completion land within a
-            # few tens of nanoseconds of each other, and pf_finish latches the
-            # result registers and refuses every read until CLR_RESULT - so
-            # the handler's read is turned away and it stores the frozen word
-            # instead.  The verdict is not lost, though: the IP keeps it until
-            # the next START.  Read it once here, after CLR_RESULT has
-            # released the hold, and overwrite that one slot.
-            asm.qpb_send(accel, 'GET_DIAG')
-            asm.qpb_wait_new()
-            # REGISTER-ADDRESSED, not literal.  result_addr is capped at
-            # LITERAL_DMEM_MAX by plan_sweep, but log_addr is not - it is only
-            # checked against dmem_size, because a 4001-point log has to live
-            # past the 11-bit literal range.  log_addr + n_points - 1 = 4004
-            # for the notebook sweep, which a literal DMEM_WR cannot encode.
-            reg_a = prog.add_reg('qp2_log_a', allow_reuse=True)
-            asm.write_reg(dst=reg_a,
-                          src=to_s32(plan.log_addr + plan.n_points - 1))
-            asm.write_dmem(addr=reg_a, src='s_core_r2')
-            asm.qpb_ack()
-
-
-
-    #grid --------------------------------------------------------------
-
-    def _emit_grid(self, prog, asm, plan):
-        accel = plan.accel
-        reg_point = prog.add_reg('qp2_point', allow_reuse=True)
-        reg_shot = prog.add_reg('qp2_shot', allow_reuse=True)
-
-        self._config(prog, asm, plan)
-        avg_field = ({'avg_shift': plan.avg_shift}
-                     if 'avg_shift' in accel.op('CFG_WINDOW').field_names()
-                     else {'averager_value': plan.avg})
-        if plan.start_regs:
-            for key in ('qp2_dt2', 'qp2_dt3', 'qp2_dt4'):
-                prog.add_reg(key, allow_reuse=True)
-            asm.write_reg('qp2_dt2', plan.gen_step)
-            asm.write_reg('qp2_dt3', plan.n_points)
-            asm.write_reg('qp2_dt4', next(iter(avg_field.values())))
-            asm.pb(accel.op('CFG_WINDOW').number, r1=plan.start_regs[0],
-                   r2='qp2_dt2', r3='qp2_dt3', r4='qp2_dt4')
-        else:
-            asm.qpb_send(accel, 'CFG_WINDOW', start_freq=plan.gen_start,
-                         step=plan.gen_step, n_points=plan.n_points, **avg_field)
-
-        # seed both waveforms at the first point before the IP starts, so the
-        # very first shot already measures the frequency the IP believes it is
-        # measuring
-        gstart, rstart = plan.start_regs or (plan.gen_start, plan.ro_start)
-        self._seed_wave(asm, plan.gen_wave, gstart)
-        self._seed_wave(asm, plan.ro_wave, rstart)
-
-        asm.qpb_send(accel, 'START')
-        # confirm the peripheral actually took the job before polling for its
-        # completion: the READY still standing from before the START would
-        # otherwise read as an instant, bogus "done"
-        asm.qpb_wait_ready(invert=True)
-
-        point_label = self._label(prog, 'point')
-        resume_label = self._label(prog, 'nextpoint')
-        asm.write_reg(dst=reg_point, src=0)
-        asm.label(point_label)
-        self._shot_loop(prog, asm, plan, reg_shot)
-        # an aborted point rejoins here, with the point counter untouched
-        asm.label(resume_label)
-        # step to the next point; the IP walks its own copy of the same grid
-        self._step_wave(asm, plan.gen_wave, plan.gen_step)
-        self._step_wave(asm, plan.ro_wave, plan.ro_step)
-        asm.append_macro(LoopBack(label=point_label, reg=reg_point,
-                                  last=plan.n_points - 1))
-
-        asm.qpb_wait_ready()
-        asm.qpb_wait_new()
-        self._store_result(prog, asm, plan, status_src=None)
-        if plan.interrupt:
-            self._landing_block(prog, asm, plan, resume_label,
-                                reg_point=reg_point)
-
-    #kw handshake ------------------------------------------------------
-
-    def _emit_handshake(self, prog, asm, plan):
-        accel = plan.accel
-        reg_shot = prog.add_reg('%s_shot' % (plan.name))
-        reg_gen = prog.add_reg('%s_gen' % (plan.name))
-        reg_ro = prog.add_reg('%s_ro' % (plan.name))
-        reg_genbase = prog.add_reg('%s_genbase' % (plan.name))
-        reg_robase = prog.add_reg('%s_robase' % (plan.name))
-        reg_ratio = prog.add_reg('%s_ratio' % (plan.name))
-        prog.add_reg('qp2_tmp', allow_reuse=True)
-
-        self._config(prog, asm, plan)
-        asm.qpb_send(accel, 'CFG_WINDOW', start_freq=plan.gen_start,
-                     step=plan.gen_step, n_points=plan.n_points,
-                     avg_shift=plan.avg_shift)
-        asm.qpb_send(accel, 'CFG_GDKW', f_lo=plan.f_lo, f_hi=plan.f_hi)
-
-        # constants for the readout-word tracker
-        asm.write_reg(dst=reg_genbase, src=to_s32(plan.gen_base))
-        asm.write_reg(dst=reg_robase, src=to_s32(plan.ro_base))
-        asm.write_reg(dst=reg_ratio, src=to_s32(plan.ro_ratio))
-
-        self._seed_wave(asm, plan.gen_wave, plan.x0)
-        self._seed_wave(asm, plan.ro_wave, plan.ro_x0)
-
-        asm.qpb_send(accel, 'RUN_KW', x0=plan.x0,
-                     min_step=plan.min_step, max_iter=plan.max_iter)
-        asm.qpb_wait_ready(invert=True)
-
-        service = self._label(prog, 'service')
-        done = self._label(prog, 'done')
-        resume = self._label(prog, 'nextprobe')
-        asm.label(service)
-        # READY high means the job is over.  Test it before touching the
-        # peripheral: any read would overwrite the final result registers.
-        asm.cond_jump(label=done, arg1='s_status', op='&', arg2=BIT_QPB_RDY,
-                      test='NZ')
-        asm.qpb_send(accel, 'GET_FREQ')
-        asm.qpb_wait_new()
-        asm.write_reg(dst=reg_gen, src='s_core_r1')
-        asm.write_reg(dst='qp2_tmp', src='s_core_r2')
-
-
-
-
-        asm.cond_jump(label=done, arg1='s_status', op='&', arg2=BIT_QPB_RDY,
-                      test='NZ')
-        asm.qpb_ack()
-        # dt2_o[0] is the pending flag; a read with nothing pending does not
-        # ack the engine, so spinning here is harmless
-        asm.cond_jump(label=service, arg1='qp2_tmp', op='&', arg2=1, test='Z')
-
-        self._emit_ro_track(prog, asm, plan, reg_gen, reg_ro, reg_genbase,
-                            reg_robase, reg_ratio)
-
-        asm.read_wmem(plan.gen_wave)
-        asm.write_reg(dst='w_freq', src=reg_gen)
-        asm.write_wmem(plan.gen_wave)
-        asm.read_wmem(plan.ro_wave)
-        asm.write_reg(dst='w_freq', src=reg_ro)
-        asm.write_wmem(plan.ro_wave)
-
-        self._shot_loop(prog, asm, plan, reg_shot)
-        # an aborted probe rejoins here and asks the engine for the next one
-        asm.label(resume)
-        asm.jump(service)
-
-        asm.label(done)
-        asm.qpb_wait_new()
-        self._store_result(prog, asm, plan, status_src='s_core_r2')
-        if plan.interrupt:
-            self._landing_block(prog, asm, plan, resume)
-
-    def _emit_ro_track(self, prog, asm, plan, reg_gen, reg_ro, reg_genbase,
-                       reg_robase, reg_ratio):
-        """Derive the readout word for a drive word the engine chose.
-
-        The engine only knows about the drive axis, but the two axes have
-        different sampling rates, so::
-
-            ro = ro_base + (((gen - gen_base) >> pre) * ratio) >> post
-
-        The tProc ALU has no multiplier, so the product comes from the ARITH
-        unit, a 27x18 DSP whose 46-bit result is read back sign-extended as a
-        low/high pair.  ``pre`` shrinks the drive delta into the 27-bit input
-        and the host pre-scales ``ratio`` by ``2**(pre+post)`` to fit the
-        18-bit one; :func:`_ratio_scaling` picks both as small
-        as those widths allow.
-        """
-        asm.append_macro(AluReg(dst='qp2_tmp', arg1=reg_gen, op='-',
-                                arg2=reg_genbase))
-        if plan.ro_pre_shift:
-            asm.append_macro(AluReg(dst='qp2_tmp', arg1='qp2_tmp', op='ASR',
-                                    arg2=plan.ro_pre_shift))
-        # the ARITH unit answers on s_core_r1/r2, the same registers the custom
-        # peripheral uses, so hand the source select over and take it back
-        asm.write_reg(dst='s_cfg', src=CFG_SRC_ARITH)
-        asm.append_macro(Arith(op='T', r1='qp2_tmp', r2=reg_ratio, r3=None,
-                               r4=None))
-        # the unit takes a few cycles and the hazard unit does not stall for
-        # it, so poll the response bit
-        asm.append_macro(QpbPoll(mask=BIT_ARITH_NEW, want=1,
-                                 tag='%s_arith' % (plan.name)))
-        # (high << (32-post)) | (low >> post) is the low word of the 64-bit
-        # product shifted right by post.  The ALU's shift amount is only four
-        # bits wide in hardware, so the left shift is split into two left
-        # shifts compose, and each half stays inside the field.
-        hi_shift = 32 - plan.ro_post_shift
-        first = min(ALU_MAX_SHIFT, hi_shift)
-        asm.append_macro(AluReg(dst=reg_ro, arg1='s_core_r2', op='SL',
-                                arg2=first))
-        if hi_shift - first:
-            asm.append_macro(AluReg(dst=reg_ro, arg1=reg_ro, op='SL',
-                                    arg2=hi_shift - first))
-        asm.append_macro(AluReg(dst='qp2_tmp', arg1='s_core_r1', op='SR',
-                                arg2=plan.ro_post_shift))
-        asm.append_macro(AluReg(dst=reg_ro, arg1=reg_ro, op='OR',
-                                arg2='qp2_tmp'))
-        asm.append_macro(AluReg(dst=reg_ro, arg1=reg_ro, op='+',
-                                arg2=reg_robase))
-        # clear the ARITH response and re-select the peripheral in one write,
-        # for the same reason the QP2 ack does
-        asm.write_reg(dst='s_ctrl', src=ARITH_ACK_TO_QPB)
-
-class FineTuningSweep(AdaptiveSweep):
-    """Compile finer grids, keeping every point inside the original band."""
-
-    def preprocess(self, prog):
-        stages = list(self.schedule)
-        _require(stages, "fine-tuning schedule cannot be empty")
-        _require(stages[0][1] is None, "the first schedule window must be None (full band)")
-        previous_step = float('inf')
-        for index, (step, half_window) in enumerate(stages):
-            _require(0 < step < previous_step,
-                     "fine-tuning steps must be positive and strictly decreasing")
-            if index:
-                _require(half_window is not None and half_window > 0,
-                         "later stages need a positive half-window in MHz")
-                count = 2 * half_window / step
-                _require(abs(count - round(count)) < 1e-9,
-                         "twice the half-window must be an integer multiple of the step")
-            previous_step = step
-        _require(self.name not in prog._sweep_groups and self.name not in prog._sweep_plans,
-                 "sweep name %r is already declared" % self.name)
-        args = dict(self.kwargs)
-        _require('step' not in args and 'n_points' not in args,
-                 "fine_tuning_sweep takes its steps and point counts from schedule")
-        initial_start = args['start']
-        initial_stop = args.pop('stop')
-        _require(initial_stop > initial_start, "fine-tuning stop must exceed start")
-        result_base = int(args.pop('result_addr', 0))
-        points_base = args.pop('points_addr', None)
-        legacy_points_base = args.pop('log_addr', None)
-        _require(points_base is None or legacy_points_base is None
-                 or points_base == legacy_points_base,
-                 "points_addr and log_addr disagree")
-        if points_base is None:
-            points_base = legacy_points_base
-        if points_base is None:
-            points_base = result_base + len(stages) * RESULT_BLOCK
-        asm = AsmV2()
-        gstart = prog.add_reg('qp2_start_gen', allow_reuse=True)
-        rstart = prog.add_reg('qp2_start_ro', allow_reuse=True)
-        names = []
-        previous = None
-        band = None
-        for index, (step, half_window) in enumerate(stages):
-            stage_args = dict(args, step=step,
-                              stop=initial_stop,
-                              result_addr=result_base + index * RESULT_BLOCK)
-            if index:
-                drive_step, _ = _sweep_step_words(prog, step, band.gen_ch, band.ro_ch)
-                _require(drive_step > 0, "fine-tuning step rounds to zero")
-                nominal_span = Fraction(str(float(initial_stop))) - Fraction(str(float(initial_start)))
-                nominal_count = int(nominal_span / Fraction(str(float(step)))) + 1
-                stage_args['n_points'] = min(int(round(2 * half_window / step)) + 1,
-                                            nominal_count, band.gen_span // drive_step + 1)
-
-            recording = stage_args.get('record_points')
-            if recording is None:
-                recording = stage_args.get('dump_log')
-            stopping = stage_args.get('early_stop')
-            if stopping is None:
-                stopping = stage_args.get('interrupt')
-            if stopping is None:
-                mode = stage_args.get('sweep_mode')
-                stopping = stage_args.get('calc') == 'split' or (
-                    mode is not None and resolve_sweep_mode(mode)['calc'] == 'split')
-            if bool(recording) or (recording is None and stopping):
-                stage_args['points_addr'] = points_base
-            stage_name = '%s_stage%d' % (self.name, index)
-            _require(stage_name not in prog._sweep_plans and stage_name not in prog._sweep_groups,
-                     "generated stage name %r is already declared" % stage_name)
-            plan = plan_sweep(prog, name=stage_name, algorithm='grid', **stage_args)
-            plan.start_regs = (gstart, rstart)
-            prog._sweep_plans[stage_name] = plan
-            names.append(stage_name)
-            if plan.record_points:
-                points_base += plan.n_points
-            if previous is None:
-                band = plan
-                asm.write_reg(gstart, plan.gen_start)
-                asm.write_reg(rstart, plan.ro_start)
-            else:
-
-
-                seek_g = prog.add_reg('qp2_seek_gen', allow_reuse=True)
-                seek_r = prog.add_reg('qp2_seek_ro', allow_reuse=True)
-                seek_n = prog.add_reg('qp2_seek_n', allow_reuse=True)
-                winner = prog.add_reg('qp2_winner', allow_reuse=True)
-                seek = self._label(prog, 'seek')
-                found = self._label(prog, 'found')
-                asm.read_dmem(winner, previous.result_addr + RESULT_FREQ)
-                asm.write_reg(seek_g, gstart)
-                asm.write_reg(seek_r, rstart)
-                asm.write_reg(seek_n, 0)
-                asm.label(seek)
-                asm.cond_jump(found, seek_g, 'Z', op='-', arg2=winner)
-                asm.inc_reg(seek_g, previous.gen_step)
-                asm.inc_reg(seek_r, previous.ro_step)
-                asm.append_macro(LoopBack(label=seek, reg=seek_n,
-                                          last=previous.n_points - 1))
-                asm.end()
-                asm.label(found)
-                span = (plan.n_points - 1) * plan.gen_step
-                _require(span <= band.gen_span, "refinement window exceeds the original band")
-                _, gquant, rquant = _sweep_frequency_lattice(prog, plan.gen_ch, plan.ro_ch)
-                half_ticks = (span // gquant) // 2
-                ghalf, rhalf = half_ticks * gquant, to_s32(half_ticks * rquant)
-                lower = self._label(prog, 'lower_bound')
-                upper = self._label(prog, 'upper_bound')
-                bounded = self._label(prog, 'bounded')
-
-
-
-
-
-                for endpoint, distance, target, reverse in (
-                        (band.gen_start, ghalf, lower, False),
-                        (band.gen_limit, span - ghalf, upper, True)):
-                    if distance == 0:
-                        continue
-                    skip = self._label(prog, 'bound_ok')
-                    asm.write_reg(seek_n, endpoint)
-                    if reverse:
-                        asm.alu_reg(winner, seek_n, '-', seek_g)
-                    else:
-                        asm.alu_reg(winner, seek_g, '-', seek_n)
-                    if distance < (1 << 31):
-                        asm.cond_jump(skip, winner, 'S')
-                    else:
-                        asm.cond_jump(target, winner, 'NS')
-                    asm.write_reg(seek_n, to_s32(distance))
-                    asm.cond_jump(target, winner, 'S', op='-', arg2=seek_n)
-                    asm.label(skip)
-                asm.alu_reg(gstart, seek_g, '-', ghalf)
-                asm.alu_reg(rstart, seek_r, '-', rhalf)
-                asm.jump(bounded)
-                asm.label(lower)
-                asm.write_reg(gstart, band.gen_start)
-                asm.write_reg(rstart, band.ro_start)
-                asm.jump(bounded)
-                asm.label(upper)
-                asm.write_reg(gstart, to_s32(band.gen_limit - span))
-                asm.write_reg(rstart, to_s32(band.ro_limit - (plan.n_points - 1) * plan.ro_step))
-                asm.label(bounded)
-            self._emit_grid(prog, asm, plan)
-            previous = plan
-        prog._sweep_groups[self.name] = names
-        self.children = asm.macro_list
-        for child in self.children:
-            child.preprocess(prog)
-
+        # the label is named after its address, so it is unique
+        label = "wait_%d"%(prog.p_addr)
+        return [Label(label=label), CondJump(label=label, arg1='s_status', op='&', arg2=self.mask, test=self.test)]
 
 # loops
 
@@ -3551,6 +853,24 @@ class CloseLoop(Macro):
         for reg, steps in reg_sweeps:
             insts.append(IncReg(dst=reg.full_addr(), src=-steps['step']-steps['span']))
 
+        return insts
+
+class LoopBack(Macro):
+    # the end of a loop that counts in a register the caller chose (CloseLoop without the sweeps)
+    # label, reg, n
+    def expand(self, prog):
+        insts = []
+        reg = prog._get_reg(self.reg)
+        # test i-n
+        if prog.tproccfg['pmem_size'] > 2**11:
+            # NOTE: to jump to address > 11bits, use s_addr/s15 reg
+            insts.append(WriteLabel(label=self.label))
+        insts.append(AsmInst(inst={'CMD':'TEST', 'OP':'%s - #%d'%(reg, self.n-1)}, addr_inc=1))
+        # if i!=n, jump to the start and increment i
+        if prog.tproccfg['pmem_size'] > 2**11:
+            insts.append(AsmInst(inst={'CMD':'JUMP', 'ADDR':'s15', 'IF':'NZ', 'WR':'%s op'%(reg), 'OP':'%s + #1'%(reg)}, addr_inc=1))
+        else:
+            insts.append(AsmInst(inst={'CMD':'JUMP', 'LABEL':self.label, 'IF':'NZ', 'WR':'%s op'%(reg), 'OP':'%s + #1'%(reg)}, addr_inc=1))
         return insts
 
 class TimedMacro(Macro):
@@ -4030,52 +1350,22 @@ class AsmV2:
         """
         self.append_macro(IncReg(dst=dst, src=src))
 
-    def alu_reg(self, dst, arg1, op=None, arg2=None):
-        """Write an ALU result into a register.
+    def alu_reg(self, dst, arg1, op, arg2):
+        """Write the result of an operation to a register.
 
         Parameters
         ----------
         dst : str
-            Name of the destination register.
+            Name of destination register
         arg1 : str
-            Name of the first operand register.
-        op : str or None
-            ALU operation: ``+``, ``-``, ``AND``, ``OR``, ``XOR``, ``ASR``
-            (arithmetic shift right), ``SR``/``SL`` (logical shifts), or any
-            other name the assembler's ALU table accepts.
-            If None, ``arg1`` is simply copied.
-        arg2 : int or str or None
-            Second operand: a literal (24-bit; wider values are staged through
-            a scratch register) or a register name.
-            Note the assembler caps *literal* shift amounts at 15, pass a
-            register for larger shifts.
+            Name of the register for operand 1
+        op : str
+            The operation, as the tProc assembler names it: +, -, AND, OR, XOR, ASR, SR, SL
+            (shifts take 0 to 15 bits)
+        arg2 : int or str
+            Literal value, or name of the register for operand 2
         """
         self.append_macro(AluReg(dst=dst, arg1=arg1, op=op, arg2=arg2))
-
-    def arith(self, op, r1, r2, r3=None, r4=None):
-        """Start a multiply on the internal ARITH unit.
-
-        The unit computes one of nine forms of ``(D +/- A) * B +/- C`` and
-        parks a 64-bit result inside itself.  To read it, point the peripheral
-        source select at ARITH (``write_reg('s_cfg', CFG_SRC_ARITH)``) *before*
-        starting the operation, wait for ``bit_arith_new``, then read
-        ``s_core_r1`` (low word) and ``s_core_r2`` (high word).
-
-        Those are the same registers the QP2 custom peripheral answers on, so
-        the two cannot have responses in flight at the same time; hand the
-        select back afterwards with ``write_reg('s_ctrl', ARITH_ACK_TO_QPB)``,
-        which also clears the ARITH response.
-
-        Parameters
-        ----------
-        op : str
-            One of ``T`` (A*B), ``TP`` (A*B+C), ``TM``, ``PT`` ((D+A)*B),
-            ``MT`` ((D-A)*B), ``PTP``, ``PTM``, ``MTP``, ``MTM``.
-        r1, r2, r3, r4 : str or None
-            Source registers, in the order the chosen form needs them --
-            see ``ARITH_OPS``.
-        """
-        self.append_macro(Arith(op=op, r1=r1, r2=r2, r3=r3, r4=r4))
 
     def read_wmem(self, name):
         """Copy a waveform from waveform memory to waveform registers.
@@ -4183,118 +1473,45 @@ class AsmV2:
         self.read_input(ro_ch)
         self.cond_jump(label=label, arg1=reg, op='-', test=test, arg2=threshold)
 
-    # QP2 custom peripheral
+    # peripherals
 
     def qpb_select(self):
-        """Point the tProc's peripheral bus at the QPeriphB custom peripheral.
-
-        Writes ``cfg_src_qpb`` (0x05) to the config register.  This must happen
-        before any ``PB`` instruction, and again after anything that rewrites
-        that register.
-
-        Caution: ``s_cfg`` and ``s_ctrl`` are the same physical register (s2),
-        so a later write to one replaces the other.  This is why
-        :meth:`qpb_ack` rewrites the source select along with the clear bit.
+        """Make the QPeriphB peripheral the source of the s_core_r1 and s_core_r2 registers.
+        The responses of the peripheral are read from these two registers.
         """
-        self.write_reg(dst='s_cfg', src=CFG_SRC_QPB)
+        self.write_reg(dst='s_cfg', src=0x05)
 
-    def pb(self, op, r1='s_zero', r2='s_zero', r3='s_zero', r4='s_zero', nop=True):
-        """Issue a raw ``PB`` instruction to the QPeriphB peripheral.
-
-        The peripheral has no immediate operands, so any literal must already
-        be staged in a register; use :meth:`qpb_send` if you'd rather give
-        named field values and let the library stage them.
+    def qpb_cmd(self, op, r1=0, r2=0, r3=0, r4=0):
+        """Send a command to the peripheral on the tProc's QPeriphB port.
 
         Parameters
         ----------
         op : int
-            Opcode, 0 to 31.
-        r1, r2, r3, r4 : str
-            Register names supplying ``qtag_dt1_i`` .. ``qtag_dt4_i``.
-            The default ``s_zero`` supplies a hardwired zero.
-            r3 and r4 are address-type operands and cannot be w-registers.
-        nop : bool
-            Emit the mandatory NOP after the instruction.  Only set this False
-            if you are deliberately placing your own instruction between two
-            ``PB``s.
+            Operation number, 0 to 31
+        r1, r2, r3, r4 : int or str
+            The four data words of the command: literal values, or names of registers
         """
-        self.append_macro(PeriphB(op=op, r1=r1, r2=r2, r3=r3, r4=r4, nop=nop))
+        self.append_macro(PeriphB(op=op, args=[r1, r2, r3, r4]))
 
-    def qpb_send(self, accel, mnemonic, nop=True, **values):
-        """Issue a named accelerator operation, staging its ``dt`` words.
+    def qpb_wait(self, state):
+        """Pause tProc execution until the QPeriphB peripheral reaches a state.
 
         Parameters
         ----------
-        accel : str or QP2Accel
-            Accelerator name, e.g. ``"adaptive_sweep"``.
-        mnemonic : str
-            Operation name from that accelerator's opcode map, e.g. ``"CFG_ACQ"``.
-        nop : bool
-            Emit the mandatory NOP after the ``PB``.
-        **values
-            Field values by name.  Omitted fields pack as zero.
-
-        See Also
-        --------
-        pack_op : the pure packing function.
+        state : str
+            "busy" (the peripheral has taken the job you sent), "ready" (the job is done),
+            or "new" (a response is waiting in s_core_r1 and s_core_r2)
         """
-        self.append_macro(PeriphBOp(accel=accel, mnemonic=mnemonic,
-                                    values=values, nop=nop))
-
-    def qpb_wait_ready(self, invert=False):
-        """Spin until the peripheral's READY line reaches the wanted level.
-
-        Parameters
-        ----------
-        invert : bool
-            If False (the default), wait for READY high - the peripheral is
-            idle, so a job it was running has finished.
-            If True, wait for READY *low*: use this immediately after starting
-            a job, to confirm the peripheral really took it before you start
-            polling for completion.  Without that confirmation, the first poll
-            can see the READY that was still high from before the job started
-            and report an instant, bogus "done".
-        """
-        self.append_macro(QpbPoll(mask=BIT_QPB_RDY, want=0 if invert else 1,
-                                  tag='qpb_busy' if invert else 'qpb_ready'))
-
-    def qpb_wait_new(self):
-        """Spin until the peripheral has a response waiting (``bit_qpb_new``).
-
-        After this returns, the response words are readable from ``s_core_r1``
-        and ``s_core_r2``, and must be acknowledged with :meth:`qpb_ack`.
-        """
-        self.append_macro(QpbPoll(mask=BIT_QPB_NEW, want=1, tag='qpb_new'))
+        # bit_qpb_rdy and bit_qpb_new of the status register
+        mask, test = {'busy': (0x0400, 'NZ'), 'ready': (0x0400, 'Z'), 'new': (0x0800, 'Z')}[state]
+        self.append_macro(WaitStatus(mask=mask, test=test))
 
     def qpb_ack(self):
-        """Acknowledge a peripheral response, clearing ``bit_qpb_new``.
-
-        Writes ``clr_qpb | cfg_src_qpb``, not a bare ``clr_qpb``: the control
-        and config registers are one register (s2), so acking with only the
-        clear bit would also deselect the peripheral and every later response
-        read would come back empty.
+        """Clear the "new response" flag of the QPeriphB peripheral.
+        Do this after you have read a response.
         """
-        self.write_reg(dst='s_ctrl', src=QPB_ACK)
-
-    def qpb_read_resp(self, dst1=None, dst2=None, ack=True):
-        """Copy the peripheral's response words into registers.
-
-        Parameters
-        ----------
-        dst1 : str or None
-            Register to receive ``qtag_dt1_o`` (read from ``s_core_r1``).
-        dst2 : str or None
-            Register to receive ``qtag_dt2_o`` (read from ``s_core_r2``).
-        ack : bool
-            Acknowledge the response afterwards.  Leave this True unless you
-            are deliberately deferring the ack.
-        """
-        if dst1 is not None:
-            self.write_reg(dst=dst1, src='s_core_r1')
-        if dst2 is not None:
-            self.write_reg(dst=dst2, src='s_core_r2')
-        if ack:
-            self.qpb_ack()
+        # s_ctrl and s_cfg are the same register, so the peripheral must be selected again in the same write
+        self.write_reg(dst='s_ctrl', src=0x200005)
 
     # loops
 
@@ -4991,7 +2208,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         # Attributes to dump when saving the program to JSON.
         # The dump just keeps enough information to execute the program - ASM and initial waveform values.
         # Most of the high-level information (macros, sweeps) is lost.
-        self.dump_keys += ['waves', 'prog_list', 'labels', 'dmem_image', 'ipc_image']
+        self.dump_keys += ['waves', 'prog_list', 'labels']
 
     def _init_declarations(self):
         # initialize the high-level objects that get filled in manually, or by a make_program()
@@ -5016,10 +2233,6 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         # allocated registers
         self.reg_dict = {}
 
-        # accelerated sweeps declared with adaptive_sweep(), by name
-        self._sweep_plans = {}
-        self._sweep_groups = {}
-
     def _init_instructions(self):
         # initialize the low-level objects that get filled by macro expansion
 
@@ -5042,33 +2255,15 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         self.p_addr = 1
         # line number
         self.line = 1
-        #: The compiled data-memory preload, as a plain list.  It travels with
-        #: dump_prog()/load_prog(), because a reloaded program has no macros
-        #: left for compile_datamem() to rebuild it from.
-        self.dmem_image = None
-        self.ipc_image = 0
-        self._sweep_isr_targets = []
-        self._sweep_isr_dispatch = None
-        # counters for compiler-generated labels (poll loops etc.)
-        # these are reset per compile, and macro expansion order is
-        # deterministic, so recompiling a program reproduces the same names
-        self._auto_labels = defaultdict(int)
 
     def load_prog(self, progdict):
         # note that we only dump+load the raw waveforms and ASM (the low-level stuff that gets converted to binary)
         # we don't load the macros, pulses, or sweeps (the high-level stuff that gets translated to the low-level stuff)
-        progdict = dict(progdict)
-        progdict.setdefault('ipc_image', 0)
         super().load_prog(progdict)
         # re-create the Waveform objects
         self.waves = [Waveform(**w) for w in self.waves]
         # make the binary (this will prevent compile() from running and wiping out the low-level stuff)
-        loaded_dmem = self.dmem_image
         self._make_binprog()
-        if loaded_dmem is not None and self.binprog['dmem'] is None:
-            # the macros are gone, so compile_datamem() can no longer rebuild
-            # the preload; restore the one that was dumped
-            self.binprog['dmem'] = np.array(loaded_dmem, dtype=np.int32)
 
     def _compile_prog(self):
         # the assembler modifies some of the command dicts, so do a copy first
@@ -5087,38 +2282,13 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         For basic QICK programs no data needs to be written, and this method returns no values.
         If you need to write data, you should override this method.
 
-        An accelerated sweep whose tables are staged through data memory
-        supplies them here, so if you override this you should start from
-        ``super().compile_datamem()`` rather than from None.
-
         Returns
         -------
         numpy.ndarray of int or None
             data to write
         """
-        if not self._sweep_plans:
-            return None
-
-
-        size = 0
-        for plan in self._sweep_plans.values():
-            size = max(size, plan.result_addr + RESULT_BLOCK)
-            if plan.record_points:
-                size = max(size, plan.log_addr + plan.n_points)
-        d_mem = np.zeros(size, dtype=np.int32)
+        d_mem = None
         return d_mem
-
-    def _compile_ipc(self):
-        """The interrupt vector: pmem address of the sweep's landing block.
-
-        0 means "no redirect", which is what the tProc's IPC register holds
-        unless a program asks for one, so a program without an accelerated
-        sweep - or with one that does not stop early - runs exactly as before.
-        """
-        if self._sweep_isr_dispatch is None:
-            return self.ipc_image
-        addr = self.labels[self._sweep_isr_dispatch]
-        return int(addr.lstrip('&'))
 
     def compile(self):
         self._make_asm()
@@ -5130,10 +2300,6 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         self.binprog['pmem'] = self._compile_prog()
         self.binprog['wmem'] = self._compile_waves()
         self.binprog['dmem'] = self.compile_datamem()
-        self.binprog['ipc'] = self._compile_ipc()
-        self.ipc_image = self.binprog['ipc']
-        if self.binprog['dmem'] is not None:
-            self.dmem_image = [int(w) for w in self.binprog['dmem']]
         # check that the program will fit
         for name in ['pmem', 'wmem', 'dmem']:
             progsize = 0
@@ -5148,8 +2314,6 @@ class QickProgramV2(AsmV2, AbsQickProgram):
 
         # reset the low-level program objects
         self._init_instructions()
-        self._sweep_plans = {}
-        self._sweep_groups = {}
 
         for macro in self.macro_list:
             # get the loop names and counts and fill the loop dict
@@ -5178,19 +2342,6 @@ class QickProgramV2(AsmV2, AbsQickProgram):
                 WriteReg(dst=k, src=v.init.start).translate(self)
         for i, macro in enumerate(self.macro_list):
             macro.translate(self)
-        if self._sweep_isr_targets:
-
-
-
-            after = self._next_auto_label('qp2_after_isr')
-            self._sweep_isr_dispatch = self._next_auto_label('qp2_isr')
-            Jump(label=after).translate(self)
-            Label(label=self._sweep_isr_dispatch).translate(self)
-            for index, plan in enumerate(self._sweep_isr_targets):
-                CondJump(label=plan.landing_label, arg1='qp2_isr_id', op='-',
-                         arg2=index, test='Z').translate(self)
-            End().translate(self)
-            Label(label=after).translate(self)
 
     def _add_asm(self, inst, addr_inc=1):
         inst = inst.copy()
@@ -5199,27 +2350,6 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         self.p_addr += addr_inc
         self.line += 1
         self.prog_list.append(inst)
-
-    def _next_auto_label(self, tag):
-        """Make a fresh label name for compiler-generated control flow.
-
-        For internal use by macros that need to jump to themselves (poll
-        loops).  Names are ``<tag>_<n>`` with n counting per tag, so two polls
-        in one program can't collide and a recompile reproduces the names.
-
-        Parameters
-        ----------
-        tag : str
-            Prefix describing the loop, e.g. ``"qpb_ready"``.
-
-        Returns
-        -------
-        str
-            Label name.
-        """
-        n = self._auto_labels[tag]
-        self._auto_labels[tag] = n + 1
-        return "%s_%d" % (tag, n)
 
     def _add_label(self, label):
         if label in self.labels:
@@ -5425,994 +2555,6 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         pulse = self._ro_mgrs[ch[0]].make_pulse(kwargs)
         pulse.ro_chs = [ch]
         self._register_pulse(pulse, name)
-
-    # accelerated sweeps
-
-    def adaptive_sweep(self, name, accel, algorithm="grid", calc=None, **kwargs):
-        """Declare a sweep that runs on a QP2 co-processor.
-
-        The accelerator owns the search: it decides which frequency to measure
-        next and where the optimum is.  The tProcessor owns the tone, it
-        writes waveform memory and fires shots.  This call validates the
-        parameters, converts them from physical units to the register words the
-        accelerator wants, and emits the configuration ops,
-        run command, service loop, and result
-        read-back into data memory.
-        :meth:`run_sweeps` loads the AXI settings (early-stop threshold, block
-        tolerance) on the host.
-
-        A program that uses this is a *job* program, not a shot-averaged one.
-        Call it from ``_initialize()``, leave ``_body()`` empty, and use
-        ``reps=1``; the sweep's own loops fire every shot it needs.  Read the
-        answer back with :meth:`get_sweep_result`.
-
-        Parameters
-        ----------
-        name : str
-            Name for this sweep, used to look the plan and result up later.
-        accel : str
-            Which accelerator to drive: ``"adaptive_sweep"`` or
-            ``"fine_tuning_sweep"``.
-        algorithm : str
-            ``"grid"`` (walk a fixed grid and take the argmax), or ``"kw"``
-            (the border search, ABI 4: a coarse grid, then one probe at a time
-            inside the border around the best point, each frequency through a
-            handshake).  ``"gd"`` was removed with opcode-map ABI 3.
-        calc : str
-            Measurement scheme: ``"shift"`` or ``"split"`` (``"welford"`` is
-            a deprecated alias of ``"shift"`` and warns).  Defaults to the
-            accelerator's only option, or ``"shift"``.  On
-            ``adaptive_sweep`` these are presets over one shared datapath (a
-            64-bit accumulator, MUX-selected reduction, and an independently
-            enabled early stop), not separate pipelines.  ``split`` is the
-            repetition-axis early stop: each point accumulates raw shot
-            sums, the split test checks convergence at power-of-two
-            candidates (4, 8, 16, ...) with policy-specific confirmation, and the
-            point retires as an exact 32-bit mean divided by the shot count
-            it really used. Alternating samples can agree despite slow drift,
-            so passing this test does not establish an unbiased mean or a
-            confidence interval. See ``confirmation_policy`` for the check
-            schedule and which measurements contribute to the returned mean.
-        gen_ch : int
-            Generator channel carrying the drive, already declared.
-        ro_ch : int
-            Readout channel, already declared.  Must be tProc-controlled, so
-            its downconversion can track the drive.
-        pulse : str
-            Name of the drive pulse from :meth:`add_pulse`.  Its waveform's
-            frequency field is what the sweep retunes.
-        ro_cfg : str
-            Name of the readout config from :meth:`add_readoutconfig`.
-        start, stop : float
-            Allowed band edges (MHz), rounded inward to the shared DDS
-            lattice. For kw these are the coarse grid the engine walks
-            first, or (with ``x0``) bound the search window.
-        step : float
-            Grid step (MHz), also the kw coarse grid's step (not with ``x0``).
-            Give this or ``n_points``. Its realized magnitude rounds downward
-            to the shared DDS lattice. Bounded grids may shorten it by a
-            further lattice quantum to keep the requested count inside the
-            inward-rounded endpoints; inspect ``plan.gen_step``/``ro_step``.
-        n_points : int
-            Number of grid points, 1 to 65535 on ``adaptive_sweep`` (the IP
-            keeps a 16-bit count; an oversized request is rejected).
-        avg : int
-            Shots averaged per point, up to 2**26.  The cap is a power of
-            two: ``shot_counter`` does not compare against a limit, it
-            watches bit ``avg_shift`` of the shot number, so the cap is
-            exactly ``1 << avg_shift`` and CFG_WINDOW dt4 carries the EXPONENT.
-            A request that is not a power of two is rounded UP to the next
-            one with a warning -- 1000 becomes 1024 -- and the plan records
-            ``avg_requested`` / ``avg_rounded``.  ``plan.avg`` becomes the
-            rounded count, because the tProcessor's shot loop has to fire
-            exactly as many shots as the IP will fold; ``plan.avg_shift`` is
-            what goes on the wire.  The exponent is capped at 26 because
-            that is where ``shot_counter`` clamps and where the 58-bit
-            accumulators run out (2**26 * 2**31 = 2**57).  See
-            MODULE_GUIDE.txt section 3.5.
-        nsamp : int
-            Raw ADC samples folded per shot.  Defaults to the declared readout
-            window length, which is what the averaging buffer itself uses.
-        mode : str or int
-            ``"peak"`` to maximise, ``"dip"`` to minimise.  ``"max"``/``"min"``
-            are accepted aliases, and so are the encoded values ``0``/``1``
-            (the ``search_mode`` bit, CTRL[0]).  Anything else raises a
-            ValueError naming the accepted spellings.
-        sweep_mode : str
-            Optional shorthand naming the whole hardware behaviour instead of
-            spelling out ``calc`` and ``mode``:
-
-            ==================  ==========  ==========  ===========  =========
-            sweep_mode          calc        mode        search_mode  estop_en
-            ==================  ==========  ==========  ===========  =========
-            ``fixed_peak``      ``shift``   ``peak``    0            0
-            ``fixed_dip``       ``shift``   ``dip``     1            0
-            ``adaptive_peak``   ``split``   ``peak``    0            1
-            ``adaptive_dip``    ``split``   ``dip``     1            1
-            ==================  ==========  ==========  ===========  =========
-
-            "fixed" means every point runs the full ``avg`` shots; "adaptive"
-            means the split early stop may retire a point sooner.  Passing
-            ``sweep_mode`` together with a contradicting ``calc`` or ``mode``
-            is an error.  ``grid_peak``/``grid_dip``/``early_stop_peak``/
-            ``early_stop_dip`` still work as deprecated aliases (they raise a
-            DeprecationWarning, which Python hides by default).
-        trig_time : float
-            Readout trigger time within a shot (us).
-        shot_period : float
-            Shot-to-shot period (us).  Must exceed ``trig_time`` plus the
-            readout length.
-        n0 : int
-            Warmup shots, for the deprecated ``calc="welford"``; it only
-            drives the ``warmup_done`` status bit.
-        n_min : int
-            Eligibility floor for early stopping, from 0 through ``avg``.
-            In power-of-two mode the final confirming checkpoint must meet
-            this floor; in short mode the first candidate N must meet it.
-            Zero makes every candidate eligible; it does not disable stopping.
-        emit_mode : str
-            Early stopping uses ``"immediate"`` with its interrupt handler.
-            It is selected automatically; ``"drain"`` is rejected when
-            ``early_stop=True``.
-        estop_thr : float
-            Early-stop threshold for the split-family calcs: the noise /
-            signal ratio a checkpoint must reach to pass, so a checkpoint
-            passes iff ``|dI|+|dQ| <= estop_thr * (|SI|+|SQ|)``.  In
-            ``(0, 1]``, default ``1/64``. This is a stopping heuristic;
-            validate achieved accuracy for the experiment's noise and response.
-
-            The IP stores the integer reciprocal ``D = round(1/estop_thr)``
-            in a 16-bit register and tests ``(|dI|+|dQ|)*D <= |SI|+|SQ|``,
-            so the realized threshold is ``1/D`` (exact whenever
-            ``estop_thr`` has that form, and coarse only near 1); the plan
-            reports it as ``plan.estop_thr`` beside
-            ``plan.estop_thr_requested``, and warns when they differ by
-            more than 1%.  The finest value the register reaches is
-            ``1/65535``.
-
-            The threshold is NOT part of the generated program - it lives
-            in an AXI register.  Write it with the ``Adaptive_Sweep``
-            driver (``soc.adaptive_sweep_0.load_tables(plan)``, or
-            ``set_estop_thr(thr)`` to retarget it), which means a
-            threshold sweep needs no program rebuild.  The register comes
-            out of reset at ``D=64``, so an unwritten register behaves as
-            ``estop_thr=1/64`` rather than disabling the stop.
-        record_points : bool
-            Record, per grid point, the shot count at which that point
-            stopped early. Needs ``early_stop=True``,
-            and defaults to True when both hold.  There is no log buffer in
-            the accelerator: the interrupt handler reads GET_DIAG's verdict word
-            and stores it at ``dmem[log_addr + point]`` while it is already
-            parked doing the rearm handshake, so it costs four instructions
-            on a path that is already waiting microseconds for the last shot
-            to drain, and the depth limit is data memory rather than a fixed
-            4096.  A point that ran to the cap never interrupts and so
-            leaves its word at zero, which decodes as the cap.  The last
-            point is filled in once after the sweep instead of from the
-            handler, because the sweep's completion latches the result
-            registers and refuses the handler's read.
-            ``get_sweep_result`` / ``wait_for_sweep`` return a ``stop_log``
-            dict of per-frequency arrays: ``n_used``, ``converged``,
-            ``capped``, ``saturated`` and ``freq_mhz``.
-        points_addr : int
-            Data-memory address of the dumped log.  Defaults to just past
-            the result block.
-        dump_log, log_addr : bool, int
-            Compatibility aliases for ``record_points`` and ``points_addr``.
-        x0 : float
-            kw only (MHz): start from the three words f_lo, x0, f_hi instead of
-            a coarse grid; x0 must lie strictly inside (f_lo, f_hi).  Without
-            it the engine walks the grid start..stop / step itself.
-        min_step : float
-            kw (MHz): the search converges once the border is within
-            ``min_step`` on both sides of the best point.  ``2*min_step`` must
-            fit in the start span.
-        max_iter : int
-            Probe cap after the start for kw; the run reports itself capped,
-            or nothing_seen if the best start point did not clear the noise
-            gate.
-        f_lo, f_hi : float
-            kw with ``x0`` only: the two outer start words (MHz), within
-            ``[start, stop]``; default ``start`` and ``stop``.
-        result_addr : int
-            Data-memory address of the result block.  Literal data-memory
-            addresses are 11-bit signed, so this must leave the 4-word block
-            ending at or below address 1024.  Sweeps in the same program must
-            not overlap here.
-        debug : bool
-            Also read the diagnostic counters into the result block.  Only
-            available on accelerators that have a diagnostic read.
-        count_shots : bool
-            Increment the externally readable shot counter once per shot, so a
-            host streaming the averaging buffer with
-            ``soc.start_readout(total_shots, counter_addr=1)`` can follow
-            along.  Off by default, because that is the same counter
-            ``acquire()`` and ``run_rounds()`` poll against ``reps``: with it
-            on, those would return after the sweep's first shot. The
-            counter-based sweep helpers (:meth:`run_sweeps`,
-            :meth:`wait_for_sweep`) accept it only when the program completes
-            on the other counter (``COUNTER_ADDR = 2``); the result then
-            carries ``observed_shots``.
-        early_stop : bool
-            Enable the split test and its tProcessor interrupt together.
-            Defaults to True for algorithm='kw' (and for calc='split'),
-            False otherwise.
-            Requires a dedicated readout trigger and matching firmware with
-            PB15 selective trigger cancellation. Multiple stages share one
-            interrupt vector, dispatched using the active stage's register.
-        confirmation_policy : str or None
-            ``None`` or ``"power_of_two"`` keeps the legacy policy: check at
-            N, 2N, 4N, ... and return the final confirming checkpoint's mean.
-            ``"short"`` checks at an eligible power-of-two N, then at N+2,
-            N+4, ... using cumulative measurements. Once all checks pass,
-            return the saved mean from the first N samples. A failed check
-            cancels that candidate; search resumes at later power-of-two
-            candidates. ``n_min`` gates the first candidate N in short mode.
-            Short confirmation requires ``early_stop=True`` and firmware
-            with CTRL bit 8 support; it cannot be combined with ``block_tol``.
-        confirm : int
-            Total consecutive passing checks, from 1 through 7, including
-            the first candidate. Only accepted with ``early_stop=True``.
-            Defaults to 2 for ``"power_of_two"`` and 3 for ``"short"``.
-            Thus short confirmation with confirm=3 requires N, N+2 and N+4,
-            while confirm=1 returns a passing candidate immediately.
-            In power-of-two mode ``n_min`` gates stopping and earlier passes
-            contribute to the streak. In short mode no pre-n_min passes count.
-        block_tol : int or None
-            Also require agreement between the first and second halves of
-            the samples at each doubling checkpoint. The tolerance is the
-            absolute L1 change in the block means, in integrated I/Q units
-            before host normalization: ``abs(delta_I) + abs(delta_Q)``.
-            An integer in [0, 4294967295] enables the guard; zero requires
-            exact agreement. ``None`` retains the odd/even rule alone.
-            Both tests must pass before the confirmation counter advances.
-            The first complete block comparison is at 8 shots, so confirm=2
-            cannot stop before 16. Only accepted with ``early_stop=True``.
-            Requires firmware with CTRL bit 7 and AXI target 4 support.
-            Not supported with ``confirmation_policy="short"``.
-        interrupt : bool
-            Deprecated compatibility alias for ``early_stop``.
-        Raises
-        ------
-        ValueError
-            If the parameters are inconsistent, out of range, or ask an
-            accelerator for something it does not implement.  The message
-            names the parameter at fault.
-        """
-        self.append_macro(AdaptiveSweep(
-            name=name,
-            kwargs=dict(accel=accel, algorithm=algorithm, calc=calc, **kwargs)))
-
-    def fine_tuning_sweep(self, name, *, schedule, accel='adaptive_sweep', **kwargs):
-        """Run successively finer grids around each preceding winner.
-
-        ``schedule`` contains ``(step_MHz, half_window_MHz)`` pairs. The
-        first window must be None and uses ``start`` through ``stop``.
-        Later windows are centered on the preceding winner and shifted inward
-        at either boundary, with matched generator/readout DDS arithmetic.
-        A window wider than the original band uses fewer points. Every stage
-        remains within the original, inward-quantized ``[start, stop]`` band.
-        Example: ``[(25, None), (5, 25), (0.5, 5)]``.
-
-        Other arguments are grid arguments accepted by :meth:`adaptive_sweep`,
-        including ``early_stop`` and ``record_points``. Each stage gets its
-        own four-word DMEM result. The group result includes all stages.
-        """
-        self.append_macro(FineTuningSweep(
-            name=name, schedule=schedule, kwargs=dict(accel=accel, **kwargs)))
-
-    def kw_sweep(self, name, *, accel='adaptive_sweep', **kwargs):
-        """Run the hardware border search (opcode RUN_KW); see :meth:`adaptive_sweep`."""
-        self.adaptive_sweep(name, accel, algorithm='kw', **kwargs)
-
-    def get_sweep_plan(self, name):
-        """Look up the converted parameters of a declared sweep.
-
-        Only available after the program has been compiled, because the
-        conversion happens during compilation.
-
-        Parameters
-        ----------
-        name : str
-            The sweep's name.
-
-        Returns
-        -------
-        SweepPlan
-        """
-        if self.binprog is None:
-            raise RuntimeError("get_sweep_plan() can only be called on a "
-                               "program after it's been compiled")
-        try:
-            return self._sweep_plans[self._sweep_groups.get(name, [name])[-1]]
-        except KeyError:
-            raise KeyError("no adaptive_sweep named %r in this program; it has "
-                           "%s" % (name, sorted(self._sweep_plans))) from None
-
-    def list_sweeps(self):
-        """Names of the accelerated sweeps declared in this program."""
-        grouped = {name for stages in self._sweep_groups.values() for name in stages}
-        return ([name for name in self._sweep_plans if name not in grouped]
-                + list(self._sweep_groups))
-
-    def get_sweep_result(self, soc, name=None):
-        """Read an accelerated sweep's result back from the board.
-
-        Parameters
-        ----------
-        soc : QickSoc
-            The board to read data memory from.
-        name : str or None
-            Which sweep; may be omitted if the program declares only one.
-
-        Returns
-        -------
-        dict
-            Always present:
-
-            ``freq`` : float
-                Winning/final drive frequency, MHz.
-            ``freq_word`` : int
-                The raw 32-bit drive register word behind ``freq``.
-            ``done`` : bool
-                Whether the normal QICK external completion counter reached
-                the configured number of experiment iterations.
-            ``stop_reason`` : str
-                ``'grid_complete'`` for a finished grid sweep,
-                ``'converged'``/``'nothing_seen'``/``'max_iterations'``/
-                ``'finished'`` for kw,
-                ``'incomplete'`` while the counter is below its target. This is why the
-                *sweep* ended; per-point early stops are in ``stop_log``.
-
-            Present when they can be defined unambiguously:
-
-            ``frequency_index`` : int
-                Grid index of ``freq_word``, replayed from ``start + k*step``
-                (grid algorithms only).  Not the status word's ``point_idx``,
-                which stops at the last index visited.
-            ``sweep_mode`` : str
-                Public :data:`SWEEP_MODES` name this sweep was declared with.
-            ``threshold`` : float, ``threshold_encoded`` : int
-                Realized early-stop noise/signal ratio and the 16-bit
-                reciprocal D actually written to the IP (split calcs only).
-            ``confirmation_policy`` : str, ``n_used_semantics`` : str
-                Early-stop confirmation schedule and meaning of the retained
-                sample counts. Short confirmation returns the first candidate's
-                estimate; its additional confirmation acquisitions are excluded.
-            ``status`` : int and its decoded flags
-                On accelerators with a status read.
-            ``n_used`` : int
-                GET_DIAG shot count for the LAST point the accelerator
-                emitted, with ``debug=True``. Not necessarily the winner.
-                Counts estimator samples, excluding extra short-confirmation shots.
-            ``points`` : dict of arrays, ``retained_shots_total`` : int,
-            ``retained_shots`` : int
-                With ``record_points``: the per-point verdicts, total samples
-                retained in estimates, and the winning point's retained count.
-                ``stop_log`` and ``accelerator_shots`` are compatibility aliases.
-                These counts exclude extra short-confirmation acquisitions and
-                discarded in-flight samples and cannot
-                measure wall time or physical triggers. Fixed grids return the
-                known full-schedule retained counts without point records.
-            ``observed_shots`` : int
-                With ``count_shots=True``: externally readable counter 1,
-                which counts one per shot the sweep loops fired (every
-                count_shots sweep of the job, so far).
-
-            ``i``, ``q``, ``power``, ``signal_magnitude``, ``noise_magnitude``
-            and ``threshold_margin`` are NOT returned: this build's result
-            protocol does not carry them.
-            :attr:`SWEEP_UNAVAILABLE` says why for each.  Keys the accelerator
-            cannot produce are absent rather than filled with whatever data
-            memory happened to hold.
-        """
-        name = self._sweep_name(name)
-        if name in self._sweep_groups:
-            stages = [self.get_sweep_result(soc, stage)
-                      for stage in self._sweep_groups[name]]
-            result = dict(stages[-1], name=name, stages=stages)
-            result['done'] = all(stage['done'] for stage in stages)
-            if not result['done']:
-                result['stop_reason'] = 'incomplete'
-            result.pop('accelerator_shots', None)
-            result.pop('retained_shots_total', None)
-            if all('accelerator_shots' in stage for stage in stages):
-                result['accelerator_shots'] = sum(
-                    stage['accelerator_shots'] for stage in stages)
-                result['retained_shots_total'] = result['accelerator_shots']
-            return result
-        plan = self.get_sweep_plan(name)
-
-
-        completed = self._sweep_complete(soc)
-        words = [int(w) & 0xFFFFFFFF for w in
-                 soc.tproc.read_mem('dmem', length=RESULT_BLOCK,
-                                    addr=plan.result_addr)]
-        out = self.decode_sweep_result(words, name=name, completed=completed)
-        if plan.dump_log and completed:
-            log_words = [int(w) & 0xFFFFFFFF for w in
-                         soc.tproc.read_mem('dmem', length=plan.n_points,
-                                            addr=plan.log_addr)]
-            log = self.decode_stop_log(log_words, name=name,
-                                       start_word=words[RESULT_START])
-            out['stop_log'] = log
-            out['points'] = log
-            # The per-point log records retained estimate counts, excluding
-            # additional short-confirmation shots and pipeline overshoot.
-            out['accelerator_shots'] = int(log['n_used'].sum())
-            out['retained_shots_total'] = out['accelerator_shots']
-            idx = out.get('frequency_index')
-            if idx is not None and 0 <= idx < len(log['n_used']):
-                out['retained_shots'] = int(log['n_used'][idx])
-        elif completed and not plan.handshake and not plan.early_stop:
-            out['retained_shots_total'] = plan.total_shots
-            out['accelerator_shots'] = plan.total_shots
-            out['retained_shots'] = plan.avg
-        if plan.count_shots:
-            # the shot loop increments external counter 1 (inc_ext_counter
-            # addr=1), whatever counter the program completes on
-            out['observed_shots'] = int(soc.get_tproc_counter(addr=1))
-        return out
-
-    def decode_stop_log(self, words, name=None, *, start_word=None):
-        """Turn the dumped stop words into per-point arrays.
-
-        Each word is one point's GET_DIAG dt2, written by the interrupt
-        handler at ``dmem[log_addr + point]`` at the moment that point
-        stopped early - so the grid index is the address, not part of the
-        payload, and the frequency is recovered from it.  A point that ran
-        to the averager cap never interrupts, so its word is still the zero
-        the program image left there; zero is therefore the cap verdict, and
-        it cannot collide with a real stop because every real stop sets
-        ``converged``.
-
-        Parameters
-        ----------
-        words : sequence of int
-            ``n_points`` words read from ``plan.log_addr``.
-        name : str or None
-            Which sweep the words belong to.
-
-        Returns
-        -------
-        dict of numpy arrays, one entry per grid point
-            ``n_used`` (shots in the returned estimate: 2**k, or the averager
-            cap; short confirmation uses the saved candidate's k and excludes
-            its additional confirmation acquisitions), ``converged`` (the early stop fired),
-            ``capped`` (ran to the cap without converging), ``saturated``,
-            and ``freq_mhz`` (the grid frequency of each entry).
-        """
-        name = self._sweep_name(name)
-        plan = self.get_sweep_plan(name)
-        f = {x.name: x for x in AS_DIAG_FIELDS}
-        n_used, conv, capped, sat = [], [], [], []
-        for w in words:
-            w = int(w) & 0xFFFFFFFF
-            is_cap = (w == 0) or (f['type'].unpack(w) >= 4)
-            capped.append(is_cap)
-            n_used.append(plan.avg if is_cap else 1 << f['k'].unpack(w))
-            conv.append(False if w == 0 else bool(f['converged'].unpack(w)))
-            sat.append(False if w == 0 else bool(f['saturated'].unpack(w)))
-        out = {'n_used': np.array(n_used), 'converged': np.array(conv),
-               'capped': np.array(capped), 'saturated': np.array(sat)}
-        if not plan.handshake:
-            start = plan.gen_start if start_word is None else start_word
-            out['freq_mhz'] = np.array([
-                plan.freq_of_word(self, start + k * plan.gen_step)
-                for k in range(len(words))])
-        return out
-
-    def wait_for_sweep(self, soc, name=None, timeout=60.0, poll=0.001,
-                       summary=True):
-        """Block until an accelerated sweep has written its result.
-
-        Completion uses the same external counter as QICK ``run_rounds``.
-        Call :meth:`run_sweeps` to load, reset, and start a fresh job; this
-        method only waits for a job that the caller has already started.
-
-        This is the top-level "run the sweep to completion" call, so it is
-        also where the run summary is printed: once, after the sweep has
-        actually finished, and never on the timeout path.  Lower-level helpers
-        (:meth:`get_sweep_result`, :meth:`decode_sweep_result`) print nothing,
-        so calling them repeatedly is quiet.
-
-        Parameters
-        ----------
-        soc : QickSoc
-            The board to poll.
-        name : str or None
-            Which sweep; may be omitted if the program declares only one.
-        timeout : float
-            Seconds to wait before giving up.
-        poll : float
-            Seconds between reads.
-        summary : bool
-            Print :meth:`print_adaptive_sweep_summary` once the sweep has
-            finished.  Pass False in a loop that runs the same sweep many
-            times.
-
-        Returns
-        -------
-        dict
-            The decoded result, as :meth:`get_sweep_result` returns it.
-
-        Raises
-        ------
-        TimeoutError
-            If the completion counter does not reach its target in time.
-        """
-        self._wait_for_sweep_counter(soc, timeout, poll)
-        result = self.get_sweep_result(soc, name=name)
-        if summary:
-            self.print_adaptive_sweep_summary(name=name, result=result)
-        return result
-
-    def _sweep_completion_spec(self):
-        """Use the same externally readable counter as QICK run_rounds()."""
-        counter = getattr(self, 'counter_addr', None)
-        dimensions = getattr(self, 'loop_dims', None)
-        if counter is None or not dimensions:
-            raise RuntimeError(
-                "counter-based sweep completion needs an AveragerProgramV2 "
-                "(sweeps in _initialize, empty _body, reps=1), or an "
-                "AcquireProgramV2 with setup_counter() and matching increments")
-        if int(counter) == 1 and any(p.count_shots for p in self._sweep_plans.values()):
-            raise ValueError("count_shots=True increments counter 1, which is also this "
-                             "program's completion counter; complete on counter 2 "
-                             "(COUNTER_ADDR = 2) or use record_points=True")
-        return int(counter), int(np.prod(dimensions))
-
-    def _sweep_complete(self, soc):
-        counter, target = self._sweep_completion_spec()
-        return int(soc.get_tproc_counter(addr=counter)) >= target
-
-    def _wait_for_sweep_counter(self, soc, timeout, poll):
-        import time
-        self._validate_sweep_wait(timeout, poll)
-        self._sweep_completion_spec()
-        deadline = time.monotonic() + timeout
-        while not self._sweep_complete(soc):
-            if time.monotonic() >= deadline:
-                raise TimeoutError("sweep program did not finish within %g s" % timeout)
-            time.sleep(poll)
-
-    @staticmethod
-    def _validate_sweep_wait(timeout, poll):
-        _require(np.isfinite(timeout) and timeout > 0
-                 and np.isfinite(poll) and poll >= 0,
-                 "timeout must be finite and positive; poll finite and nonnegative")
-
-    def run_sweeps(self, soc, *, timeout=60.0, poll=0.001,
-                   load_envelopes=True, accelerator=None):
-        """Run one complete sweep job using QICK's normal counter lifecycle.
-
-        Like run_rounds(), reload memories and clear the external counter
-        before starting. Enable the averaging buffer because its m2 output is
-        the accelerator input. Return results keyed by declared sweep name.
-        No accelerator log RAM or DMEM completion sentinel is used.
-        """
-        self._validate_sweep_wait(timeout, poll)
-        if self.binprog is None:
-            self.compile()
-        counter, _ = self._sweep_completion_spec()
-        settings = [p for p in self._sweep_plans.values() if p.estop_d]
-        if settings:
-            first = settings[0]
-            signature = lambda p: (p.estop_d, p.block_tol)
-            _require(all(signature(p) == signature(first) for p in settings),
-                     "one run shares the AXI thresholds; use separate "
-                     "runs when these settings differ")
-            if accelerator is None:
-                accelerator = getattr(soc, 'adaptive_sweep_0', None)
-            _require(accelerator is not None,
-                     "pass the adaptive-sweep driver as accelerator=, or expose "
-                     "it on the board as adaptive_sweep_0")
-            check_abi = getattr(accelerator, 'check_abi', None)
-            if check_abi is not None:
-                check_abi()
-        self.config_all(soc, load_envelopes=load_envelopes, load_mem=False)
-        self.config_bufs(soc, enable_avg=True, enable_buf=False)
-        if settings:
-            accelerator.load_tables(settings[0])
-        soc.reload_mem()
-        soc.clear_tproc_counter(addr=counter)
-        soc.prepare_round()
-        soc.start_src('internal')
-        try:
-            soc.start_tproc()
-            self._wait_for_sweep_counter(soc, timeout, poll)
-            return {name: self.get_sweep_result(soc, name)
-                    for name in self.list_sweeps()}
-        except BaseException:
-            soc.stop_tproc()
-            raise
-        finally:
-            soc.start_src('internal')
-            soc.cleanup_round()
-
-    def decode_sweep_result(self, words, name=None, *, completed=False):
-        """Turn a raw result block into physical units.
-
-        Split out from :meth:`get_sweep_result` so the same decoding can be
-        applied to a result block obtained any other way.
-
-        Parameters
-        ----------
-        words : sequence of int
-            The ``RESULT_BLOCK`` words read from data memory.
-        name : str or None
-            Which sweep the block belongs to.
-
-        Returns
-        -------
-        dict
-        """
-        name = self._sweep_name(name)
-        plan = self.get_sweep_plan(name)
-        out = {
-            'name': name,
-            'freq_word': words[RESULT_FREQ],
-            'start_word': words[RESULT_START],
-            'freq': plan.freq_of_word(self, words[RESULT_FREQ]),
-            'done': bool(completed),
-        }
-        # only report words the generated program actually wrote; an
-        # accelerator without a status or diagnostic read leaves those slots
-        # untouched, and whatever data memory happened to hold is not a result
-        if plan.writes_status:
-            out['status'] = words[RESULT_STATUS]
-            if plan.handshake:
-                # for kw the status slot carries the RUN response's second word
-                out['converged'] = bool(words[RESULT_STATUS] & 0x1)
-                out['capped'] = bool((words[RESULT_STATUS] >> 1) & 0x1)
-                out['nothing_seen'] = bool((words[RESULT_STATUS] >> 2) & 0x1)
-                out['bad_window'] = bool((words[RESULT_STATUS] >> 3) & 0x1)
-                out['iterations'] = (words[RESULT_STATUS] >> 16) & 0xFFFF
-            elif plan.accel.status_bits:
-                out.update(plan.accel.unpack_status(words[RESULT_STATUS]))
-        if plan.writes_diag:
-            out['n_used'] = words[RESULT_DIAG]
-
-        # --- fields derived from what is already in the block --------------
-        # the winning index is replayed from the winning word, NOT taken from
-        # the status word: point_idx stops at the last index the sweep visited
-        idx = plan.index_of_word(words[RESULT_FREQ], words[RESULT_START])
-        if idx is not None:
-            out['frequency_index'] = idx
-        if plan.sweep_mode:
-            out['sweep_mode'] = plan.sweep_mode
-        if plan.estop_d:
-            out['threshold'] = plan.estop_thr
-            out['threshold_encoded'] = plan.estop_d
-            out['confirmation_policy'] = plan.confirmation_policy
-            out['n_used_semantics'] = (
-                "first_candidate_samples_on_convergence_else_cap"
-                if plan.confirmation_policy == 'short'
-                else "final_checkpoint_samples_or_cap")
-            out['early_stop_method'] = ('odd_even_block' if plan.block_tol is not None
-                                        else 'odd_even')
-            out['block_tol'] = plan.block_tol
-        if not out['done']:
-            out['stop_reason'] = 'incomplete'
-        elif plan.handshake:
-            out['stop_reason'] = ('converged' if out.get('converged')
-                                  else 'bad_window' if out.get('bad_window')
-                                  else 'nothing_seen' if out.get('nothing_seen')
-                                  else 'max_iterations' if out.get('capped')
-                                  else 'finished')
-        else:
-            out['stop_reason'] = 'grid_complete'
-        return out
-
-    #: Result fields the current hardware/result protocol cannot supply, and
-    #: why.  They are reported as "unavailable" rather than guessed at.
-    SWEEP_UNAVAILABLE = OrderedDict([
-        ("i", "the winning mean I is inside the IP (readable with QP2 "
-              "GET_MEAN), but the 4-word result block has no slot for it"),
-        ("q", "the winning mean Q is inside the IP (readable with QP2 "
-              "GET_MEAN), but the 4-word result block has no slot for it"),
-        ("power", "the winning power never leaves the IP: qtag_dt2_o is "
-                  "hardwired to 0 at pf_finish"),
-        ("signal_magnitude", "a per-checkpoint value internal to "
-                             "threshold_compare.v; not exported over QP2 or AXI"),
-        ("noise_magnitude", "a per-checkpoint value internal to "
-                            "threshold_compare.v; not exported over QP2 or AXI"),
-        ("threshold_margin", "signal minus scaled noise, internal to "
-                             "threshold_compare.v; not exported over QP2 or AXI"),
-    ])
-
-    def get_adaptive_sweep_summary(self, soc=None, name=None, result=None):
-        """Configuration and result of an accelerated sweep, as a dict.
-
-        This is a reporting helper: it reads nothing the sweep did not already
-        produce, and it never changes the program or the hardware.
-
-        Parameters
-        ----------
-        soc : QickSoc or None
-            If given (and ``result`` is not), the result block is read from
-            the board with :meth:`get_sweep_result`.  Without it the summary
-            carries configuration only.
-        name : str or None
-            Which sweep; may be omitted if the program declares only one.
-        result : dict or None
-            An already-decoded result, as :meth:`get_sweep_result` returns.
-            Use this to summarise a result you have in hand instead of
-            re-reading the board.
-
-        Returns
-        -------
-        dict
-            An ordinary dict with these keys:
-
-            ``name``, ``accelerator``, ``algorithm``, ``calc``, ``sweep_mode``
-                What ran.  ``sweep_mode`` is the public name from
-                :data:`SWEEP_MODES`, or ``None`` for a combination that has no
-                public name.
-            ``config``
-                dict of the declared parameters, in physical units where they
-                have them, plus the register words they became.
-            ``result``
-                dict of the runtime result; empty if none was supplied.
-            ``unavailable``
-                dict of field name -> why this build cannot report it.
-        """
-        name = self._sweep_name(name)
-        plan = self.get_sweep_plan(name)
-        if result is None and soc is not None:
-            result = self.get_sweep_result(soc, name=name)
-
-        cfg = OrderedDict()
-        cfg['mode'] = 'dip' if plan.mode else 'peak'
-        cfg['nsamp'] = plan.nsamp
-        cfg['trig_time_us'] = plan.trig_time
-        cfg['shot_period_us'] = plan.shot_period
-        if plan.handshake:
-            cfg['window_mhz'] = (plan.f_lo_mhz, plan.f_hi_mhz)
-            cfg['x0_mhz'] = plan.x0_mhz
-            cfg['coarse_points'] = plan.n_points
-            cfg['coarse_step_mhz'] = plan.step_mhz if plan.n_points >= 2 else None
-            cfg['min_step_mhz'] = plan.min_step_mhz
-            cfg['max_iter'] = plan.max_iter
-        else:
-            cfg['start_mhz'] = plan.start_mhz
-            cfg['stop_mhz'] = plan.stop_mhz
-            cfg['step_mhz'] = plan.step_mhz
-            cfg['n_points'] = plan.n_points
-            cfg['gen_start_word'] = plan.gen_start
-            cfg['gen_step_word'] = plan.gen_step
-            cfg['ro_start_word'] = plan.ro_start
-            cfg['ro_step_word'] = plan.ro_step
-        cfg['max_shots_per_point'] = plan.avg
-        cfg['avg_shift'] = plan.avg_shift
-        if plan.avg_rounded:
-            cfg['shots_per_point_requested'] = plan.avg_requested
-        cfg['shots_planned'] = plan.total_shots
-        if plan.estop_d:
-            cfg['estop_threshold'] = plan.estop_thr
-            cfg['estop_threshold_encoded'] = plan.estop_d
-            cfg['estop_threshold_requested'] = plan.estop_thr_requested
-            cfg['n_min'] = plan.n_min
-            cfg['confirm'] = plan.confirm
-            cfg['confirmation_policy'] = plan.confirmation_policy
-            cfg['n_used_semantics'] = (
-                "first_candidate_samples_on_convergence_else_cap"
-                if plan.confirmation_policy == 'short'
-                else "final_checkpoint_samples_or_cap")
-            cfg['early_stop_method'] = ('odd_even_block' if plan.block_tol is not None
-                                        else 'odd_even')
-            cfg['block_tol'] = plan.block_tol
-            cfg['emit_mode'] = 'drain' if plan.emit_mode else 'immediate'
-        cfg['redirect'] = bool(plan.interrupt)
-        cfg['early_stop'] = plan.early_stop
-        if plan.interrupt and plan.landing_label:
-            cfg['redirect_landing_label'] = plan.landing_label
-        cfg['result_addr'] = plan.result_addr
-        cfg['result_words'] = RESULT_BLOCK
-        if plan.dump_log:
-            cfg['stop_log_addr'] = plan.log_addr
-            cfg['stop_log_words'] = plan.n_points
-        if self.binprog is not None:
-            # whole-program counts: an accelerated sweep is emitted as one
-            # macro inside the program, so these are the honest numbers we
-            # can quote, not a per-macro breakdown
-            if self.binprog.get('pmem') is not None:
-                cfg['program_instructions'] = len(self.binprog['pmem'])
-            if self.binprog.get('dmem') is not None:
-                cfg['program_dmem_words'] = len(self.binprog['dmem'])
-
-        res = OrderedDict()
-        if result is not None:
-            for key in ('freq', 'freq_word', 'frequency_index', 'done',
-                        'stop_reason', 'threshold', 'threshold_encoded',
-                        'confirmation_policy', 'n_used_semantics',
-                        'retained_shots', 'accelerator_shots', 'retained_shots_total',
-                        'observed_shots', 'n_used', 'status', 'converged',
-                        'capped', 'nothing_seen', 'iterations'):
-                if key in result:
-                    res[key] = result[key]
-            if 'stop_log' in result:
-                log = result['stop_log']
-                res['points_stopped_early'] = int(log['converged'].sum())
-                res['points_capped'] = int(log['capped'].sum())
-
-        unavailable = OrderedDict(self.SWEEP_UNAVAILABLE)
-        if 'observed_shots' not in res:
-            unavailable['observed_shots'] = (
-                "the completion counter cannot also count physical triggers; "
-                "measure acquisition timing and discarded shots separately")
-        if 'retained_shots' not in res:
-            unavailable['retained_shots'] = (
-                "the per-point shot counts are only recorded when the sweep "
-                "runs with record_points=True and early_stop=True")
-
-        return {
-            'name': name,
-            'accelerator': plan.accel.name,
-            'algorithm': plan.algorithm,
-            'calc': plan.calc,
-            'sweep_mode': plan.sweep_mode or None,
-            'config': dict(cfg),
-            'result': dict(res),
-            'unavailable': dict(unavailable),
-        }
-
-    def print_adaptive_sweep_summary(self, soc=None, name=None, result=None,
-                                     file=None):
-        """Print :meth:`get_adaptive_sweep_summary` in a readable block.
-
-        Called automatically by :meth:`wait_for_sweep` once a sweep has
-        finished; call it yourself to re-print, or to summarise a result you
-        already hold.
-
-        Parameters
-        ----------
-        soc, name, result
-            As for :meth:`get_adaptive_sweep_summary`.
-        file : file-like or None
-            Where to write; defaults to stdout.
-        """
-        s = self.get_adaptive_sweep_summary(soc=soc, name=name, result=result)
-        for line in self.format_adaptive_sweep_summary(s):
-            print(line, file=file)
-
-    @staticmethod
-    def format_adaptive_sweep_summary(summary):
-        """Turn a summary dict into the lines
-        :meth:`print_adaptive_sweep_summary` prints."""
-        cfg = summary['config']
-        res = summary['result']
-        una = summary['unavailable']
-
-        def row(label, text):
-            """One label/value line, wrapped to a terminal width."""
-            indent = "  %-22s " % (label,)
-            wrapped = textwrap.wrap(str(text), width=96,
-                                    initial_indent=indent,
-                                    subsequent_indent=" " * len(indent))
-            return "\n".join(wrapped) if wrapped else indent.rstrip()
-
-        head = "adaptive sweep %r  --  %s / %s / %s" % (
-            summary['name'], summary['accelerator'], summary['algorithm'],
-            summary['calc'])
-        if summary['sweep_mode']:
-            head += "  (%s)" % (summary['sweep_mode'],)
-        else:
-            head += "  (mode %s)" % (cfg['mode'],)
-        lines = [head, "configuration"]
-
-        if 'n_points' in cfg:
-            lines.append(row("band", "%.4f - %.4f MHz, %d points, step %.6f MHz"
-                             % (cfg['start_mhz'], cfg['stop_mhz'],
-                                cfg['n_points'], cfg['step_mhz'])))
-            lines.append(row("drive / readout word",
-                             "start %d step %d / start %d step %d"
-                             % (cfg['gen_start_word'], cfg['gen_step_word'],
-                                cfg['ro_start_word'], cfg['ro_step_word'])))
-        else:
-            lo, hi = cfg['window_mhz']
-            if cfg['coarse_points'] >= 2:
-                lines.append(row("coarse grid", "%.4f - %.4f MHz, %d points, step %.6f MHz"
-                                 % (lo, hi, cfg['coarse_points'], cfg['coarse_step_mhz'])))
-            else:
-                lines.append(row("start words", "f_lo %.4f / x0 %.4f / f_hi %.4f MHz"
-                                 % (lo, cfg['x0_mhz'], hi)))
-            lines.append(row("min_step / probe cap", "%.6f MHz / %d"
-                             % (cfg['min_step_mhz'], cfg['max_iter'])))
-
-        shots = "max %d per point (avg_shift %d)" % (
-            cfg['max_shots_per_point'], cfg['avg_shift'])
-        if 'shots_per_point_requested' in cfg:
-            shots += ", rounded up from %d" % (cfg['shots_per_point_requested'],)
-        if cfg.get('shots_planned') is not None:
-            shots += ", %d planned in total" % (cfg['shots_planned'],)
-        lines.append(row("shots", shots))
-
-        if 'estop_threshold' in cfg:
-            lines.append(row("early stop",
-                             "threshold %.6g (D=%d), n_min %d, confirm %d, "
-                             "emit %s"
-                             % (cfg['estop_threshold'],
-                                cfg['estop_threshold_encoded'], cfg['n_min'],
-                                cfg['confirm'], cfg['emit_mode'])))
-            policy = cfg.get('confirmation_policy', 'power_of_two')
-            lines.append(row("confirmation policy", policy))
-            if policy == 'short':
-                lines.append(row("returned estimate",
-                                 "first passing candidate N; extra confirmation shots excluded"))
-            else:
-                lines.append(row("returned estimate", "final confirming checkpoint"))
-        lines.append(row("redirect",
-                         ("enabled -> %s" % (cfg['redirect_landing_label'],))
-                         if cfg.get('redirect_landing_label')
-                         else ("enabled" if cfg['redirect'] else "disabled")))
-        lines.append(row("acquisition",
-                         "nsamp %d, trigger %.3f us, shot period %.3f us"
-                         % (cfg['nsamp'], cfg['trig_time_us'],
-                            cfg['shot_period_us'])))
-        mem = "result block dmem[%d..%d]" % (
-            cfg['result_addr'], cfg['result_addr'] + cfg['result_words'] - 1)
-        if 'stop_log_addr' in cfg:
-            mem += ", stop log dmem[%d..%d]" % (
-                cfg['stop_log_addr'],
-                cfg['stop_log_addr'] + cfg['stop_log_words'] - 1)
-        if 'program_instructions' in cfg:
-            mem = "%d instructions, %s" % (cfg['program_instructions'], mem)
-        lines.append(row("program", mem))
-
-        if not res:
-            lines.append("result")
-            lines.append(row("", "not read yet (pass soc= or result=)"))
-            return lines
-
-        lines.append("result")
-        freq = "%.6f MHz (word 0x%08x)" % (res['freq'], to_u32(res['freq_word']))
-        if 'frequency_index' in res:
-            freq += ", grid index %d" % (res['frequency_index'],)
-        lines.append(row("frequency", freq))
-        lines.append(row("stop reason", "%s%s"
-                         % (res.get('stop_reason', 'unknown'),
-                            "" if res.get('done', True) else " (done flag not set)")))
-        if 'iterations' in res:
-            lines.append(row("iterations", "%d (converged=%s capped=%s)"
-                             % (res['iterations'], res.get('converged'),
-                                res.get('capped'))))
-        if 'threshold' in res:
-            lines.append(row("threshold", "%.6g (encoded D=%d)"
-                             % (res['threshold'], res['threshold_encoded'])))
-        for key, label in (('retained_shots', 'retained shots'),
-                           ('retained_shots_total', 'retained across points'),
-                           ('observed_shots', 'shots fired'),
-                           ('n_used', 'n_used (last point)')):
-            if key in res:
-                lines.append(row(label, "%d" % (res[key],)))
-        if 'points_stopped_early' in res:
-            lines.append(row("points stopped early", "%d of %d (%d ran to the cap)"
-                             % (res['points_stopped_early'], cfg['n_points'],
-                                res['points_capped'])))
-        if 'status' in res:
-            lines.append(row("status word", "0x%08x" % (to_u32(res['status']),)))
-        for key in ('i', 'q', 'power'):
-            lines.append(row(key.upper() if len(key) == 1 else key,
-                             "unavailable -- %s" % (una[key],)))
-        rest = [k for k in una if k not in ('i', 'q', 'power')]
-        if rest:
-            lines.append(row("also unavailable",
-                             "%s (summary['unavailable'] says why for each)"
-                             % (", ".join(rest),)))
-        return lines
-
-    def _sweep_name(self, name):
-        """Resolve an optional sweep name, defaulting only when unambiguous."""
-        if name is not None:
-            return name
-        names = self.list_sweeps()
-        if not names:
-            raise ValueError("this program declares no accelerated sweeps")
-        if len(names) != 1:
-            raise ValueError("this program declares %d sweeps (%s); say which "
-                             "one" % (len(names), sorted(names)))
-        return names[0]
 
     def list_pulse_waveforms(self, pulsename, exclude_special=True):
         """Get the names of the waveforms in a given pulse.
@@ -6835,6 +2977,936 @@ class AveragerProgramV2(AcquireProgramV2):
         self._cleanup(self.cfg)
 
         self.end()
+
+        # subroutines go after the main program
+        for name, asm in self.subroutines.items():
+            self.label(name)
+            self.extend_macros(asm)
+            self.ret()
+
+# frequency searches run by the adaptive_sweep peripheral
+
+def _s32(val):
+    # constrain a register word to signed 32-bit
+    return int(np.int64(val).astype(np.int32))
+
+def _ratio_scaling(ratio, max_delta):
+    """Find the numbers the tProc needs to turn a difference of generator frequency words into readout words.
+    The ALU of the tProc has no multiplier, so the product comes from the ARITH unit (27 x 18 bits, signed):
+
+    ro_delta = ((gen_delta >> pre) * ratio_word) >> post
+
+    Parameters
+    ----------
+    ratio : float
+        Readout words per generator word
+    max_delta : int
+        Largest difference of generator words that will be converted
+
+    Returns
+    -------
+    tuple of int
+        ratio_word, pre, post
+    """
+    # the difference must fit the 27-bit input
+    pre = 0
+    while (int(max_delta) >> pre) >= 2**26:
+        pre += 1
+    # the ratio must fit the 18-bit input, and the ALU shifts by 15 bits at most
+    scale = min(17, pre + 15)
+    while scale > 0 and abs(round(ratio * 2**scale)) >= 2**17:
+        scale -= 1
+    ratio_word = int(round(ratio * 2**scale))
+    post = scale - pre
+    # the high word of the product is shifted left by 32-post in two shifts, so post can't be less than 2
+    if pre > 15 or ratio_word == 0 or post < 2 or post > 15:
+        raise RuntimeError("the readout frequency can't follow the generator over this window (ratio %g, %d generator words): use a narrower window"%(ratio, max_delta))
+    return ratio_word, pre, post
+
+class AdaptiveSweep(Macro):
+    """Common parts of the frequency searches run by the adaptive_sweep peripheral.
+
+    The peripheral is on the QPeriphB port of the tProc and gets every shot of one readout from its averaging buffer.
+    It averages the shots of a frequency, keeps the frequency with the largest (or smallest) power, and can stop a frequency early when its shots agree.
+    The tProc plays the shots: these macros send the commands of the peripheral and make the loops around the shot.
+
+    This is for internal use; user code should use the methods of AdaptiveSweepProgramV2.
+    """
+    # operations of the peripheral, as firmware/ip/adaptive_sweep/src/adaptive_sweep.v decodes them
+    CFG_WINDOW, CFG_ACQ, CFG_GDKW = 0, 1, 2
+    START, RUN_KW, CLR_RESULT, REARM, CFG_INTERRUPT = 8, 9, 10, 11, 15
+    GET_FREQ, GET_STATUS, GET_DIAG, GET_MEAN = 16, 17, 18, 19
+
+    # fields (name, first bit, number of bits) of the words the peripheral answers with
+    # GET_STATUS, first word
+    STATUS = [('nothing_seen', 0, 1), ('finish_seen', 1, 1), ('busy', 2, 1), ('mode', 3, 1),
+              ('warmup_done', 7, 1), ('early_stop', 8, 1), ('bad_window', 9, 1), ('estop_en', 10, 1),
+              ('dest', 11, 1), ('capped', 12, 1), ('converged', 13, 1), ('gdkw_busy', 14, 1),
+              ('freq_pending', 15, 1), ('point_idx', 16, 16)]
+    # GET_DIAG, second word: how the last point ended (it took 2**k shots if it stopped early)
+    DIAG = [('type', 0, 3), ('k', 3, 5), ('converged', 8, 1), ('saturated', 9, 1), ('nconv_count', 16, 16)]
+    # RUN_KW, second word of the answer
+    KW_STATUS = [('converged', 0, 1), ('capped', 1, 1), ('nothing_seen', 2, 1), ('bad_window', 3, 1), ('iterations', 16, 16)]
+
+    @staticmethod
+    def unpack(word, fields):
+        # split a word (or an array of words) into its fields
+        return {name: (word >> lsb) & (2**nbits - 1) for name, lsb, nbits in fields}
+
+    def __repr__(self):
+        return "%s(name=%r)"%(type(self).__name__, self.name)
+
+    def expand(self, prog):
+        return self.insts
+
+    def _add(self, prog, asm):
+        # the macros of a sweep include timed ones (the shot), so they step through the timeline here, in program order
+        for macro in asm.macro_list:
+            macro.preprocess(prog)
+        self.insts.extend(asm.macro_list)
+
+    def _config(self, prog, asm, s):
+        # send the acquisition setup of a grid or search
+        asm.qpb_select()
+        # the control word: [0] dip, [6] early stop, [7] block test, [8] short confirmation, [19:17] passes needed to stop
+        ctrl = s.mode
+        if s.early_stop:
+            ctrl |= 1 << 6 | s.block_en << 7 | s.short_confirm << 8 | s.confirm << 17
+        asm.qpb_cmd(self.CFG_ACQ, 0, ctrl, 0, s.n_min)
+        if s.early_stop:
+            # an early stop interrupts the tProc: note which sweep is running, and which trigger the peripheral cancels
+            prog.add_reg("sweep_id", allow_reuse=True)
+            asm.write_reg(dst="sweep_id", src=s.sweep_id)
+            asm.qpb_cmd(self.CFG_INTERRUPT, 1 << prog.soccfg['readouts'][s.ro_ch]['trigger_port'])
+            # from here on the peripheral waits after an early stop until the tProc sends REARM again
+            asm.qpb_cmd(self.REARM)
+
+    def _set_freq(self, prog, asm, pulse, src):
+        # write a frequency word (literal or register) to the waveforms of a pulse
+        for wave in prog.list_pulse_waveforms(pulse):
+            asm.read_wmem(wave)
+            asm.write_reg(dst='w_freq', src=src)
+            asm.write_wmem(wave)
+
+    def _step_freq(self, prog, asm, pulse, step):
+        # step the frequency of the waveforms of a pulse, as CloseLoop does for a sweep
+        for wave in prog.list_pulse_waveforms(pulse):
+            asm.read_wmem(wave)
+            asm.inc_reg(dst='w_freq', src=step)
+            asm.write_wmem(wave)
+
+    def _shots(self, prog, asm, s):
+        # play the shots of one frequency: the shot of the program, reps times
+        reg = prog.add_reg("sweep_shot", allow_reuse=True)
+        asm.write_reg(dst=reg, src=0)
+        # before this the tProc stepped the frequency or waited for the peripheral, for a time that the timeline does not know:
+        # make sure that the first shot is not late
+        asm.resync()
+        asm.label(s.name + "_shot")
+        s.shot = prog._shot()
+        asm.extend_macros(s.shot)
+        asm.append_macro(LoopBack(label=s.name + "_shot", reg=reg, n=prog.reps))
+
+    def _result(self, prog, asm, s, start, status=None):
+        # copy the answer of the peripheral to the result block in data memory:
+        # frequency word, first word of the grid (None: already written), status, shots of the last point
+        asm.write_dmem(addr=s.result_addr, src='s_core_r1')
+        if start is not None:
+            asm.write_dmem(addr=s.result_addr + 1, src=start)
+        if status is not None:
+            asm.write_dmem(addr=s.result_addr + 2, src=status)
+        asm.qpb_ack()
+        # the peripheral holds its answer and refuses every read until this command
+        asm.qpb_cmd(self.CLR_RESULT)
+        if status is None:
+            asm.qpb_cmd(self.GET_STATUS)
+            asm.qpb_wait('new')
+            asm.write_dmem(addr=s.result_addr + 2, src='s_core_r1')
+            asm.qpb_ack()
+        asm.qpb_cmd(self.GET_DIAG)
+        asm.qpb_wait('new')
+        asm.write_dmem(addr=s.result_addr + 3, src='s_core_r1')
+        if s.record_points:
+            # the last point ends together with the sweep, so its record is written here and not at the early stop
+            reg = prog.add_reg("sweep_addr", allow_reuse=True)
+            asm.write_reg(dst=reg, src=s.points_addr + s.n_points - 1)
+            asm.write_dmem(addr=reg, src='s_core_r2')
+        asm.qpb_ack()
+
+    def _landing(self, prog, asm, s, point=None):
+        # where the tProc goes when the peripheral stops a frequency early
+        # the tProc is somewhere in the shots of that frequency, and the shot it has already sent out may still be measured:
+        # wait until that shot is over, let the peripheral go on (REARM) and continue after the shots
+
+        # from the timeline of the shot: the end of its readout window, and the time from one shot to the next
+        t_ro = float([m for m in s.shot.macro_list if isinstance(m, Wait)][-1].t_params['t']) - prog.final_wait
+        t_shot = float([m for m in s.shot.macro_list if isinstance(m, Delay)][-1].t_params['t'])
+        # the program itself goes around this block
+        asm.jump(s.name + "_end")
+        asm.label(s.name + "_landing")
+        # the interrupt may have left the readout trigger high
+        asm.asm_inst({'CMD':'TRIG', 'SRC':'clr', 'DST':str(prog.soccfg['readouts'][s.ro_ch]['trigger_port']), 'TIME':'@0'})
+        if s.record_points:
+            # how the point ended (GET_DIAG), one word per point
+            reg = prog.add_reg("sweep_addr", allow_reuse=True)
+            asm.qpb_cmd(self.GET_DIAG)
+            asm.qpb_wait('new')
+            asm.alu_reg(dst=reg, arg1=point, op='+', arg2=s.points_addr)
+            asm.write_dmem(addr=reg, src='s_core_r2')
+            asm.qpb_ack()
+        # reference time still ahead: the shot that was sent out has not started and the interrupt cancelled its trigger, so there is nothing to wait for
+        asm.cond_jump(label=s.name + "_idle", arg1='s_usr_time', test='S')
+        # otherwise its readout window may be open: wait until it has closed and the shot has reached the peripheral
+        asm.wait(t_ro + t_shot)
+        asm.qpb_cmd(self.REARM)
+        # the wait left the reference time in the past
+        asm.resync(t_shot)
+        asm.jump(s.name + "_rearmed")
+        asm.label(s.name + "_idle")
+        asm.qpb_cmd(self.REARM)
+        asm.delay(t_shot)
+        asm.label(s.name + "_rearmed")
+        asm.jump(s.name + "_next")
+        asm.label(s.name + "_end")
+
+    def _grids(self, prog, stages):
+        # a grid over the band, then finer grids that the tProc places around the winner of the grid before
+        # first words of the grid that is running
+        gen = prog.add_reg("sweep_gen", allow_reuse=True)
+        ro = prog.add_reg("sweep_ro", allow_reuse=True)
+        point = prog.add_reg("sweep_point", allow_reuse=True)
+        band = stages[0]
+        for k, s in enumerate(stages):
+            asm = AsmV2()
+            if k == 0:
+                asm.write_reg(dst=gen, src=s.gen_start)
+                asm.write_reg(dst=ro, src=s.ro_start)
+            else:
+                self._place(prog, asm, s, stages[k-1], band)
+            self._config(prog, asm, s)
+            asm.qpb_cmd(self.CFG_WINDOW, gen, s.gen_step, s.n_points, prog.reps.bit_length()-1)
+            # both waveforms get the first point before the peripheral starts
+            self._set_freq(prog, asm, self.pulse, gen)
+            self._set_freq(prog, asm, self.ro_cfg, ro)
+            asm.qpb_cmd(self.START)
+            # wait until the peripheral has taken the job: the "ready" from before the START must not be read as its end
+            asm.qpb_wait('busy')
+            asm.write_reg(dst=point, src=0)
+            asm.label(s.name + "_point")
+            self._shots(prog, asm, s)
+            # an early stop comes back here
+            asm.label(s.name + "_next")
+            self._step_freq(prog, asm, self.pulse, s.gen_step)
+            self._step_freq(prog, asm, self.ro_cfg, s.ro_step)
+            asm.append_macro(LoopBack(label=s.name + "_point", reg=point, n=s.n_points))
+            asm.qpb_wait('ready')
+            asm.qpb_wait('new')
+            self._result(prog, asm, s, gen)
+            self._add(prog, asm)
+            if s.early_stop:
+                asm = AsmV2()
+                self._landing(prog, asm, s, point=point)
+                self._add(prog, asm)
+
+    def _place(self, prog, asm, s, previous, band):
+        # put the first words of this grid in the registers: its window centered on the winner of the grid before, moved inward at the edges of the band
+        gen, ro = "sweep_gen", "sweep_ro"
+        seek_gen = prog.add_reg("sweep_seek_gen", allow_reuse=True)
+        seek_ro = prog.add_reg("sweep_seek_ro", allow_reuse=True)
+        tmp = prog.add_reg("sweep_tmp", allow_reuse=True)
+        winner = prog.add_reg("sweep_winner", allow_reuse=True)
+        # the peripheral only gives the generator word of the winner: walk the grid before, with both words, until it is found
+        asm.read_dmem(dst=winner, addr=previous.result_addr)
+        asm.write_reg(dst=seek_gen, src=gen)
+        asm.write_reg(dst=seek_ro, src=ro)
+        asm.write_reg(dst=tmp, src=0)
+        asm.label(s.name + "_seek")
+        asm.cond_jump(label=s.name + "_found", arg1=seek_gen, test='Z', op='-', arg2=winner)
+        asm.inc_reg(dst=seek_gen, src=previous.gen_step)
+        asm.inc_reg(dst=seek_ro, src=previous.ro_step)
+        asm.append_macro(LoopBack(label=s.name + "_seek", reg=tmp, n=previous.n_points))
+        # the winner is always a point of the grid
+        asm.end()
+        asm.label(s.name + "_found")
+        # the window, and its half on the frequency steps that the generator and the readout share
+        span = (s.n_points-1)*s.gen_step
+        half = span//self.gen_q//2
+        # too close to an edge of the band if (winner - low edge) < half or (high edge - winner) < span - half
+        for edge, distance, label, sign in [(band.gen_start, half*self.gen_q, "_low", 1), (self.gen_limit, span - half*self.gen_q, "_high", -1)]:
+            if distance == 0:
+                continue
+            asm.write_reg(dst=tmp, src=edge)
+            if sign > 0:
+                asm.alu_reg(dst=winner, arg1=seek_gen, op='-', arg2=tmp)
+            else:
+                asm.alu_reg(dst=winner, arg1=tmp, op='-', arg2=seek_gen)
+            # a negative difference is a distance of more than 2**31 words, far from this edge
+            asm.cond_jump(label=s.name + label + "_ok", arg1=winner, test='S')
+            asm.write_reg(dst=tmp, src=distance)
+            asm.cond_jump(label=s.name + label, arg1=winner, test='S', op='-', arg2=tmp)
+            asm.label(s.name + label + "_ok")
+        asm.alu_reg(dst=gen, arg1=seek_gen, op='-', arg2=half*self.gen_q)
+        asm.alu_reg(dst=ro, arg1=seek_ro, op='-', arg2=_s32(half*self.ro_q))
+        asm.jump(s.name + "_placed")
+        asm.label(s.name + "_low")
+        asm.write_reg(dst=gen, src=band.gen_start)
+        asm.write_reg(dst=ro, src=band.ro_start)
+        asm.jump(s.name + "_placed")
+        asm.label(s.name + "_high")
+        asm.write_reg(dst=gen, src=_s32(self.gen_limit - span))
+        asm.write_reg(dst=ro, src=_s32(self.ro_limit - (s.n_points-1)*s.ro_step))
+        asm.label(s.name + "_placed")
+
+class LoopSweep(AdaptiveSweep):
+    # a grid that is a loop of the program: this part configures and starts the peripheral, before the loop
+    # name (of the loop), pulse, n_points, and the options of the sweep
+    def preprocess(self, prog):
+        # QICK has already converted the frequency sweep of the pulse: its first word and its step in this loop
+        freq = prog._get_wave(prog.list_pulse_waveforms(self.pulse)[0]).freq
+        if not isinstance(freq, QickRawParam) or self.name not in freq.spans:
+            raise RuntimeError("the frequency of pulse %s is not swept in loop %s"%(self.pulse, self.name))
+        self.gen_start = _s32(freq.start)
+        self.gen_step = freq.steps[self.name]['step']
+        self.insts = []
+        asm = AsmV2()
+        self._config(prog, asm, self)
+        asm.qpb_cmd(self.CFG_WINDOW, self.gen_start, self.gen_step, self.n_points, prog.reps.bit_length()-1)
+        asm.qpb_cmd(self.START)
+        # wait until the peripheral has taken the job: the "ready" from before the START must not be read as its end
+        asm.qpb_wait('busy')
+        self._add(prog, asm)
+
+class LoopSweepEnd(Macro):
+    # the part of a LoopSweep after the loop: read the answer of the peripheral
+    # sweep
+    def preprocess(self, prog):
+        sweep = self.sweep
+        asm = AsmV2()
+        asm.qpb_wait('ready')
+        asm.qpb_wait('new')
+        sweep._result(prog, asm, sweep, sweep.gen_start)
+        if sweep.early_stop:
+            # the loop register of the program counts the points
+            sweep._landing(prog, asm, sweep, point=sweep.name)
+        for macro in asm.macro_list:
+            macro.preprocess(prog)
+        sweep.end_insts = asm.macro_list
+
+    def expand(self, prog):
+        return self.sweep.end_insts
+
+class CoarseToFineSweep(AdaptiveSweep):
+    # a grid over a band, then finer grids that the tProc places around the winner of the grid before
+    # name, pulse, ro_cfg, stages, gen_limit, ro_limit, gen_span, gen_q, ro_q
+    def preprocess(self, prog):
+        self.insts = []
+        self._grids(prog, self.stages)
+
+class KwSweep(AdaptiveSweep):
+    # a search where the peripheral picks every frequency and hands it to the tProc
+    # name, pulse, ro_cfg, the words that kw_sweep() computed, and the options of the sweep;
+    # grids: the coarse-to-fine grids before the search, with gen_limit, ro_limit, gen_span, gen_q, ro_q of their band
+    def preprocess(self, prog):
+        self.insts = []
+        gen = prog.add_reg("sweep_gen", allow_reuse=True)
+        ro = prog.add_reg("sweep_ro", allow_reuse=True)
+        if self.grids:
+            self._grids(prog, self.grids)
+            # the first grid of the search, around the winner of the last grid; its low edge goes to the result block now,
+            # because the probes overwrite the register
+            asm = AsmV2()
+            self._place(prog, asm, self, self.grids[-1], self.grids[0])
+            asm.write_dmem(addr=self.result_addr + 1, src=gen)
+            # the tProc has 16 registers: the search uses those the grids leave free. _place left both words of the winner in
+            # sweep_seek_gen/sweep_seek_ro, the base of the readout words; the high edge goes through sweep_winner, the ratio into sweep_point
+            gen_base, ro_base, f_hi, ratio = "sweep_seek_gen", "sweep_seek_ro", "sweep_winner", "sweep_point"
+            tmp = prog.add_reg("sweep_tmp", allow_reuse=True)
+            asm.alu_reg(dst=f_hi, arg1=gen, op='+', arg2=self.f_hi)
+            start, f_lo, gen_x0, ro_x0 = gen, gen, gen, ro
+        else:
+            gen_base = prog.add_reg("sweep_gen_base", allow_reuse=True)
+            ro_base = prog.add_reg("sweep_ro_base", allow_reuse=True)
+            ratio = prog.add_reg("sweep_ratio", allow_reuse=True)
+            tmp = prog.add_reg("sweep_tmp", allow_reuse=True)
+            asm = AsmV2()
+            start, f_lo, f_hi, gen_x0, ro_x0 = self.gen_start, self.f_lo, self.f_hi, self.gen_x0, self.ro_x0
+        self._config(prog, asm, self)
+        asm.qpb_cmd(self.CFG_WINDOW, start, self.gen_step, self.n_points, prog.reps.bit_length()-1)
+        asm.qpb_cmd(self.CFG_GDKW, f_lo, f_hi)
+        # the peripheral only gives generator words: what the tProc needs to compute the readout word
+        if not self.grids:
+            asm.write_reg(dst=gen_base, src=self.gen_base)
+            asm.write_reg(dst=ro_base, src=self.ro_base)
+        asm.write_reg(dst=ratio, src=self.ro_ratio)
+        self._set_freq(prog, asm, self.pulse, gen_x0)
+        self._set_freq(prog, asm, self.ro_cfg, ro_x0)
+        asm.qpb_cmd(self.RUN_KW, gen_x0, 0, self.min_step, self.max_iter)
+        # wait until the peripheral has taken the job: the "ready" from before the RUN_KW must not be read as its end
+        asm.qpb_wait('busy')
+        asm.label(self.name + "_probe")
+        # "ready" (bit_qpb_rdy) means the search is over; test it before a read, which would overwrite the answer
+        asm.cond_jump(label=self.name + "_done", arg1='s_status', test='NZ', op='&', arg2=0x0400)
+        asm.qpb_cmd(self.GET_FREQ)
+        asm.qpb_wait('new')
+        asm.write_reg(dst=gen, src='s_core_r1')
+        asm.write_reg(dst=tmp, src='s_core_r2')
+        asm.cond_jump(label=self.name + "_done", arg1='s_status', test='NZ', op='&', arg2=0x0400)
+        asm.qpb_ack()
+        # bit 0 of the second word: a frequency is waiting for its shots; if not, ask again
+        asm.cond_jump(label=self.name + "_probe", arg1=tmp, test='Z', op='&', arg2=1)
+        # readout word: ro = ro_base + (((gen - gen_base) >> pre) * ratio) >> post
+        asm.alu_reg(dst=tmp, arg1=gen, op='-', arg2=gen_base)
+        if self.ro_pre:
+            asm.alu_reg(dst=tmp, arg1=tmp, op='ASR', arg2=self.ro_pre)
+        # the ARITH unit answers in s_core_r1/s_core_r2 like the peripheral: select it (cfg_src_arith), and the peripheral again after
+        asm.write_reg(dst='s_cfg', src=0x01)
+        asm.asm_inst({'CMD':'ARITH', 'C_OP':'T', 'R1':prog._get_reg(tmp), 'R2':prog._get_reg(ratio)})
+        # wait for bit_arith_new
+        asm.append_macro(WaitStatus(mask=0x0002, test='Z'))
+        # the low word of the 64-bit product shifted right by post: (high << (32-post)) | (low >> post)
+        asm.alu_reg(dst=ro, arg1='s_core_r2', op='SL', arg2=min(15, 32-self.ro_post))
+        if 32-self.ro_post > 15:
+            asm.alu_reg(dst=ro, arg1=ro, op='SL', arg2=32-self.ro_post-15)
+        asm.alu_reg(dst=tmp, arg1='s_core_r1', op='SR', arg2=self.ro_post)
+        asm.alu_reg(dst=ro, arg1=ro, op='OR', arg2=tmp)
+        asm.alu_reg(dst=ro, arg1=ro, op='+', arg2=ro_base)
+        # clear the flag of the ARITH unit and select the peripheral (ctrl_clr_arith + cfg_src_qpb)
+        asm.write_reg(dst='s_ctrl', src=0x10005)
+        self._set_freq(prog, asm, self.pulse, gen)
+        self._set_freq(prog, asm, self.ro_cfg, ro)
+        self._shots(prog, asm, self)
+        # an early stop comes back here
+        asm.label(self.name + "_next")
+        asm.jump(self.name + "_probe")
+        asm.label(self.name + "_done")
+        asm.qpb_wait('new')
+        self._result(prog, asm, self, None if self.grids else self.gen_start, status='s_core_r2')
+        self._add(prog, asm)
+        asm = AsmV2()
+        self._landing(prog, asm, self)
+        self._add(prog, asm)
+
+class AdaptiveSweepProgramV2(AveragerProgramV2):
+    """Use this as a base class for programs where the adaptive_sweep peripheral searches for a resonance.
+    You write _initialize() and _body() as for AveragerProgramV2: the content of your _body() is a shot, and it is played "reps" times at every frequency.
+    The peripheral gets every shot from the averaging buffer of the readout, averages the shots of a frequency, and keeps the frequency with the largest (or smallest) power.
+
+    In _initialize() you declare the search, with one of these:
+
+    * adaptive_sweep(): the peripheral watches a loop that you made with add_loop() and that sweeps the frequency of a pulse.
+      This is an ordinary QICK sweep, and acquire() returns the data of all points as usual.
+    * coarse_to_fine_sweep(): a grid over a band, then finer grids around the winner of the grid before. You can declare several.
+    * kw_sweep(): a search where the peripheral picks every frequency, optionally after coarse-to-fine grids. You can declare several.
+
+    What is different from AveragerProgramV2:
+
+    * reps must be a power of 2, because the peripheral averages with a shift.
+    * The reps loop is always innermost, because the peripheral averages consecutive shots.
+    * Before the first shot of every frequency the program makes sure that it is not late (resync()).
+      The tProc steps the frequency there, or waits for the peripheral, for a time that the timeline does not know:
+      between two grids of coarse_to_fine_sweep() it walks the grid before to find its winner, and in kw_sweep() it gets every frequency from the peripheral.
+      So the first shot of a frequency can come later than final_delay after the shot before it, but the shots of one frequency keep their spacing.
+    * The peripheral can skip shots (early stop, kw search). Such a program has no fixed number of shots: run it with run_rounds() (acquire() will refuse), and its end is counted on the second tProc counter.
+    * get_sweep_result() reads the answer of the peripheral.
+
+    The threshold of the early stop and the tolerance of its block test are registers of the peripheral: set them with its driver before running the program.
+
+    Parameters
+    ----------
+    soccfg : QickConfig
+        The QICK firmware configuration dictionary.
+    cfg : dict
+        Your program configuration dictionary.
+    reps : int
+        Number of shots at each frequency, a power of 2.
+    final_delay : float
+        Amount of time (in us) to add at the end of the shot timeline, see AveragerProgramV2.
+    final_wait : float
+        Amount of time (in us) to pause tProc execution at the end of each shot, see AveragerProgramV2.
+    initial_delay : float
+        Amount of time (in us) to add to the timeline before starting to run the sweeps, see AveragerProgramV2.
+    """
+
+    COUNTER_ADDR = 1
+    # tProc counter that counts the completed runs of the program
+    DONE_ADDR = 2
+
+    def __init__(self, soccfg, reps, final_delay, final_wait=0, initial_delay=1.0, cfg=None):
+        if reps < 1 or reps & (reps-1) or reps > 2**23:
+            raise RuntimeError("reps must be a power of 2 (the adaptive_sweep peripheral averages with a shift) and at most 2**23, got %d"%(reps))
+        super().__init__(soccfg, reps=reps, final_delay=final_delay, final_wait=final_wait, initial_delay=initial_delay, reps_innermost=True, cfg=cfg)
+
+    def _init_declarations(self):
+        super()._init_declarations()
+        # the sweeps of the peripheral, by name
+        self.sweeps = OrderedDict()
+        # number of copies of the shot in the program
+        self.n_shots = 0
+
+    def compile(self):
+        # we should only need to compile once
+        if self.binprog is not None:
+            return
+        super().compile()
+
+        # every grid plays its own copy of the shot, so the triggers of a shot were counted once per copy
+        for ro in self.ro_chs.values():
+            ro['trigs'] //= self.n_shots
+        stages = self._stages()
+        if any([s.early_stop for s in stages]):
+            # the number of shots is not known: the program is complete when the second counter says so
+            self.setup_counter(counter_addr=self.DONE_ADDR, loop_dims=[1])
+        else:
+            # the data shape: every point of every grid, reps shots each
+            self.setup_acquire(counter_addr=self.COUNTER_ADDR, loop_dims=[sum([s.n_points for s in stages]), self.reps], avg_level=1)
+
+    def _make_binprog(self):
+        super()._make_binprog()
+        # the interrupt vector of the tProc: where an early stop of the peripheral sends the program (0 for nowhere)
+        self.binprog['ipc'] = int(self.labels.get('sweep_interrupt', '&0')[1:])
+
+    def compile_datamem(self):
+        """The result block of every sweep (4 words) and its per-point records, as zeros: reload_mem() then clears them before each round.
+
+        Returns
+        -------
+        numpy.ndarray of int or None
+            data to write
+        """
+        blocks = []
+        for s in self._stages():
+            # the result block is written with literal addresses, which are 10 bits
+            if s.result_addr < 0 or s.result_addr + 4 > 1024:
+                raise RuntimeError("the result block of %s must be in the first 1024 words of data memory"%(s.name))
+            blocks.append((s.result_addr, s.result_addr + 4, s.name))
+            if s.record_points:
+                blocks.append((s.points_addr, s.points_addr + s.n_points, s.name))
+        for i, (start, stop, name) in enumerate(blocks):
+            for start2, stop2, name2 in blocks[:i]:
+                if start < stop2 and start2 < stop:
+                    raise RuntimeError("%s and %s use the same data memory: give them different result_addr or points_addr"%(name2, name))
+        if not blocks:
+            return None
+        return np.zeros(max([stop for start, stop, name in blocks]), dtype=np.int32)
+
+    def prepare_round(self):
+        if self.acquire_params['type'] == 'run_rounds':
+            # no data is read, but the peripheral gets its shots from the averaging buffer, so the buffer must run
+            self.config_bufs(self.acquire_params['soc'], enable_avg=True, enable_buf=False)
+        elif self.counter_addr == self.DONE_ADDR:
+            raise RuntimeError("the peripheral can skip shots in this program (early stop or kw search), so there is no fixed set of shots to acquire: use run_rounds()")
+        super().prepare_round()
+
+    def _stages(self):
+        # every grid or search of the program, in the order they run
+        stages = []
+        for sweep in self.sweeps.values():
+            stages.extend(getattr(sweep, 'stages', [sweep]))
+        return stages
+
+    def _shot(self):
+        # make a copy of the shot as AveragerProgramV2 plays it: the body, the final wait and delay, the shot counter
+        shot = AsmV2()
+        macro_list, self.macro_list = self.macro_list, shot.macro_list
+        self._body(self.cfg)
+        if self.final_wait is not None:
+            self.wait_auto(self.final_wait, no_warn=True)
+        if self.final_delay is not None:
+            self.delay_auto(self.final_delay)
+        self.inc_ext_counter(addr=self.COUNTER_ADDR)
+        self.macro_list = macro_list
+        self.n_shots += 1
+        return shot
+
+    def _sweep_words(self, pulse, start, stop, n):
+        # convert a frequency sweep of a declared pulse or readout config to register words, the way add_pulse() and add_readoutconfig() do
+        # returns the first word and the step; the words are not wrapped to the DDS range
+        p = self.pulses[pulse]
+        par = {k: QickParam(v.start, v.spans.copy()) if isinstance(v, QickParam) else v for k, v in p.params.items()}
+        par['freq'] = QickSweep1D("sweep", start, stop)
+        freq = p.ch_mgr.make_pulse(par).waveforms[0].freq
+        freq.to_steps({"sweep": n})
+        return freq.start, freq.steps["sweep"]["step"]
+
+    def _word2freq(self, gen_ch, word):
+        # frequency in MHz of a generator register word (or an array of words)
+        gencfg = self.soccfg['gens'][gen_ch]
+        freq = self.reg2freq(word % 2**gencfg['b_dds'], gen_ch=gen_ch)
+        if self.ABSOLUTE_FREQS and gencfg['has_mixer']:
+            freq += self.gen_chs[gen_ch]['mixer_freq']['rounded']
+        return freq
+
+    def _sweep_options(self, name, ro_ch, mode, early_stop, n_min, confirm, short_confirm, block_en, record_points):
+        # check the options that the sweeps share, and return them as the attributes of the sweep
+        if name in self.sweeps:
+            raise RuntimeError("sweep name %s is already used"%(name))
+        if ro_ch not in self.ro_chs:
+            raise RuntimeError("readout %s feeds the peripheral, but it is not declared"%(ro_ch))
+        if mode not in ['peak', 'dip']:
+            raise RuntimeError("mode must be peak or dip, got %s"%(mode))
+        if early_stop:
+            if self.final_wait is None or self.final_delay is None:
+                raise RuntimeError("the early stop needs final_wait and final_delay: they tell how long a shot takes")
+            if self.soccfg['readouts'][ro_ch]['trigger_type'] == 'dport':
+                raise RuntimeError("the early stop cancels the readout trigger of a shot, and it can only do that on a tProc trigger port")
+            if short_confirm and block_en:
+                raise RuntimeError("short_confirm and block_en can't be used together")
+            if confirm is None:
+                confirm = 3 if short_confirm else 2
+            if not 1 <= confirm <= 7 or not 0 <= n_min <= self.reps:
+                raise RuntimeError("confirm must be 1 to 7 and n_min at most reps, got %d and %d"%(confirm, n_min))
+            if not short_confirm:
+                # a point is checked at 4, 8, 16, ... shots (from 8 with the block test), the last time at reps/2
+                first = (8 if block_en else 4) << (confirm-1)
+                while first < n_min:
+                    first *= 2
+                if first > self.reps//2:
+                    raise RuntimeError("the early stop can never happen: with confirm=%d, n_min=%d%s the first possible stop is at %d shots, but the last check is at reps/2 = %d"%(confirm, n_min, " and block_en" if block_en else "", first, self.reps//2))
+        elif n_min or confirm is not None or short_confirm or block_en:
+            raise RuntimeError("n_min, confirm, short_confirm and block_en are options of the early stop")
+        return dict(ro_ch=ro_ch, mode=['peak', 'dip'].index(mode), early_stop=early_stop, n_min=n_min, confirm=confirm,
+                    short_confirm=short_confirm, block_en=block_en, record_points=early_stop and record_points,
+                    sweep_id=len([s for s in self._stages() if s.early_stop]))
+
+    def adaptive_sweep(self, loop, pulse, ro_ch=None, mode="peak", early_stop=False, n_min=0, confirm=None, short_confirm=False, block_en=False, record_points=True, result_addr=0, points_addr=None):
+        """Let the adaptive_sweep peripheral watch a loop that sweeps the frequency of a pulse.
+        You make the sweep in the QICK way: add_loop() for the loop, and a QickSweep1D on that loop as the frequency of the pulse (and of the readout config, if the readout follows the pulse).
+        The loop must be the only loop of the program.
+        The peripheral averages the reps shots of every point and keeps the best point; the program runs as it would without the peripheral.
+
+        With the early stop the peripheral checks the shots of a point while they come in (at 4, 8, 16, ... shots).
+        A check passes when the odd and the even shots agree to the threshold that is set in the peripheral (driver method set_estop_thr()).
+        After enough passes the peripheral stops the point: it interrupts the tProc, which skips the rest of the shots of that point.
+
+        Parameters
+        ----------
+        loop : str
+            Name of the loop, as used in add_loop() and in the sweep. This is also the name of the sweep in get_sweep_result().
+        pulse : str
+            Name of the pulse with the swept frequency (as used in add_pulse())
+        ro_ch : int
+            Readout channel that feeds the peripheral (index in 'readouts' list). Optional if the program declares one readout.
+        mode : str
+            "peak" to keep the point with the largest power, "dip" for the smallest
+        early_stop : bool
+            Let the peripheral stop a point early.
+        n_min : int
+            Early stop: smallest number of shots a point must have before it can stop.
+        confirm : int
+            Early stop: number of checks in a row that must pass, 1 to 7. The default is 2 (3 with short_confirm).
+        short_confirm : bool
+            Early stop: after the first passing check at n shots, do the following checks at n+2, n+4, ... shots (instead of 2n, 4n, ...), and return the mean of the first n shots.
+        block_en : bool
+            Early stop: a check must also find that the first and second half of the shots agree, to the tolerance that is set in the peripheral (driver method set_block_tol()).
+        record_points : bool
+            Early stop: keep in data memory how many shots each point took. get_sweep_result() returns them.
+        result_addr : int
+            Data memory address of the result block (4 words).
+        points_addr : int
+            Data memory address of the per-point records (one word per point). The default is right after the result block.
+        """
+        if ro_ch is None:
+            if len(self.ro_chs) != 1:
+                raise RuntimeError("this program declares %d readouts: say with ro_ch which one feeds the peripheral"%(len(self.ro_chs)))
+            ro_ch = list(self.ro_chs)[0]
+        opts = self._sweep_options(loop, ro_ch, mode, early_stop, n_min, confirm, short_confirm, block_en, record_points)
+        if points_addr is None:
+            points_addr = result_addr + 4
+        # the grid itself (n_points, gen_start, gen_step) is filled in when the program is compiled
+        self.sweeps[loop] = LoopSweep(name=loop, pulse=pulse, result_addr=result_addr, points_addr=points_addr, **opts)
+
+    def coarse_to_fine_sweep(self, name, pulse, ro_cfg, start, stop, steps, windows=None, mode="peak", early_stop=False, n_min=0, confirm=None, short_confirm=False, block_en=False, record_points=True, result_addr=0, points_addr=None):
+        """Declare a coarse-to-fine tuning: a grid over a band, then successively finer grids.
+        The first grid covers the band from start to stop.
+        Each later grid is centered on the winner of the grid before, and moved inward if it would leave the band; the tProc places it while the program runs.
+        The frequencies are converted the way add_pulse() converts a QickSweep1D.
+
+        The pulse and the readout config must be declared before this, each with one waveform frequency (any value: the search rewrites it).
+        The peripheral averages the reps shots of every point of a grid and keeps the best point.
+
+        Parameters
+        ----------
+        name : str
+            Name of the sweep. The grids are named <name>_stage0, <name>_stage1, ...
+        pulse : str
+            Name of the pulse whose frequency is searched (as used in add_pulse())
+        ro_cfg : str
+            Name of the readout config that follows the pulse (as used in add_readoutconfig())
+        start : float
+            Low edge of the band (MHz)
+        stop : float
+            High edge of the band (MHz)
+        steps : list of float
+            The frequency step of each grid (MHz), decreasing. For example [25, 5, 0.5]; one step gives a plain grid over the band.
+        windows : list of float
+            The half-width (MHz) of each grid after the first, around the winner of the grid before.
+            Twice a window must be a multiple of the step of its grid. The default is the step of the grid before.
+        mode, early_stop, n_min, confirm, short_confirm, block_en, record_points :
+            See adaptive_sweep(); they apply to every grid.
+        result_addr : int
+            Data memory address of the result block of the first grid (4 words); the next grids follow.
+        points_addr : int
+            Data memory address of the per-point records of the first grid; the next grids follow. The default is right after the result blocks.
+        """
+        ro_ch = self.pulses[ro_cfg].ch_mgr.ch
+        opts = self._sweep_options(name, ro_ch, mode, early_stop, n_min, confirm, short_confirm, block_en, record_points)
+        stages, band = self._grid_stages(name, pulse, ro_cfg, start, stop, steps, windows, opts, result_addr, points_addr)
+        self.sweeps[name] = CoarseToFineSweep(name=name, pulse=pulse, ro_cfg=ro_cfg, stages=stages, **band)
+
+    def _grid_stages(self, name, pulse, ro_cfg, start, stop, steps, windows, opts, result_addr, points_addr):
+        # the grids of a coarse-to-fine tuning (see coarse_to_fine_sweep()), and the band they are placed in
+        gen_ch, ro_ch = self.pulses[pulse].ch_mgr.ch, self.pulses[ro_cfg].ch_mgr.ch
+        early_stop = opts['early_stop']
+        steps = list(steps)
+        windows = steps[:-1] if windows is None else list(windows)
+        if stop <= start or not steps or steps[-1] <= 0 or any([a <= b for a, b in zip(steps, steps[1:])]) or len(windows) != len(steps) - 1:
+            raise RuntimeError("a coarse-to-fine tuning needs start < stop, decreasing steps, and one window for each grid after the first")
+        schedule = list(zip(steps, [None] + windows))
+        # the band in generator and readout words
+        gen_start, ro_start = self._sweep_words(pulse, start, start, 1)[0], self._sweep_words(ro_cfg, start, start, 1)[0]
+        gen_limit, ro_limit = self._sweep_words(pulse, stop, stop, 1)[0], self._sweep_words(ro_cfg, stop, stop, 1)[0]
+        if points_addr is None:
+            points_addr = result_addr + 4*len(schedule)
+        stages = []
+        for k, (step, window) in enumerate(schedule):
+            n = int(np.floor(np.round((stop-start)/step, 9))) + 1
+            if k > 0:
+                if window <= 0 or abs(2*window/step - np.round(2*window/step)) > 1e-9:
+                    raise RuntimeError("the window of grid %d must be a half-width in MHz, with twice the window a multiple of the step"%(k))
+                n = min(n, int(np.round(2*window/step)) + 1)
+            while True:
+                # the steps of an n-point sweep; one point less if rounding takes the grid out of the band
+                gen_step = self._sweep_words(pulse, start, start + (n-1)*step, n)[1]
+                ro_step = self._sweep_words(ro_cfg, start, start + (n-1)*step, n)[1]
+                if (n-1)*gen_step <= gen_limit - gen_start:
+                    break
+                n -= 1
+            if n > 65535:
+                raise RuntimeError("a grid has at most 65535 points, grid %d has %d"%(k, n))
+            stages.append(SimpleNamespace(name="%s_stage%d"%(name, k), n_points=n, gen_start=_s32(gen_start), ro_start=_s32(ro_start),
+                                          gen_step=gen_step, ro_step=ro_step, result_addr=result_addr + 4*k, points_addr=points_addr, **opts))
+            if early_stop:
+                stages[-1].sweep_id += k
+            if stages[-1].record_points:
+                points_addr += n
+        # generator and readout words of one frequency step that both can make: the windows are placed on these steps
+        gencfg, rocfg = self.soccfg['gens'][gen_ch], self.soccfg['readouts'][ro_ch]
+        gen_q = self.soccfg.calc_fstep_int(gencfg, [rocfg])
+        ro_q = self.soccfg.calc_fstep_int(rocfg, [gencfg]) * (-1 if self.FLIP_DOWNCONVERSION else 1)
+        return stages, dict(gen_limit=_s32(gen_limit), ro_limit=_s32(ro_limit), gen_span=gen_limit - gen_start, gen_q=int(gen_q), ro_q=int(ro_q))
+
+    def kw_sweep(self, name, pulse, ro_cfg, start, stop, min_step, max_iter, n_points=None, x0=None, steps=None, windows=None, mode="peak", n_min=0, confirm=None, short_confirm=False, block_en=False, result_addr=0):
+        """Declare a search where the peripheral picks every frequency (the border search of the adaptive_sweep peripheral).
+        The peripheral first measures a grid of n_points from start to stop, or the three frequencies start, x0 and stop,
+        or, with steps, the grids of a coarse-to-fine tuning, the last of which is the first grid of the search.
+        The best of these and its two neighbours are the border of the search.
+        Then it measures one frequency at a time inside the border and narrows it, until both sides are within min_step of the best frequency.
+        Every frequency is measured with the early stop, with at most reps shots.
+
+        The pulse and the readout config must be declared before this, each with one waveform frequency (any value: the search rewrites it).
+        The tProc gets each frequency as a generator word and computes the readout word from it.
+
+        Parameters
+        ----------
+        name : str
+            Name of the sweep
+        pulse : str
+            Name of the pulse whose frequency is searched (as used in add_pulse())
+        ro_cfg : str
+            Name of the readout config that follows the pulse (as used in add_readoutconfig())
+        start : float
+            Low edge of the search (MHz)
+        stop : float
+            High edge of the search (MHz)
+        min_step : float
+            The search ends when the border is within this distance (MHz) on both sides of the best frequency.
+        max_iter : int
+            Largest number of frequencies the search may measure after the first ones, 1 to 65535.
+        n_points : int
+            Number of points of the first grid, at least 2. Give this, x0 or steps.
+        x0 : float
+            Start from start, x0 and stop instead of a grid (MHz).
+        steps, windows : list of float
+            Grids before the search, as for coarse_to_fine_sweep(); the last grid is the first grid of the search,
+            placed by the tProc around the winner of the grid before it while the program runs.
+            [25] is a grid over the band with a 25 MHz step, as with n_points; [25, 5] first measures that grid,
+            then searches inside +/-25 MHz of its winner, starting from a 5 MHz grid.
+            Every grid is measured with the early stop, as the search.
+        mode, n_min, confirm, short_confirm, block_en :
+            See adaptive_sweep().
+        result_addr : int
+            Data memory address of the result block (4 words). With steps, the result blocks of the grids come first.
+        """
+        gen_ch, ro_ch = self.pulses[pulse].ch_mgr.ch, self.pulses[ro_cfg].ch_mgr.ch
+        opts = self._sweep_options(name, ro_ch, mode, True, n_min, confirm, short_confirm, block_en, False)
+        if [n_points, x0, steps].count(None) != 2:
+            raise RuntimeError("a kw search starts from a grid (give n_points), from start, x0 and stop (give x0), or after coarse-to-fine grids (give steps)")
+        grids, band = [], {}
+        if steps is not None:
+            grids, band = self._grid_stages(name, pulse, ro_cfg, start, stop, steps, windows, opts, result_addr, None)
+            last = grids.pop()
+            if not grids:
+                # one grid over the band: the same as n_points
+                n_points, stop = last.n_points, start + (last.n_points-1)*steps[0]
+        if grids:
+            # the tProc places the search around the winner of the last grid while the program runs: here only its size is known
+            n_points, gen_step, result_addr = last.n_points, last.gen_step, last.result_addr
+            opts['sweep_id'] = last.sweep_id
+            band['ro_step'] = last.ro_step
+            f_lo, f_hi = 0, (n_points-1)*gen_step
+            gen_start, gen_x0, ro_x0 = last.gen_start, 0, 0
+        elif x0 is None:
+            if not 2 <= n_points <= 65535:
+                raise RuntimeError("the grid of a kw search has 2 to 65535 points, got %d"%(n_points))
+            # the grid, converted the way add_pulse() converts a QickSweep1D
+            gen_start, gen_step = self._sweep_words(pulse, start, stop, n_points)
+            ro_x0 = self._sweep_words(ro_cfg, start, stop, n_points)[0]
+            f_lo, f_hi, gen_x0 = gen_start, gen_start + (n_points-1)*gen_step, gen_start
+        else:
+            n_points, gen_step = 0, 0
+            f_lo, f_hi = self._sweep_words(pulse, start, start, 1)[0], self._sweep_words(pulse, stop, stop, 1)[0]
+            gen_start, gen_x0, ro_x0 = f_lo, self._sweep_words(pulse, x0, x0, 1)[0], self._sweep_words(ro_cfg, x0, x0, 1)[0]
+        # the peripheral compares frequency words as unsigned numbers
+        if not 0 <= f_lo < f_hi < 2**32 or (x0 is not None and not f_lo < gen_x0 < f_hi):
+            raise RuntimeError("a kw search needs start < stop inside the range of the DDS, and x0 between them")
+        gen_min = self._sweep_words(pulse, start, start + min_step, 2)[1]
+        if gen_min <= 0 or 2*gen_min > f_hi - f_lo or not 1 <= max_iter < 2**16:
+            raise RuntimeError("min_step must be at least one frequency step and at most half of the search range, and max_iter 1 to 65535")
+        if grids:
+            # the readout word is computed from the generator word, relative to the winner of the last grid, inside the search
+            gen_base, ro_base, max_delta = 0, 0, f_hi - f_lo
+        else:
+            # the readout word is computed from the generator word, relative to the middle of the search range
+            f_mid = (self._word2freq(gen_ch, f_lo) + self._word2freq(gen_ch, f_hi))/2
+            gen_base, ro_base = self._sweep_words(pulse, f_mid, f_mid, 1)[0], self._sweep_words(ro_cfg, f_mid, f_mid, 1)[0]
+            max_delta = max(gen_base - f_lo, f_hi - gen_base)
+        gencfg, rocfg = self.soccfg['gens'][gen_ch], self.soccfg['readouts'][ro_ch]
+        ratio = self.soccfg.calc_fstep_int(rocfg, [gencfg]) / self.soccfg.calc_fstep_int(gencfg, [rocfg])
+        if self.FLIP_DOWNCONVERSION: ratio *= -1
+        ro_ratio, ro_pre, ro_post = _ratio_scaling(ratio, max_delta)
+        sweep = KwSweep(name=name, pulse=pulse, ro_cfg=ro_cfg, n_points=n_points, gen_start=_s32(gen_start), gen_step=gen_step,
+                        f_lo=_s32(f_lo), f_hi=_s32(f_hi), gen_x0=_s32(gen_x0), ro_x0=_s32(ro_x0), min_step=gen_min, max_iter=max_iter,
+                        gen_base=_s32(gen_base), ro_base=_s32(ro_base), ro_ratio=ro_ratio, ro_pre=ro_pre, ro_post=ro_post,
+                        result_addr=result_addr, grids=grids, **band, **opts)
+        if grids:
+            # its grids and the search, in the order the tProc runs them
+            sweep.stages = grids + [sweep]
+        self.sweeps[name] = sweep
+
+    def get_sweep_result(self, soc, name=None):
+        """Read the answer of the adaptive_sweep peripheral for a sweep of this program.
+        This can be called after the program has run, with acquire() or run_rounds().
+
+        Parameters
+        ----------
+        soc : QickSoc
+            Qick object
+        name : str
+            Name of the sweep (for adaptive_sweep(), the name of the loop). Optional if the program has one sweep.
+
+        Returns
+        -------
+        dict
+            freq (MHz) and freq_word (generator register word): the frequency the peripheral found.
+
+            start_word: first word of the grid; n_used: shots of the last point or frequency it measured.
+
+            For a grid: index (the winner's place in the grid), freqs (MHz, its points), and the fields of the status word of the peripheral.
+            With record_points also points, a dict of arrays with one entry per point:
+            freq (MHz), n_used (shots it took), converged (it stopped early), capped (it took all reps shots), saturated.
+
+            For coarse_to_fine_sweep(): the result of the last grid, and stages, the list of the results of all grids.
+
+            For kw_sweep(): converged, capped, nothing_seen, bad_window (how the search ended), iterations, and window (MHz, its low and high edge).
+            With steps also stages: the results of its grids, then that of the search.
+        """
+        if name is None:
+            if len(self.sweeps) != 1:
+                raise RuntimeError("this program has %d sweeps: say which one"%(len(self.sweeps)))
+            name = list(self.sweeps)[0]
+        sweep = self.sweeps[name]
+        gen_ch = self.pulses[sweep.pulse].ch_mgr.ch
+        results = []
+        for s in getattr(sweep, 'stages', [sweep]):
+            freq_word, start_word, status, n_used = [int(x) & 0xFFFFFFFF for x in soc.read_mem(4, 'dmem', s.result_addr)]
+            result = {'name': s.name, 'freq': float(self._word2freq(gen_ch, freq_word)), 'freq_word': freq_word, 'start_word': start_word, 'n_used': n_used}
+            if isinstance(s, KwSweep):
+                result.update(AdaptiveSweep.unpack(status, AdaptiveSweep.KW_STATUS))
+                # after coarse-to-fine grids the tProc placed the search: its low edge is in the result block
+                lo, hi = (start_word, start_word + s.f_hi) if s.grids else (s.f_lo, s.f_hi)
+                result['window'] = (float(self._word2freq(gen_ch, lo & 0xFFFFFFFF)), float(self._word2freq(gen_ch, hi & 0xFFFFFFFF)))
+            else:
+                result.update(AdaptiveSweep.unpack(status, AdaptiveSweep.STATUS))
+                steps = _s32(freq_word - start_word)
+                result['index'] = steps//s.gen_step if s.gen_step != 0 else 0
+                result['freqs'] = self._word2freq(gen_ch, (start_word + s.gen_step*np.arange(s.n_points)) & 0xFFFFFFFF)
+                if s.record_points:
+                    # a point that took all its shots never interrupted the tProc, so its word is still the zero that reload_mem() wrote
+                    words = np.array(soc.read_mem(s.n_points, 'dmem', s.points_addr)).astype(np.int64) & 0xFFFFFFFF
+                    diag = AdaptiveSweep.unpack(words, AdaptiveSweep.DIAG)
+                    capped = (words == 0) | (diag['type'] >= 4)
+                    result['points'] = {'freq': self._word2freq(gen_ch, start_word + s.gen_step*np.arange(s.n_points)),
+                                        'n_used': np.where(capped, self.reps, 2**diag['k']),
+                                        'converged': diag['converged'] == 1, 'capped': capped, 'saturated': diag['saturated'] == 1}
+            results.append(result)
+        if hasattr(sweep, 'stages'):
+            return dict(results[-1], name=name, stages=results)
+        return results[0]
+
+    def make_program(self):
+        # play the initialization
+        self.set_ext_counter(addr=self.COUNTER_ADDR)
+        self.set_ext_counter(addr=self.DONE_ADDR)
+        self._initialize(self.cfg)
+        if not self.sweeps:
+            raise RuntimeError("no sweep is declared: use adaptive_sweep(), coarse_to_fine_sweep() or kw_sweep() in _initialize()")
+        if self.initial_delay is not None:
+            self.delay_auto(self.initial_delay)
+
+        loop_sweeps = [s for s in self.sweeps.values() if isinstance(s, LoopSweep)]
+        if loop_sweeps:
+            # the sweep is a loop of the program: start the peripheral, play the loops as AveragerProgramV2 does, read the answer
+            sweep = loop_sweeps[0]
+            if len(self.sweeps) > 1 or [x[0] for x in self.loops] != [sweep.name, "reps"]:
+                raise RuntimeError("adaptive_sweep() needs its loop %s as the only loop of the program, and no other sweep"%(sweep.name))
+            name, count, before, after = self.loops[0]
+            if count > 65535:
+                raise RuntimeError("a grid has at most 65535 points, loop %s has %d"%(name, count))
+            sweep.n_points = count
+            self.append_macro(sweep)
+            self.open_loop(count, name=name)
+            # the tProc has just stepped the frequency (or started the peripheral): make sure that the first shot of this point is not late
+            self.resync()
+            if before is not None: self.extend_macros(before)
+            self.open_loop(self.reps, name="reps")
+            sweep.shot = self._shot()
+            self.extend_macros(sweep.shot)
+            self.close_loop()
+            # an early stop comes back here
+            self.label(name + "_next")
+            if after is not None: self.extend_macros(after)
+            self.close_loop()
+            self.append_macro(LoopSweepEnd(sweep=sweep))
+        else:
+            if len(self.loops) > 1:
+                raise RuntimeError("add_loop() is only used with adaptive_sweep(); the other sweeps make their own loops")
+            # each sweep plays the shot in its own loops
+            for sweep in self.sweeps.values():
+                self.append_macro(sweep)
+
+        self._cleanup(self.cfg)
+
+        # the program is complete; the shot counter does not tell when the peripheral skips shots
+        self.inc_ext_counter(addr=self.DONE_ADDR)
+        self.end()
+
+        early_stops = [s for s in self._stages() if s.early_stop]
+        if early_stops:
+            # an early stop of the peripheral sends the tProc here (the interrupt vector, see _make_binprog): go on in the sweep that is running
+            self.label("sweep_interrupt")
+            for s in early_stops:
+                self.cond_jump(label=s.name + "_landing", arg1="sweep_id", test='Z', op='-', arg2=s.sweep_id)
+            self.end()
 
         # subroutines go after the main program
         for name, asm in self.subroutines.items():
