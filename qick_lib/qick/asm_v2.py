@@ -2168,7 +2168,7 @@ class QickProgramV2(AsmV2, AbsQickProgram):
     FLIP_DOWNCONVERSION = True
 
     # supported revisions of the tProc v2 core
-    ASM_REVISIONS = [21, 22, 23, 24, 25, 26, 27, 31, 32, 33, 34, 35]
+    ASM_REVISIONS = [21, 22, 23, 24, 25, 26, 27, 31, 32, 33, 34, 35, 36]
 
     def __init__(self, soccfg):
         super().__init__(soccfg)
@@ -2632,6 +2632,25 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         if as_array: return param.to_array(self.loop_dict)
         elif param.is_sweep(): return param
         else: return float(param)
+
+    def get_run_time(self, soc):
+        """Read how long the last run of the program took on the tProc, from its start to its end.
+        The tProc counts the cycles of its core clock while a program runs, and stops counting when the program ends.
+        This can be called after the program has run (acquire(), run_rounds() or run()), until the tProc is started again.
+        If the program ran more than one round, this is the time of the last round.
+
+        Parameters
+        ----------
+        soc : QickSoc
+            Qick object
+
+        Returns
+        -------
+        dict
+            time_cycles (cycles of the tProc core clock) and time_us (the same time in us)
+        """
+        cycles = soc.get_tproc_cycles()
+        return {'time_cycles': cycles, 'time_us': cycles/self.tproccfg['f_core']}
 
     def list_time_params(self, tag):
         """Get the list of parameters you can look up for a given timed instruction with get_time_param().
@@ -3833,6 +3852,8 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
 
             For kw_sweep(): converged, capped, nothing_seen, bad_window (how the search ended), iterations, and window (MHz, its low and high edge).
             With steps also stages: the results of its grids, then that of the search.
+
+            time_cycles and time_us: how long the program ran on the tProc, see get_run_time().
         """
         if name is None:
             if len(self.sweeps) != 1:
@@ -3864,8 +3885,8 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
                                         'converged': diag['converged'] == 1, 'capped': capped, 'saturated': diag['saturated'] == 1}
             results.append(result)
         if hasattr(sweep, 'stages'):
-            return dict(results[-1], name=name, stages=results)
-        return results[0]
+            return dict(results[-1], name=name, stages=results, **self.get_run_time(soc))
+        return dict(results[0], **self.get_run_time(soc))
 
     def _initialize(self, cfg):
         """Declare one constant pulse, one readout and the search, as the configuration dictionary says (see the class).

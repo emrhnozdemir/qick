@@ -19,6 +19,8 @@ set_false_path -from [get_pins -filter {REF_PIN_NAME =~ C} -of_objects [get_cell
 
 set_false_path -from [get_pins -filter {REF_PIN_NAME =~ C} -of_objects [get_cells -hier -filter {name =~ *QPROC/CORE_*/CORE_CPU/reg_bank/LFSR_YES.lfsr/reg_lfsr_reg*}]] -to [get_pins -filter {REF_PIN_NAME =~ D} -of_objects [get_cells -hier -filter {name =~ *QPROC/xreg_TPROC_R_DT_reg*}]]
 
+set_false_path -from [get_pins -filter {REF_PIN_NAME =~ C} -of_objects [get_cells -hier -filter {name =~ *QPROC/prog_cycles_reg* || name =~ *QPROC/prog_ended_reg*}]] -to [get_pins -filter {REF_PIN_NAME =~ D} -of_objects [get_cells -hier -filter {name =~ *QPROC/xreg_TPROC_R_DT_reg*}]]
+
 set_false_path -from [get_pins -filter {REF_PIN_NAME =~ C} -of_objects [get_cells -hier -filter {name =~ *QPROC/qp?_dt_r_reg*}]] -to [get_clocks -of_objects [get_ports -filter {name =~ ps_clk_i}]]
 
 # Doesn't exist if parameter QNET = 0

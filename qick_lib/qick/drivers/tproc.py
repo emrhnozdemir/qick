@@ -570,6 +570,24 @@ class Axis_QICK_Proc(SocIP):
             return 'external'
         else:
             return 'internal'
+    def get_cycles(self):
+        """Read the cycle counter of the last program.
+        The tProc counts the cycles of its core clock while a program runs: the counter is cleared when the program starts and stops when the program reaches its end.
+        It keeps its value until the tProc is started or reset again.
+
+        :return: cycles of the tProc core clock from the start of the program to its end
+        :rtype: int
+        """
+        if self['revision'] < 36:
+            raise RuntimeError("the cycle counter requires tProc revision 36 or newer")
+        # the counter is on the two AXI-readable registers: the low word, then the high 16 bits; bit 31 of the second is set once the program has ended
+        # the second register is read first: the counter does not move once that bit is set, so the low word read after it is final
+        self.read_sel = 11
+        high = int(self.axi_r_dt2)
+        low = int(self.axi_r_dt1)
+        if not high >> 31:
+            raise RuntimeError("the program has not ended: its cycle counter is still running")
+        return ((high & 0xFFFF) << 32) | low
 
     def set_lfsr_cfg(self, mode, core=0):
         """

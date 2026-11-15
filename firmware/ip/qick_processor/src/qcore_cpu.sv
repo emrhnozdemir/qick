@@ -34,6 +34,7 @@ module qcore_cpu # (
    input   wire                  interrupt_i    , // External Redirect Request
    input   wire [PMEM_AW-1:0]    ipc_i          , // Interrupt Program Counter (0 = disarmed)
    output  wire                  int_take_o     , // redirect taken (flushes the trigger queue)
+   output  wire                  prog_end_o     , // the program is at its END instruction
 // DATA INPUT
    output wire [7:0]       sreg_cfg_o           ,
    output wire [7:0]       sreg_ctrl_o           ,
@@ -384,6 +385,26 @@ always @(posedge clk_i) begin
       end
    end
 end
+
+// PROGRAM END
+/////////////////////////////////////////////////
+// A program ends on a JUMP to its own address that has no condition (END); a wait
+// is the same JUMP with a condition. The instruction in ID was fetched from
+// PC_prev - 1 (a CALL pushes PC_prev as its return address). The compare is
+// registered, so it adds nothing to the PC path: prog_end_o follows the JUMP by
+// one cycle and repeats while the core stays at the END.
+reg                  end_jump_r ;
+reg  [PMEM_AW-1:0]   end_addr_r, end_self_r ;
+
+always_ff @ (posedge clk_i) begin
+   if      (!rst_ni)     end_jump_r <= 1'b0 ;
+   else if (restart_i)   end_jump_r <= 1'b0 ;
+   else                  end_jump_r <= id_branch_cond_ok & ~|id_COND & ~id_SO & ~id_TO & fetch_en & ~int_take ;
+   end_addr_r <= id_AI ? id_imm_addr : reg_addr ;
+   end_self_r <= PC_prev - 1'b1 ;
+end
+
+assign prog_end_o = end_jump_r & (end_addr_r == end_self_r) ;
 
 
  

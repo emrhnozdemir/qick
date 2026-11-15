@@ -1754,6 +1754,44 @@ wire        as_interrupt;
       end
    end
 
+   // The cycle counter of the tProc (prog_cycles) against the test bench's own view of the core.
+   // cyc_ref counts every c_clk cycle from the first one in which the core is enabled after its restart.
+   // The counter may stop only while the core repeats its END instruction: the PC then has a period
+   // of three cycles, and a stop outside such a loop is counted in cyc_bad.
+   wire                cyc_ended   = AXIS_QPROC.QPROC.prog_ended;
+   wire [`PMEM_AW-1:0] cyc_pc      = AXIS_QPROC.QPROC.CORE_0.CORE_CPU.PC_curr;
+   reg  [`PMEM_AW-1:0] cyc_pc_d1   = 0, cyc_pc_d2 = 0, cyc_pc_d3 = 0;
+   reg                 cyc_ended_d = 1'b0;
+   longint             cyc_ref     = 0, cyc_ref_at_stop = 0;
+   int                 cyc_stops   = 0, cyc_bad = 0, cyc_loop = 0, cyc_loop_at_stop = 0;
+   realtime            cyc_t_run   = 0, cyc_t_stop = 0;
+   integer             cyc_axi_lo, cyc_axi_hi;
+   always @(posedge c_clk) begin
+      cyc_pc_d1   <= cyc_pc;
+      cyc_pc_d2   <= cyc_pc_d1;
+      cyc_pc_d3   <= cyc_pc_d2;
+      cyc_ended_d <= cyc_ended;
+      cyc_loop    <= (cyc_pc == cyc_pc_d3) ? cyc_loop + 1 : 0;
+      if (AXIS_QPROC.QPROC.core_rst) begin
+         cyc_ref   <= 0;
+         cyc_stops <= 0;
+         cyc_bad   <= 0;
+      end else begin
+         if (AXIS_QPROC.QPROC.core_en | (cyc_ref != 0)) begin
+            if (cyc_ref == 0) cyc_t_run <= $realtime();
+            cyc_ref <= cyc_ref + 1;
+         end
+         if (cyc_ended & ~cyc_ended_d) begin
+            cyc_stops        <= cyc_stops + 1;
+            cyc_ref_at_stop  <= cyc_ref;
+            cyc_loop_at_stop <= cyc_loop;
+            cyc_t_stop       <= $realtime();
+         end
+         if (cyc_ended & cyc_ended_d & (cyc_pc != cyc_pc_d3))
+            cyc_bad <= cyc_bad + 1;
+      end
+   end
+
    function automatic [31:0] sys_counter_now();
       sys_counter_now = (sys_counter == 2) ? AXIS_QPROC.QPROC.core0_w_dt[1]
                                            : AXIS_QPROC.QPROC.core0_w_dt[0];
@@ -1777,6 +1815,11 @@ wire        as_interrupt;
          t_done = $realtime();
          $fdisplay(sys_log, "done,%0.1f,%0d,%0d", t_done, done, sys_counter_now());
          #(sys_drain_us * 1us);
+         // the cycle counter as the ARM reads it: READ_SEL 11 puts it on the two AXI read registers
+         WRITE_AXI( REG_AXI_DT_SRC , 11);
+         @(posedge s_ps_dma_aclk); #0.1;
+         axi_mst_tproc_agent.AXI4LITE_READ_BURST(REG_AXI_R_DT1, 0, cyc_axi_lo, resp);
+         axi_mst_tproc_agent.AXI4LITE_READ_BURST(REG_AXI_R_DT2, 0, cyc_axi_hi, resp);
          WRITE_AXI( REG_TPROC_CTRL , 8); //PROC_STOP
          $fclose(sys_log);
          sys_log = 0;
@@ -1784,6 +1827,9 @@ wire        as_interrupt;
          $display("*** SYSTEM %s done=%0d counter=%0d/%0d c1=%0d c2=%0d t_start_ns=%0.1f t_done_ns=%0.1f fpga_us=%0.3f",
                   TEST_NAME, done, sys_counter_now(), sys_count, AXIS_QPROC.QPROC.core0_w_dt[0],
                   AXIS_QPROC.QPROC.core0_w_dt[1], t_start / 1ns, t_done / 1ns, (t_done - t_start) / 1us);
+         $display("*** CYCLES count=%0d ended=%0d axi_lo=%0d axi_hi=%0d ref=%0d stops=%0d bad=%0d loop=%0d t_run_ns=%0.1f t_stop_ns=%0.1f",
+                  AXIS_QPROC.QPROC.prog_cycles, AXIS_QPROC.QPROC.prog_ended, $unsigned(cyc_axi_lo), $unsigned(cyc_axi_hi),
+                  cyc_ref_at_stop, cyc_stops, cyc_bad, cyc_loop_at_stop, cyc_t_run / 1ns, cyc_t_stop / 1ns);
       end
    endtask
 

@@ -250,6 +250,31 @@ qproc_ctrl # (
    .c_debug_do      ( ctrl_c_ds)
 );
 
+// Program cycle counter. c_clk cycles from the start of the program to its END: cleared when
+// the core is restarted, counts while the processor is in its RUN state (core_st_ds 5; also
+// while a full dispatcher FIFO pauses the core), stops while the core is at its END
+// instruction (prog_end), and goes on if an interrupt takes the program out of it.
+// Read through xreg_TPROC_R_DT (READ_SEL 11).
+wire           prog_end;
+reg            prog_ended;
+reg [47:0]     prog_cycles;
+always_ff @(posedge c_clk_i, negedge c_rst_ni) begin
+   if (!c_rst_ni) begin
+      prog_ended  <= 1'b0;
+      prog_cycles <= 48'd0;
+   end else if (core_rst) begin
+      prog_ended  <= 1'b0;
+      prog_cycles <= 48'd0;
+   end else begin
+      if (int_take)
+         prog_ended <= 1'b0;
+      else if (prog_end)
+         prog_ended <= 1'b1;
+      if ((core_st_ds == 3'd5) & ~prog_ended)
+         prog_cycles <= prog_cycles + 1'b1;
+   end
+end
+
 
 ///////////////////////////////////////////////////////////////////////////////
 // Processor STATUS 
@@ -486,6 +511,7 @@ always_ff @ (posedge ps_clk_i, negedge ps_rst_ni) begin
           4'd8 : xreg_TPROC_R_DT = qp2_dt_r;
           4'd9 : xreg_TPROC_R_DT = '{in_port_dt_r[0][31:0], in_port_dt_r[0][63:32]};
           4'd10: xreg_TPROC_R_DT = '{core0_lfsr, core1_lfsr}; 
+          4'd11: xreg_TPROC_R_DT = '{prog_cycles[31:0], {prog_ended, 15'd0, prog_cycles[47:32]}};
           default: xreg_TPROC_R_DT = '{default:'0} ;
        endcase
    end
@@ -648,6 +674,7 @@ qproc_core # (
    .interrupt_i      ( interrupt_i       ) ,
    .ipc_i            ( ipc_core          ) ,
    .int_take_o       ( int_take          ) ,
+   .prog_end_o       ( prog_end          ) ,
    .sreg_cfg_o       ( core0_cfg         ) ,
    .sreg_ctrl_o      ( core0_ctrl        ) ,
    .sreg_arith_i     ( arith_result[31:0] ) ,
@@ -712,6 +739,7 @@ generate
          .interrupt_i      ( 1'b0              ) ,
          .ipc_i            ( '0                ) ,
          .int_take_o       (                   ) ,
+         .prog_end_o       (                   ) ,
          .sreg_arith_i     ( {arith_result[31:0],arith_result[63:32]}  ) ,
          .sreg_div_i       ( {div_quotient  ,div_remainder }  ) ,
          .sreg_status_i    ( sreg_status       ) ,

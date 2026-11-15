@@ -1741,6 +1741,21 @@ class QickSoc(Overlay, QickConfig):
             reg = {1:'axi_r_dt1', 2:'axi_r_dt2'}[addr]
             return getattr(self.tproc, reg)
 
+    def get_tproc_cycles(self):
+        """
+        Read the tProc cycle counter: the number of core clock cycles the last program ran, from its start to its end.
+        The counter stops when the program ends, and keeps its value until the tProc is started or reset again.
+        This needs tProc v2, revision 36 or newer.
+
+        Returns
+        -------
+        int
+            Cycles of the tProc core clock
+        """
+        if self.TPROC_VERSION != 2:
+            raise RuntimeError("the cycle counter needs tProc v2")
+        return self.tproc.get_cycles()
+
     def reset_gens(self):
         """
         Reset the tProc and run a minimal tProc program that drives all signal generators with 0's.
