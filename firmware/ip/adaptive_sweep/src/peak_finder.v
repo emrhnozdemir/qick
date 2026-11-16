@@ -23,6 +23,7 @@ module peak_finder(
   output [31:0] best_mean_i_o,
   output [31:0] best_mean_q_o,
   output [15:0] point_idx_o,
+  output [31:0] frequency_o,
   output waiting_o
 );
 
@@ -82,5 +83,6 @@ module peak_finder(
   end
 
   assign waiting_o = waiting;
+  assign frequency_o = frequency;
 
 endmodule

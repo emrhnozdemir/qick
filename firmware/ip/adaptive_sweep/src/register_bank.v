@@ -29,6 +29,9 @@ module register_bank(
   input cfg_sweep_i,
   input cfg_meas_i,
   input cfg_search_i,
+  input cfg_tones_i,
+  input sel_tone_i,
+  input cfg_ratio_i,
   input [31:0] dt1_i,
   input [31:0] dt2_i,
   input [31:0] dt3_i,
@@ -39,14 +42,20 @@ module register_bank(
   input [31:0] view_dt2_i,
   input [31:0] ident_i,
 
-  output reg [31:0] start_freq_o,
+  output [31:0] start_freq_o,
   output reg [31:0] step_o,
   output reg [15:0] n_points_o,
   output reg [4:0] avg_shift_o,
   output reg [31:0] warmup_shots_o,
   output reg [31:0] n_min_o,
-  output reg [31:0] f_lo_o,
-  output reg [31:0] f_hi_o,
+  output [31:0] f_lo_o,
+  output [31:0] f_hi_o,
+  output [31:0] x0_o,
+  output [31:0] gen_base_o,
+  output [36:0] ro_base_o,
+  output [34:0] ratio_o,
+  output reg [7:0] tone_mask_o,
+  output reg [2:0] tone_sel_o,
   output reg [15:0] threshold_o,
   output reg [31:0] block_tol_o,
 
@@ -194,12 +203,48 @@ module register_bank(
 
   always @(posedge clk) begin
     if (!rst_n) begin
-      start_freq_o <= 0;
+      tone_mask_o <= 0;
+    end else if (cfg_tones_i) begin
+      tone_mask_o <= dt1_i[7:0];
+    end
+  end
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      tone_sel_o <= 0;
+    end else if (cfg_tones_i) begin
+      tone_sel_o <= 0;
+    end else if (sel_tone_i) begin
+      tone_sel_o <= dt1_i[2:0];
+    end
+  end
+
+  tone_registers tone0(
+    .clk(clk),
+    .rst_n(rst_n),
+    .select_i(tone_sel_o == 3'd0),
+    .cfg_sweep_i(cfg_sweep_i),
+    .cfg_search_i(cfg_search_i),
+    .cfg_ratio_i(cfg_ratio_i),
+    .dt1_i(dt1_i),
+    .dt2_i(dt2_i),
+    .dt3_i(dt3_i),
+    .dt4_i(dt4_i),
+    .start_freq_o(start_freq_o),
+    .f_lo_o(f_lo_o),
+    .f_hi_o(f_hi_o),
+    .x0_o(x0_o),
+    .gen_base_o(gen_base_o),
+    .ro_base_o(ro_base_o),
+    .ratio_o(ratio_o)
+  );
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
       step_o <= 0;
       n_points_o <= 0;
       avg_shift_o <= 0;
     end else if (cfg_sweep_i) begin
-      start_freq_o <= dt1_i;
       step_o <= dt2_i;
       n_points_o <= dt3_i[15:0];
       avg_shift_o <= dt4_i[4:0];
@@ -213,16 +258,6 @@ module register_bank(
     end else if (cfg_meas_i) begin
       warmup_shots_o <= dt3_i;
       n_min_o <= dt4_i;
-    end
-  end
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      f_lo_o <= 0;
-      f_hi_o <= 32'hFFFFFFFF;
-    end else if (cfg_search_i) begin
-      f_lo_o <= dt1_i;
-      f_hi_o <= dt2_i;
     end
   end
 

@@ -3052,9 +3052,9 @@ class AdaptiveSweep(Macro):
     This is for internal use; user code should use the methods of AdaptiveSweepProgramV2.
     """
     # operations of the peripheral, as firmware/ip/adaptive_sweep/src/adaptive_sweep.v decodes them
-    CFG_WINDOW, CFG_ACQ, CFG_GDKW = 0, 1, 2
+    CFG_WINDOW, CFG_ACQ, CFG_GDKW, CFG_TONES, SEL_TONE, CFG_RATIO = 0, 1, 2, 3, 4, 5
     START, RUN_KW, CLR_RESULT, REARM, CFG_INTERRUPT = 8, 9, 10, 11, 15
-    GET_FREQ, GET_STATUS, GET_DIAG, GET_MEAN = 16, 17, 18, 19
+    GET_FREQ, GET_STATUS, GET_DIAG, GET_MEAN, NEXT, GET_RESULT = 16, 17, 18, 19, 20, 21
 
     # fields (name, first bit, number of bits) of the words the peripheral answers with
     # GET_STATUS, first word
@@ -3087,6 +3087,8 @@ class AdaptiveSweep(Macro):
     def _config(self, prog, asm, s):
         # send the acquisition setup of a grid or search
         asm.qpb_select()
+        # which tones the peripheral searches: bit k for tone k of a multiplexed generator, 0 for the one tone that the tProc sets
+        asm.qpb_cmd(self.CFG_TONES, s.tone_mask)
         # the control word: [0] dip, [6] early stop, [7] block test, [8] short confirmation, [19:17] passes needed to stop
         ctrl = s.mode
         if s.early_stop:
@@ -3096,7 +3098,7 @@ class AdaptiveSweep(Macro):
             # an early stop interrupts the tProc: note which sweep is running, and which trigger the peripheral cancels
             prog.add_reg("sweep_id", allow_reuse=True)
             asm.write_reg(dst="sweep_id", src=s.sweep_id)
-            asm.qpb_cmd(self.CFG_INTERRUPT, 1 << prog.soccfg['readouts'][s.ro_ch]['trigger_port'])
+            asm.qpb_cmd(self.CFG_INTERRUPT, sum([1 << port for port in s.trig_ports]))
             # from here on the peripheral waits after an early stop until the tProc sends REARM again
             asm.qpb_cmd(self.REARM)
 
@@ -3164,7 +3166,8 @@ class AdaptiveSweep(Macro):
         asm.jump(s.name + "_end")
         asm.label(s.name + "_landing")
         # the interrupt may have left the readout trigger high
-        asm.asm_inst({'CMD':'TRIG', 'SRC':'clr', 'DST':str(prog.soccfg['readouts'][s.ro_ch]['trigger_port']), 'TIME':'@0'})
+        for port in s.trig_ports:
+            asm.asm_inst({'CMD':'TRIG', 'SRC':'clr', 'DST':str(port), 'TIME':'@0'})
         if s.record_points:
             # how the point ended (GET_DIAG), one word per point
             reg = prog.add_reg("sweep_addr", allow_reuse=True)
@@ -3405,6 +3408,114 @@ class KwSweep(AdaptiveSweep):
         self._landing(prog, asm, self)
         self._add(prog, asm)
 
+class MuxSweep(AdaptiveSweep):
+    # coarse-to-fine grids, and the kw search after them, on the tones of a multiplexed generator: every tone searches its own band
+    # the peripheral writes the frequency of every tone to the generator and to the readout itself; the tProc plays the shots
+    # name, pulse, tones (gen_start, gen_limit and the CFG_RATIO words of each tone), stages, gen_q
+    def preprocess(self, prog):
+        self.insts = []
+        gen = prog.add_reg("sweep_gen", allow_reuse=True)
+        tmp = prog.add_reg("sweep_tmp", allow_reuse=True)
+        f_hi = prog.add_reg("sweep_winner", allow_reuse=True)
+        for k, s in enumerate(self.stages):
+            asm = AsmV2()
+            self._config(prog, asm, s)
+            for i, tone in enumerate(self.tones):
+                asm.qpb_cmd(self.SEL_TONE, tone.slot)
+                if k == 0:
+                    # what the peripheral needs to turn a generator word of this tone into its readout words
+                    asm.qpb_cmd(self.CFG_RATIO, *tone.ratio)
+                    asm.write_reg(dst=gen, src=tone.gen_start)
+                else:
+                    self._place_tone(prog, asm, s, self.stages[k-1], tone, i)
+                # the first word of this tone's grid goes to its result block
+                asm.write_dmem(addr=s.result_addr + 4*i + 1, src=gen)
+                asm.qpb_cmd(self.CFG_WINDOW, gen, s.gen_step, s.n_points, prog.reps.bit_length()-1)
+                if s.kw:
+                    # the search starts from this grid: its edges are the outer points, and it begins at the low one
+                    asm.alu_reg(dst=f_hi, arg1=gen, op='+', arg2=(s.n_points-1)*s.gen_step)
+                    asm.qpb_cmd(self.CFG_GDKW, gen, f_hi, gen)
+            if s.kw:
+                asm.qpb_cmd(self.RUN_KW, 0, 0, s.min_step, s.max_iter)
+            else:
+                asm.qpb_cmd(self.START)
+            # wait until the peripheral has taken the job: the "ready" from before must not be read as its end
+            asm.qpb_wait('busy')
+            asm.label(s.name + "_probe")
+            # "ready" (bit_qpb_rdy) means every tone is done; test it before a read, which would overwrite the answer
+            asm.cond_jump(label=s.name + "_done", arg1='s_status', test='NZ', op='&', arg2=0x0400)
+            asm.qpb_cmd(self.NEXT)
+            asm.qpb_wait('new')
+            asm.write_reg(dst=tmp, src='s_core_r2')
+            asm.cond_jump(label=s.name + "_done", arg1='s_status', test='NZ', op='&', arg2=0x0400)
+            asm.qpb_ack()
+            # bit 0 of the second word: the peripheral has written the frequencies of the next point; if not, ask again
+            asm.cond_jump(label=s.name + "_probe", arg1=tmp, test='Z', op='&', arg2=1)
+            self._shots(prog, asm, s)
+            # an early stop comes back here
+            asm.label(s.name + "_next")
+            asm.jump(s.name + "_probe")
+            asm.label(s.name + "_done")
+            asm.qpb_wait('new')
+            asm.qpb_ack()
+            # the peripheral holds its answer and refuses every read until this command
+            asm.qpb_cmd(self.CLR_RESULT)
+            for i, tone in enumerate(self.tones):
+                # the answer of this tone: frequency word, how the search ended (or the status of the grid), shots of its last point
+                asm.qpb_cmd(self.SEL_TONE, tone.slot)
+                asm.qpb_cmd(self.GET_RESULT)
+                asm.qpb_wait('new')
+                asm.write_dmem(addr=s.result_addr + 4*i, src='s_core_r1')
+                if s.kw:
+                    asm.write_dmem(addr=s.result_addr + 4*i + 2, src='s_core_r2')
+                asm.qpb_ack()
+                if not s.kw:
+                    asm.qpb_cmd(self.GET_STATUS)
+                    asm.qpb_wait('new')
+                    asm.write_dmem(addr=s.result_addr + 4*i + 2, src='s_core_r1')
+                    asm.qpb_ack()
+                asm.qpb_cmd(self.GET_DIAG)
+                asm.qpb_wait('new')
+                asm.write_dmem(addr=s.result_addr + 4*i + 3, src='s_core_r1')
+                asm.qpb_ack()
+            self._add(prog, asm)
+            if s.early_stop:
+                asm = AsmV2()
+                self._landing(prog, asm, s)
+                self._add(prog, asm)
+
+    def _place_tone(self, prog, asm, s, previous, tone, i):
+        # put the first word of this tone's grid in the register: its window centered on the tone's winner of the grid before,
+        # moved inward at the edges of the tone's band
+        gen, tmp, winner = "sweep_gen", "sweep_tmp", prog.add_reg("sweep_point", allow_reuse=True)
+        label = "%s_tone%d"%(s.name, i)
+        asm.read_dmem(dst=winner, addr=previous.result_addr + 4*i)
+        # the window, and its half on the frequency steps that the generator and the readout share
+        span = (s.n_points-1)*s.gen_step
+        half = span//self.gen_q//2*self.gen_q
+        # too close to an edge of the band if (winner - low edge) < half or (high edge - winner) < span - half
+        for edge, distance, name, sign in [(tone.gen_start, half, "_low", 1), (tone.gen_limit, span - half, "_high", -1)]:
+            if distance == 0:
+                continue
+            asm.write_reg(dst=tmp, src=edge)
+            if sign > 0:
+                asm.alu_reg(dst=gen, arg1=winner, op='-', arg2=tmp)
+            else:
+                asm.alu_reg(dst=gen, arg1=tmp, op='-', arg2=winner)
+            # a negative difference is a distance of more than 2**31 words, far from this edge
+            asm.cond_jump(label=label + name + "_ok", arg1=gen, test='S')
+            asm.write_reg(dst=tmp, src=distance)
+            asm.cond_jump(label=label + name, arg1=gen, test='S', op='-', arg2=tmp)
+            asm.label(label + name + "_ok")
+        asm.alu_reg(dst=gen, arg1=winner, op='-', arg2=half)
+        asm.jump(label + "_placed")
+        asm.label(label + "_low")
+        asm.write_reg(dst=gen, src=tone.gen_start)
+        asm.jump(label + "_placed")
+        asm.label(label + "_high")
+        asm.write_reg(dst=gen, src=_s32(tone.gen_limit - span))
+        asm.label(label + "_placed")
+
 class AdaptiveSweepProgramV2(AveragerProgramV2):
     """Use this class for programs where the adaptive_sweep peripheral searches for a resonance.
     A shot is played "reps" times at every frequency.
@@ -3423,6 +3534,11 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
       The kw search always uses the early stop.
     * mean_addr: if given, the program ends by storing the mean I and Q of the winner, as the peripheral holds them, at this address of the data memory (2 words).
 
+    With a multiplexed generator in gen_ch the program searches several resonances at once, one tone each:
+    give ro_chs (the readout of each tone, a list) instead of ro_ch, mixer_freq (MHz), gains (optional, one per tone) instead of gain,
+    and start and stop as lists with one band per tone. Every tone is played in every shot, and every tone gets the same grids.
+    The peripheral writes the frequency of every tone to the generator and to the readout itself, so the tProc only plays the shots.
+
     For another shot you write _initialize() and _body() as for AveragerProgramV2: the content of your _body() is a shot.
     In _initialize() you declare the search, with one of these:
 
@@ -3430,6 +3546,8 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
       This is an ordinary QICK sweep, and acquire() returns the data of all points as usual.
     * coarse_to_fine_sweep(): a grid over a band, then finer grids around the winner of the grid before. You can declare several.
     * kw_sweep(): a search where the peripheral picks every frequency, optionally after coarse-to-fine grids. You can declare several.
+
+    For a pulse of a multiplexed generator the last two take the readout channels of its tones as ro_cfg, and start and stop as lists.
 
     What is different from AveragerProgramV2:
 
@@ -3509,9 +3627,11 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
         blocks = []
         for s in self._stages():
             # the result block is written with literal addresses, which are 10 bits
-            if s.result_addr < 0 or s.result_addr + 4 > 1024:
+            # 4 words, or 4 words for each tone of a multiplexed generator
+            result_len = getattr(s, 'result_len', 4)
+            if s.result_addr < 0 or s.result_addr + result_len > 1024:
                 raise RuntimeError("the result block of %s must be in the first 1024 words of data memory"%(s.name))
-            blocks.append((s.result_addr, s.result_addr + 4, s.name))
+            blocks.append((s.result_addr, s.result_addr + result_len, s.name))
             if s.record_points:
                 blocks.append((s.points_addr, s.points_addr + s.n_points, s.name))
         for i, (start, stop, name) in enumerate(blocks):
@@ -3564,7 +3684,12 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
     def _word2freq(self, gen_ch, word):
         # frequency in MHz of a generator register word (or an array of words)
         gencfg = self.soccfg['gens'][gen_ch]
-        freq = self.reg2freq(word % 2**gencfg['b_dds'], gen_ch=gen_ch)
+        if gencfg['has_mixer']:
+            # the DDS word is a signed offset from the mixer frequency
+            half = 2**(gencfg['b_dds']-1)
+            freq = self.reg2freq((np.asarray(word) + half) % (2*half) - half, gen_ch=gen_ch)
+        else:
+            freq = self.reg2freq(word % 2**gencfg['b_dds'], gen_ch=gen_ch)
         if self.ABSOLUTE_FREQS and gencfg['has_mixer']:
             freq += self.gen_chs[gen_ch]['mixer_freq']['rounded']
         return freq
@@ -3573,14 +3698,17 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
         # check the options that the sweeps share, and return them as the attributes of the sweep
         if name in self.sweeps:
             raise RuntimeError("sweep name %s is already used"%(name))
-        if ro_ch not in self.ro_chs:
-            raise RuntimeError("readout %s feeds the peripheral, but it is not declared"%(ro_ch))
+        # one readout, or the readouts of the tones of a multiplexed generator
+        ro_chs = list(ro_ch) if isinstance(ro_ch, (list, tuple)) else [ro_ch]
+        for ch in ro_chs:
+            if ch not in self.ro_chs:
+                raise RuntimeError("readout %s feeds the peripheral, but it is not declared"%(ch))
         if mode not in ['peak', 'dip']:
             raise RuntimeError("mode must be peak or dip, got %s"%(mode))
         if early_stop:
             if self.final_wait is None or self.final_delay is None:
                 raise RuntimeError("the early stop needs final_wait and final_delay: they tell how long a shot takes")
-            if self.soccfg['readouts'][ro_ch]['trigger_type'] == 'dport':
+            if any([self.soccfg['readouts'][ch]['trigger_type'] == 'dport' for ch in ro_chs]):
                 raise RuntimeError("the early stop cancels the readout trigger of a shot, and it can only do that on a tProc trigger port")
             if short_confirm and block_en:
                 raise RuntimeError("short_confirm and block_en can't be used together")
@@ -3597,7 +3725,8 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
                     raise RuntimeError("the early stop can never happen: with confirm=%d, n_min=%d%s the first possible stop is at %d shots, but the last check is at reps/2 = %d"%(confirm, n_min, " and block_en" if block_en else "", first, self.reps//2))
         elif n_min or confirm is not None or short_confirm or block_en:
             raise RuntimeError("n_min, confirm, short_confirm and block_en are options of the early stop")
-        return dict(ro_ch=ro_ch, mode=['peak', 'dip'].index(mode), early_stop=early_stop, n_min=n_min, confirm=confirm,
+        return dict(ro_ch=ro_ch, trig_ports=[self.soccfg['readouts'][ch].get('trigger_port') for ch in ro_chs], tone_mask=0,
+                    mode=['peak', 'dip'].index(mode), early_stop=early_stop, n_min=n_min, confirm=confirm,
                     short_confirm=short_confirm, block_en=block_en, record_points=early_stop and record_points,
                     sweep_id=len([s for s in self._stages() if s.early_stop]))
 
@@ -3681,10 +3810,98 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
         points_addr : int
             Data memory address of the per-point records of the first grid; the next grids follow. The default is right after the result blocks.
         """
+        if 'n_tones' in self.pulses[pulse].ch_mgr.chcfg:
+            # a multiplexed generator: ro_cfg is the list of the readout channels of its tones, start and stop have one band per tone
+            opts = self._sweep_options(name, ro_cfg, mode, early_stop, n_min, confirm, short_confirm, block_en, False)
+            self.sweeps[name] = self._mux_sweep(name, pulse, ro_cfg, start, stop, steps, windows, opts, result_addr)
+            return
         ro_ch = self.pulses[ro_cfg].ch_mgr.ch
         opts = self._sweep_options(name, ro_ch, mode, early_stop, n_min, confirm, short_confirm, block_en, record_points)
         stages, band = self._grid_stages(name, pulse, ro_cfg, start, stop, steps, windows, opts, result_addr, points_addr)
         self.sweeps[name] = CoarseToFineSweep(name=name, pulse=pulse, ro_cfg=ro_cfg, stages=stages, **band)
+
+    def _mux_sweep(self, name, pulse, ro_chs, start, stop, steps, windows, opts, result_addr, min_step=None, max_iter=None):
+        # the grids of a coarse-to-fine tuning on the tones of a multiplexed generator, the last one the start of a kw search if min_step is given
+        gen_ch = self.pulses[pulse].ch_mgr.ch
+        gencfg = self.soccfg['gens'][gen_ch]
+        mask = self.pulses[pulse].params['mask']
+        mixer = self.gen_chs[gen_ch]['mixer_freq']['rounded'] if gencfg['has_mixer'] else 0
+        ro_chs, start, stop, steps = list(ro_chs), list(start), list(stop), list(steps)
+        windows = steps[:-1] if windows is None else list(windows)
+        if not len(mask) == len(ro_chs) == len(start) == len(stop):
+            raise RuntimeError("a sweep on a multiplexed pulse needs one readout channel, one start and one stop for each tone of its mask")
+        if not steps or steps[-1] <= 0 or any([a <= b for a, b in zip(steps, steps[1:])]) or len(windows) != len(steps) - 1:
+            raise RuntimeError("a coarse-to-fine tuning needs decreasing steps, and one window for each grid after the first")
+        if any([abs((b - a) - (stop[0] - start[0])) > 1e-9 or b <= a for a, b in zip(start, stop)]):
+            raise RuntimeError("the bands of the tones must have start < stop and the same width, because all tones walk the same grids")
+        rocfg = self.soccfg['readouts'][ro_chs[0]]
+        if rocfg.get('pfb_nch') != 64 or not rocfg.get('pfb_dds_on_output'):
+            raise RuntimeError("the peripheral writes the readout frequencies of a polyphase filter bank readout with 64 channels and one DDS per output")
+        # generator and readout steps of one frequency step that both can make
+        fstep = self.soccfg.calc_fstep([gencfg, rocfg])
+        gen_q = int(self.soccfg.calc_fstep_int(gencfg, [rocfg]))
+        ro_q = int(self.soccfg.calc_fstep_int(rocfg, [gencfg]))
+        if ro_q % 32:
+            raise RuntimeError("generator and readout share no frequency step that the peripheral can write")
+
+        def words(f, ro_ch):
+            # generator word of a tone at f, and its readout frequency in readout DDS steps inside the band of the filter bank
+            tone = self.soccfg.calc_muxgen_regs(gen_ch, [f], None, None, ro_ch, self.ABSOLUTE_FREQS, mixer)[0]
+            regs = {}
+            self.soccfg.calc_ro_freq(self.soccfg['readouts'][ro_ch], {'freq': f, 'gen_ch': gen_ch}, regs, self.ABSOLUTE_FREQS, mixer, self.FLIP_DOWNCONVERSION)
+            return tone['freq_int'], (((regs['pfb_ch'] - rocfg['pfb_ch_offset']) % 64) << 31) + _s32(regs['f_int'])
+
+        # the band in generator words: the points of the first grid, so that rounding its step does not cost the last point
+        width = int(np.floor(np.round((stop[0] - start[0])/steps[0], 9)))*int(np.round(steps[0]/fstep))*gen_q
+        tones = []
+        for i, ro_ch in enumerate(ro_chs):
+            if self.soccfg['readouts'][ro_ch].get('pfb_port') != mask[i]:
+                raise RuntimeError("tone %d of the generator must be read by output %d of the filter bank: the peripheral writes both with one tone number"%(mask[i], mask[i]))
+            # the peripheral steps the generator word across the whole band and turns it into readout words with one ratio,
+            # so both ends of the band must be inside the generator's range and inside one Nyquist zone of the readout
+            nyquist = self.soccfg['readouts'][ro_ch]['fs']/2
+            if max(abs(start[i] - mixer), abs(stop[i] - mixer)) >= gencfg['f_dds']/2:
+                raise RuntimeError("the band of tone %d (%.3f to %.3f MHz) reaches beyond the range of the generator, %.3f MHz on each side of the mixer"%(mask[i], start[i], stop[i], gencfg['f_dds']/2))
+            if np.floor(start[i]/nyquist) != np.floor(stop[i]/nyquist):
+                raise RuntimeError("the band of tone %d (%.3f to %.3f MHz) crosses the edge of a Nyquist zone of the readout at %.3f MHz: keep each band inside one zone"%(mask[i], start[i], stop[i], nyquist*np.floor(stop[i]/nyquist)))
+            gen_start, ro_start = words(start[i], ro_ch)
+            # the peripheral computes the readout word from the generator word: readout steps per generator step, from two frequencies of the band
+            gen_next, ro_next = words(start[i] + fstep*1024, ro_ch)
+            delta = (ro_next - ro_start + 2**36) % 2**37 - 2**36
+            if _s32(gen_next - gen_start) != 1024*gen_q or abs(delta) != 1024*ro_q:
+                raise RuntimeError("the band of tone %d is at an edge of a Nyquist zone of the readout, or of the generator's range"%(mask[i]))
+            ratio = int(np.round(delta/(1024*gen_q)/32*2**31))
+            gen_limit = gen_start + width
+            if min_step is not None and not 0 <= gen_start < gen_limit < 2**32:
+                # the peripheral compares the frequency words of a search as unsigned numbers
+                raise RuntimeError("the band of tone %d crosses the mixer frequency: for a kw search put mixer_freq below (or above) all bands"%(mask[i]))
+            tones.append(SimpleNamespace(slot=mask[i], ro_ch=ro_ch, gen_start=_s32(gen_start), gen_limit=_s32(gen_limit),
+                                         ratio=[_s32(gen_start), _s32(ro_start % 2**32), _s32(ratio % 2**32), ((ratio % 2**35) >> 32) << 5 | (ro_start % 2**37) >> 32]))
+        opts = dict(opts, tone_mask=sum([1 << m for m in mask]), result_len=4*len(tones))
+        stages = []
+        for k, (step, window) in enumerate(zip(steps, [None] + windows)):
+            gen_step = int(np.round(step/fstep))*gen_q
+            if gen_step <= 0:
+                raise RuntimeError("the step of grid %d is smaller than one frequency step"%(k))
+            n = width//gen_step + 1
+            if k > 0:
+                if window <= 0 or abs(2*window/step - np.round(2*window/step)) > 1e-9:
+                    raise RuntimeError("the window of grid %d must be a half-width in MHz, with twice the window a multiple of the step"%(k))
+                n = min(n, int(np.round(2*window/step)) + 1)
+            if n > 65535:
+                raise RuntimeError("a grid has at most 65535 points, grid %d has %d"%(k, n))
+            kw = min_step is not None and k == len(steps) - 1
+            stages.append(SimpleNamespace(name=name if kw else "%s_stage%d"%(name, k), n_points=n, gen_step=gen_step, kw=kw,
+                                          result_addr=result_addr + 4*len(tones)*k, **opts))
+            if opts['early_stop']:
+                stages[-1].sweep_id += k
+        if min_step is not None:
+            last = stages[-1]
+            last.min_step = int(np.round(min_step/fstep))*gen_q
+            last.max_iter = max_iter
+            if last.n_points < 2 or last.min_step <= 0 or 2*last.min_step > (last.n_points-1)*last.gen_step or not 1 <= max_iter < 2**16:
+                raise RuntimeError("the first grid of the search needs at least 2 points, min_step at least one frequency step and at most half of that grid, and max_iter 1 to 65535")
+        return MuxSweep(name=name, pulse=pulse, tones=tones, stages=stages, gen_q=gen_q)
 
     def _grid_stages(self, name, pulse, ro_cfg, start, stop, steps, windows, opts, result_addr, points_addr):
         # the grids of a coarse-to-fine tuning (see coarse_to_fine_sweep()), and the band they are placed in
@@ -3770,6 +3987,13 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
         result_addr : int
             Data memory address of the result block (4 words). With steps, the result blocks of the grids come first.
         """
+        if 'n_tones' in self.pulses[pulse].ch_mgr.chcfg:
+            # a multiplexed generator: ro_cfg is the list of the readout channels of its tones, start and stop have one band per tone
+            if steps is None or n_points is not None or x0 is not None:
+                raise RuntimeError("a kw search on a multiplexed pulse starts from grids: give steps ([step] is one grid over the bands)")
+            opts = self._sweep_options(name, ro_cfg, mode, True, n_min, confirm, short_confirm, block_en, False)
+            self.sweeps[name] = self._mux_sweep(name, pulse, ro_cfg, start, stop, steps, windows, opts, result_addr, min_step=min_step, max_iter=max_iter)
+            return
         gen_ch, ro_ch = self.pulses[pulse].ch_mgr.ch, self.pulses[ro_cfg].ch_mgr.ch
         opts = self._sweep_options(name, ro_ch, mode, True, n_min, confirm, short_confirm, block_en, False)
         if [n_points, x0, steps].count(None) != 2:
@@ -3853,6 +4077,9 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
             For kw_sweep(): converged, capped, nothing_seen, bad_window (how the search ended), iterations, and window (MHz, its low and high edge).
             With steps also stages: the results of its grids, then that of the search.
 
+            For a sweep on a multiplexed pulse: tones, a list with the result of each tone (as above, of its last grid or of its search),
+            freq (MHz, an array with the frequency of each tone), and stages, the list of tones for every grid.
+
             time_cycles and time_us: how long the program ran on the tProc, see get_run_time().
         """
         if name is None:
@@ -3861,6 +4088,24 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
             name = list(self.sweeps)[0]
         sweep = self.sweeps[name]
         gen_ch = self.pulses[sweep.pulse].ch_mgr.ch
+        if isinstance(sweep, MuxSweep):
+            stages = []
+            for s in sweep.stages:
+                words = np.array(soc.read_mem(4*len(sweep.tones), 'dmem', s.result_addr)).astype(np.int64).reshape(-1, 4) & 0xFFFFFFFF
+                tones = []
+                for tone, (freq_word, start_word, status, n_used) in zip(sweep.tones, words.tolist()):
+                    result = {'name': s.name, 'tone': tone.slot, 'ro_ch': tone.ro_ch, 'freq': float(self._word2freq(gen_ch, freq_word)),
+                              'freq_word': freq_word, 'start_word': start_word, 'n_used': n_used}
+                    if s.kw:
+                        result.update(AdaptiveSweep.unpack(status, AdaptiveSweep.KW_STATUS))
+                        result['window'] = (float(self._word2freq(gen_ch, start_word)), float(self._word2freq(gen_ch, start_word + (s.n_points-1)*s.gen_step)))
+                    else:
+                        result.update(AdaptiveSweep.unpack(status, AdaptiveSweep.STATUS))
+                        result['index'] = _s32(freq_word - start_word)//s.gen_step
+                        result['freqs'] = self._word2freq(gen_ch, start_word + s.gen_step*np.arange(s.n_points))
+                    tones.append(result)
+                stages.append(tones)
+            return dict(name=name, tones=stages[-1], freq=np.array([t['freq'] for t in stages[-1]]), stages=stages, **self.get_run_time(soc))
         results = []
         for s in getattr(sweep, 'stages', [sweep]):
             freq_word, start_word, status, n_used = [int(x) & 0xFFFFFFFF for x in soc.read_mem(4, 'dmem', s.result_addr)]
@@ -3894,11 +4139,21 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
 
         User code should not call this method; it's called by make_program().
         """
-        self.declare_gen(ch=cfg['gen_ch'], nqz=cfg.get('nqz', 1))
-        self.declare_readout(ch=cfg['ro_ch'], length=cfg['ro_len'])
-        # the frequency can be any value: the search rewrites it
-        self.add_pulse(ch=cfg['gen_ch'], name="probe", ro_ch=cfg['ro_ch'], style="const", length=cfg['pulse_len'], freq=cfg['start'], phase=0, gain=cfg['gain'])
-        self.add_readoutconfig(ch=cfg['ro_ch'], name="ro", freq=cfg['start'], gen_ch=cfg['gen_ch'])
+        mux = 'n_tones' in self.soccfg['gens'][cfg['gen_ch']]
+        if mux:
+            # one tone for each readout, every tone at the low edge of its band: the peripheral rewrites the frequencies
+            self.declare_gen(ch=cfg['gen_ch'], nqz=cfg.get('nqz', 1), mixer_freq=cfg['mixer_freq'], mux_freqs=cfg['start'], mux_gains=cfg.get('gains'), ro_ch=cfg['ro_chs'][0])
+            for ch, freq in zip(cfg['ro_chs'], cfg['start']):
+                self.declare_readout(ch=ch, length=cfg['ro_len'], freq=freq, gen_ch=cfg['gen_ch'])
+            self.add_pulse(ch=cfg['gen_ch'], name="probe", style="const", length=cfg['pulse_len'], mask=list(range(len(cfg['ro_chs']))))
+            ro_cfg = cfg['ro_chs']
+        else:
+            self.declare_gen(ch=cfg['gen_ch'], nqz=cfg.get('nqz', 1))
+            self.declare_readout(ch=cfg['ro_ch'], length=cfg['ro_len'])
+            # the frequency can be any value: the search rewrites it
+            self.add_pulse(ch=cfg['gen_ch'], name="probe", ro_ch=cfg['ro_ch'], style="const", length=cfg['pulse_len'], freq=cfg['start'], phase=0, gain=cfg['gain'])
+            self.add_readoutconfig(ch=cfg['ro_ch'], name="ro", freq=cfg['start'], gen_ch=cfg['gen_ch'])
+            ro_cfg = "ro"
         kw = cfg.get('kw', False)
         # the kw search always uses the early stop
         early_stop = kw or cfg.get('early_stop', False)
@@ -3906,10 +4161,10 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
         if early_stop:
             opts.update({k: cfg[k] for k in ['n_min', 'confirm', 'short_confirm', 'block_en'] if k in cfg})
         if kw:
-            self.kw_sweep("sweep", pulse="probe", ro_cfg="ro", start=cfg['start'], stop=cfg['stop'], min_step=cfg['min_step'], max_iter=cfg['max_iter'],
+            self.kw_sweep("sweep", pulse="probe", ro_cfg=ro_cfg, start=cfg['start'], stop=cfg['stop'], min_step=cfg['min_step'], max_iter=cfg['max_iter'],
                           steps=cfg.get('steps'), x0=cfg.get('x0'), **opts)
         else:
-            self.coarse_to_fine_sweep("sweep", pulse="probe", ro_cfg="ro", start=cfg['start'], stop=cfg['stop'], steps=cfg['steps'], early_stop=early_stop, **opts)
+            self.coarse_to_fine_sweep("sweep", pulse="probe", ro_cfg=ro_cfg, start=cfg['start'], stop=cfg['stop'], steps=cfg['steps'], early_stop=early_stop, **opts)
 
     def _body(self, cfg):
         """Play a shot: the pulse, and the readout at the frequency of the pulse.
@@ -3917,8 +4172,12 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
         User code should not call this method; it's called by make_program().
         """
         self.pulse(ch=cfg['gen_ch'], name="probe", t=0)
-        self.send_readoutconfig(ch=cfg['ro_ch'], name="ro", t=0)
-        self.trigger(ros=[cfg['ro_ch']], t=cfg['trig_time'])
+        if 'ro_chs' in cfg:
+            # the tones of a multiplexed generator: the peripheral has set the readouts
+            self.trigger(ros=cfg['ro_chs'], t=cfg['trig_time'])
+        else:
+            self.send_readoutconfig(ch=cfg['ro_ch'], name="ro", t=0)
+            self.trigger(ros=[cfg['ro_ch']], t=cfg['trig_time'])
 
     def _cleanup(self, cfg):
         """Store the mean I and Q of the winner in data memory, if the configuration dictionary gives mean_addr.
@@ -3926,12 +4185,15 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
         User code should not call this method; it's called by make_program().
         """
         if cfg.get('mean_addr') is not None:
-            # GET_MEAN: the mean of the best frequency, as the peripheral holds it
-            self.qpb_cmd(AdaptiveSweep.GET_MEAN)
-            self.qpb_wait('new')
-            self.write_dmem(addr=cfg['mean_addr'], src='s_core_r1')
-            self.write_dmem(addr=cfg['mean_addr'] + 1, src='s_core_r2')
-            self.qpb_ack()
+            # GET_MEAN: the mean of the best frequency, as the peripheral holds it; 2 words for each tone of a multiplexed generator
+            for i in range(len(cfg.get('ro_chs', [0]))):
+                if 'ro_chs' in cfg:
+                    self.qpb_cmd(AdaptiveSweep.SEL_TONE, i)
+                self.qpb_cmd(AdaptiveSweep.GET_MEAN)
+                self.qpb_wait('new')
+                self.write_dmem(addr=cfg['mean_addr'] + 2*i, src='s_core_r1')
+                self.write_dmem(addr=cfg['mean_addr'] + 2*i + 1, src='s_core_r2')
+                self.qpb_ack()
 
     def make_program(self):
         # play the initialization

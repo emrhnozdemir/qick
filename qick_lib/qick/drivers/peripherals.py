@@ -931,7 +931,7 @@ class Adaptive_Sweep(SocIP):
     bindto = ['emrhnozdemir:QICK:adaptive_sweep:1.0']
 
     # version of the command and register map that this driver and AdaptiveSweepProgramV2 are written for
-    ABI = 5
+    ABI = 6
 
     # state names of the kw search (view 1 bits 16:12, view 0 bits 18:14) and its last decision (view 1 bits 23:21)
     ENGINE_STATES = ['IDLE', 'PRESENT', 'MEASURE', 'PMAX', 'GRID1', 'GRID2',

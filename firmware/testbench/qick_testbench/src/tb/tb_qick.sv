@@ -1608,6 +1608,15 @@ wire        as_interrupt;
       .s_axis_tvalid (as_s_axis_tvalid ),
       .s_axis_tready (/*unused*/       ),
       .s_axis_tdata  (as_s_axis_tdata  ),
+      // the tone inputs and the AXI master of the multitone mode are not used by this bench
+      .t0_axis_tvalid(1'b0), .t0_axis_tready(), .t0_axis_tdata(64'd0),
+      .t1_axis_tvalid(1'b0), .t1_axis_tready(), .t1_axis_tdata(64'd0),
+      .t2_axis_tvalid(1'b0), .t2_axis_tready(), .t2_axis_tdata(64'd0),
+      .t3_axis_tvalid(1'b0), .t3_axis_tready(), .t3_axis_tdata(64'd0),
+      .t4_axis_tvalid(1'b0), .t4_axis_tready(), .t4_axis_tdata(64'd0),
+      .t5_axis_tvalid(1'b0), .t5_axis_tready(), .t5_axis_tdata(64'd0),
+      .t6_axis_tvalid(1'b0), .t6_axis_tready(), .t6_axis_tdata(64'd0),
+      .t7_axis_tvalid(1'b0), .t7_axis_tready(), .t7_axis_tdata(64'd0),
 
       .s_axi_aclk    (c_clk            ),
       .s_axi_aresetn (rst_ni           ),
@@ -1629,7 +1638,12 @@ wire        as_interrupt;
       .s_axi_rdata   (/*unused*/       ),
       .s_axi_rresp   (/*unused*/       ),
       .s_axi_rvalid  (/*unused*/       ),
-      .s_axi_rready  (1'b1             )
+      .s_axi_rready  (1'b1             ),
+      .m_axi_awaddr  (), .m_axi_awprot (), .m_axi_awvalid (), .m_axi_awready (1'b1),
+      .m_axi_wdata   (), .m_axi_wstrb  (), .m_axi_wvalid  (), .m_axi_wready  (1'b1),
+      .m_axi_bresp   (2'd0), .m_axi_bvalid (1'b1), .m_axi_bready (),
+      .m_axi_araddr  (), .m_axi_arprot (), .m_axi_arvalid (), .m_axi_arready (1'b0),
+      .m_axi_rdata   (32'd0), .m_axi_rresp (2'd0), .m_axi_rvalid (1'b0), .m_axi_rready ()
    );
 
    // Sweep progress log: one line per emitted point, plus the final result.
