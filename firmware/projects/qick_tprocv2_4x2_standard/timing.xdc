@@ -74,10 +74,3 @@ set_false_path -through [get_pins -hier -filter {name =~ */rst_dac2/peripheral_a
 
 #set_property BLOCK_SYNTH.RETIMING 1 [get_cells {d_1_i/usp_rf_data_converter_0/*}]
 #set_property BLOCK_SYNTH.STRATEGY {PERFORMANCE_OPTIMIZED} [get_cells {d_1_i/usp_rf_data_converter_0/*}]
-
-# multitone (2026-11-16): DAC B on its own clock clk_dac0 (430.08 MHz): its crossings to the tProc, core and AXI clocks
-set clk_dac0 [get_clocks -of_objects [get_nets -of_objects [get_pins -hier -filter {name =~ */usp_rf_data_converter_0/clk_dac0}]]]
-set_clock_group -name clk_axi_to_dac0 -asynchronous -group [get_clocks $clk_axi] -group [get_clocks $clk_dac0]
-set_clock_group -name clk_tproc_to_dac0 -asynchronous -group [get_clocks $clk_dac2] -group [get_clocks $clk_dac0]
-set_clock_group -name clk_core_to_dac0 -asynchronous -group [get_clocks $clk_core] -group [get_clocks $clk_dac0]
-set_false_path -through [get_pins -hier -filter {name =~ */rst_dac0/peripheral_aresetn[0]}]

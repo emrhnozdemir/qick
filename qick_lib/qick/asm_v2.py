@@ -3861,7 +3861,7 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
             # so both ends of the band must be inside the generator's range and inside one Nyquist zone of the readout
             nyquist = self.soccfg['readouts'][ro_ch]['fs']/2
             if max(abs(start[i] - mixer), abs(stop[i] - mixer)) >= gencfg['f_dds']/2:
-                raise RuntimeError("the band of tone %d (%.3f to %.3f MHz) reaches beyond the range of the generator, %.3f MHz on each side of the mixer"%(mask[i], start[i], stop[i], gencfg['f_dds']/2))
+                raise RuntimeError("the band of tone %d (%.3f to %.3f MHz) reaches beyond the range of the generator, %.3f MHz %s"%(mask[i], start[i], stop[i], gencfg['f_dds']/2, "on each side of the mixer" if gencfg['has_mixer'] else "(its Nyquist frequency)"))
             if np.floor(start[i]/nyquist) != np.floor(stop[i]/nyquist):
                 raise RuntimeError("the band of tone %d (%.3f to %.3f MHz) crosses the edge of a Nyquist zone of the readout at %.3f MHz: keep each band inside one zone"%(mask[i], start[i], stop[i], nyquist*np.floor(stop[i]/nyquist)))
             gen_start, ro_start = words(start[i], ro_ch)
@@ -4142,7 +4142,7 @@ class AdaptiveSweepProgramV2(AveragerProgramV2):
         mux = 'n_tones' in self.soccfg['gens'][cfg['gen_ch']]
         if mux:
             # one tone for each readout, every tone at the low edge of its band: the peripheral rewrites the frequencies
-            self.declare_gen(ch=cfg['gen_ch'], nqz=cfg.get('nqz', 1), mixer_freq=cfg['mixer_freq'], mux_freqs=cfg['start'], mux_gains=cfg.get('gains'), ro_ch=cfg['ro_chs'][0])
+            self.declare_gen(ch=cfg['gen_ch'], nqz=cfg.get('nqz', 1), mixer_freq=cfg.get('mixer_freq'), mux_freqs=cfg['start'], mux_gains=cfg.get('gains'), ro_ch=cfg['ro_chs'][0])
             for ch, freq in zip(cfg['ro_chs'], cfg['start']):
                 self.declare_readout(ch=ch, length=cfg['ro_len'], freq=freq, gen_ch=cfg['gen_ch'])
             self.add_pulse(ch=cfg['gen_ch'], name="probe", style="const", length=cfg['pulse_len'], mask=list(range(len(cfg['ro_chs']))))
