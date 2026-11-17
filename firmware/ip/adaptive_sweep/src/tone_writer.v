@@ -50,6 +50,16 @@ module tone_writer(
   reg [4:0] count;
   reg aw_pending;
   reg w_pending;
+  reg readout;
+  reg [6:0] offset;
+  reg [31:0] wdata;
+  reg signed [31:0] gen_offset;
+  reg signed [34:0] ratio;
+  reg signed [66:0] product;
+  reg signed [66:0] product_d;
+  reg [36:0] band;
+  reg [31:0] ro_pinc;
+  reg [15:0] ro_id;
 
   wire picked = (count == 5'd6);
   wire settled = (count == 5'd31);
@@ -123,9 +133,18 @@ module tone_writer(
     if (!rst_n) begin
       aw_pending <= 0;
       w_pending <= 0;
+      readout <= 0;
+      offset <= 0;
+      wdata <= 0;
     end else if (state != next_state) begin
       aw_pending <= next_writing;
       w_pending <= next_writing;
+      readout <= (next_state == S_ID) | (next_state == S_RO);
+      offset <= (next_state == S_RO) ? (7'd32 + {1'b0, tone, 3'd0}) :
+                (((next_state == S_GEN) | (next_state == S_ID)) ? {2'd0, tone, 2'd0} : 7'd96);
+      wdata <= (next_state == S_GEN) ? freq_i :
+               ((next_state == S_ID) ? {16'd0, ro_id} :
+               ((next_state == S_RO) ? ro_pinc : {31'd0, (next_state == S_WE_ON)}));
     end else begin
       if (m_axi_awready)
         aw_pending <= 0;
@@ -134,14 +153,7 @@ module tone_writer(
     end
   end
 
-  reg signed [31:0] gen_offset;
-  reg signed [66:0] product;
-  reg signed [66:0] product_d;
-  reg [36:0] band;
-  reg [31:0] ro_pinc;
-  reg [15:0] ro_id;
 
-  wire signed [34:0] ratio = ratio_i;
   wire signed [66:0] rounded = product_d + 67'sd1073741824;
   wire [37:0] centred = {1'b0, band} + 38'd1073741824;
   wire [5:0] channel_steps = centred[36:31];
@@ -150,6 +162,7 @@ module tone_writer(
   always @(posedge clk) begin
     if (!rst_n) begin
       gen_offset <= 0;
+      ratio <= 0;
       product <= 0;
       product_d <= 0;
       band <= 0;
@@ -157,6 +170,7 @@ module tone_writer(
       ro_id <= 0;
     end else begin
       gen_offset <= freq_i - gen_base_i;
+      ratio <= ratio_i;
       product <= gen_offset * ratio;
       product_d <= product;
       band <= ro_base_i + {rounded[62:31], 5'd0};
@@ -165,22 +179,14 @@ module tone_writer(
     end
   end
 
-  wire to_readout = (state == S_ID) | (state == S_RO);
-  wire [6:0] offset = (state == S_GEN) ? {2'd0, tone, 2'd0} :
-                      (state == S_ID) ? {2'd0, tone, 2'd0} :
-                      (state == S_RO) ? (7'd32 + {1'b0, tone, 3'd0}) :
-                      7'd96;
 
   assign tone_o = tone;
   assign done_o = (state == S_SETTLE) & settled;
 
-  assign m_axi_awaddr = {15'd0, to_readout, 9'd0, offset};
+  assign m_axi_awaddr = {15'd0, readout, 9'd0, offset};
   assign m_axi_awprot = 3'd0;
   assign m_axi_awvalid = aw_pending;
-  assign m_axi_wdata = (state == S_GEN) ? freq_i :
-                       (state == S_ID) ? {16'd0, ro_id} :
-                       (state == S_RO) ? ro_pinc :
-                       {31'd0, (state == S_WE_ON)};
+  assign m_axi_wdata = wdata;
   assign m_axi_wstrb = 4'hF;
   assign m_axi_wvalid = w_pending;
   assign m_axi_bready = 1'b1;

@@ -130,38 +130,57 @@ module adaptive_sweep (
   assign t6_axis_tready = 1'b1;
   assign t7_axis_tready = 1'b1;
 
+  reg en_r;
   reg en_d;
-  wire en_rise = qtag_en_i & ~en_d;
+  reg [4:0] op_r;
+  reg [31:0] dt1_r;
+  reg [31:0] dt2_r;
+  reg [31:0] dt3_r;
+  reg [31:0] dt4_r;
+  wire en_rise = en_r & ~en_d;
 
   always @(posedge clk) begin
-    if (!rst_n)
+    if (!rst_n) begin
+      en_r <= 1'b0;
       en_d <= 1'b0;
-    else
-      en_d <= qtag_en_i;
+      op_r <= 5'd0;
+      dt1_r <= 32'd0;
+      dt2_r <= 32'd0;
+      dt3_r <= 32'd0;
+      dt4_r <= 32'd0;
+    end else begin
+      en_r <= qtag_en_i;
+      en_d <= en_r;
+      op_r <= qtag_op_i;
+      dt1_r <= qtag_dt1_i;
+      dt2_r <= qtag_dt2_i;
+      dt3_r <= qtag_dt3_i;
+      dt4_r <= qtag_dt4_i;
+    end
   end
 
-  wire cfg_sweep = en_rise & (qtag_op_i == OP_CFG_WINDOW);
-  wire cfg_meas = en_rise & (qtag_op_i == OP_CFG_ACQ);
-  wire cfg_gdkw = en_rise & (qtag_op_i == OP_CFG_GDKW);
-  wire cfg_tones = en_rise & (qtag_op_i == OP_CFG_TONES);
-  wire sel_tone = en_rise & (qtag_op_i == OP_SEL_TONE);
-  wire cfg_ratio = en_rise & (qtag_op_i == OP_CFG_RATIO);
-  wire start_now = en_rise & (qtag_op_i == OP_START);
-  wire run_kw = en_rise & (qtag_op_i == OP_RUN_KW);
-  wire clr_result = en_rise & (qtag_op_i == OP_CLR_RESULT);
-  wire rearm_now = en_rise & (qtag_op_i == OP_REARM);
-  wire getfreq_rd = en_rise & (qtag_op_i == OP_GET_FREQ);
-  wire status_rd = en_rise & (qtag_op_i == OP_GET_STATUS);
-  wire diag_rd = en_rise & (qtag_op_i == OP_GET_DIAG);
-  wire getmean_rd = en_rise & (qtag_op_i == OP_GET_MEAN);
-  wire next_rd = en_rise & (qtag_op_i == OP_NEXT);
-  wire result_rd = en_rise & (qtag_op_i == OP_GET_RESULT);
+  wire cfg_sweep = en_rise & (op_r == OP_CFG_WINDOW);
+  wire cfg_meas = en_rise & (op_r == OP_CFG_ACQ);
+  wire cfg_gdkw = en_rise & (op_r == OP_CFG_GDKW);
+  wire cfg_tones = en_rise & (op_r == OP_CFG_TONES);
+  wire sel_tone = en_rise & (op_r == OP_SEL_TONE);
+  wire cfg_ratio = en_rise & (op_r == OP_CFG_RATIO);
+  wire start_now = en_rise & (op_r == OP_START);
+  wire run_kw = en_rise & (op_r == OP_RUN_KW);
+  wire clr_result = en_rise & (op_r == OP_CLR_RESULT);
+  wire rearm_now = en_rise & (op_r == OP_REARM);
+  wire getfreq_rd = en_rise & (op_r == OP_GET_FREQ);
+  wire status_rd = en_rise & (op_r == OP_GET_STATUS);
+  wire diag_rd = en_rise & (op_r == OP_GET_DIAG);
+  wire getmean_rd = en_rise & (op_r == OP_GET_MEAN);
+  wire next_rd = en_rise & (op_r == OP_NEXT);
+  wire result_rd = en_rise & (op_r == OP_GET_RESULT);
   wire op_decoded = cfg_sweep | cfg_meas | cfg_gdkw | start_now | run_kw |
                     clr_result | rearm_now | getfreq_rd | status_rd | diag_rd |
                     getmean_rd | cfg_tones | sel_tone | cfg_ratio | next_rd | result_rd;
-  wire op_unknown = en_rise & ~op_decoded & (qtag_op_i != OP_CFG_INTERRUPT);
+  wire op_unknown = en_rise & ~op_decoded & (op_r != OP_CFG_INTERRUPT);
 
-  wire [15:0] threshold;
+  (* max_fanout = 16 *) wire [15:0] threshold;
   wire [31:0] block_tol;
 
   wire [31:0] cfg_start;
@@ -226,10 +245,10 @@ module adaptive_sweep (
     .cfg_tones_i(cfg_tones),
     .sel_tone_i(sel_tone),
     .cfg_ratio_i(cfg_ratio),
-    .dt1_i(qtag_dt1_i),
-    .dt2_i(qtag_dt2_i),
-    .dt3_i(qtag_dt3_i),
-    .dt4_i(qtag_dt4_i),
+    .dt1_i(dt1_r),
+    .dt2_i(dt2_r),
+    .dt3_i(dt3_r),
+    .dt4_i(dt4_r),
     .status_i(status_word),
     .view_dt1_i(dbg_dt1),
     .view_dt2_i(dbg_dt2),
@@ -700,11 +719,11 @@ module adaptive_sweep (
     .start_freq_i      (cfg_start),
     .step_i            (cfg_step),
     .n_points_i        (cfg_npoints),
-    .x0_i              (mt ? cfg_x0 : qtag_dt1_i),
+    .x0_i              (mt ? cfg_x0 : dt1_r),
     .f_lo_i            (cfg_flo),
     .f_hi_i            (cfg_fhi),
-    .min_step_i        (qtag_dt3_i),
-    .max_iteration_i   (qtag_dt4_i[15:0]),
+    .min_step_i        (dt3_r),
+    .max_iteration_i   (dt4_r[15:0]),
     .threshold_i       (threshold),
     .freq_word_o       (eng_freq_word),
     .freq_valid_o      (eng_freq_valid),
@@ -757,10 +776,10 @@ module adaptive_sweep (
     .cfg_sweep_i       (cfg_sweep),
     .cfg_search_i      (cfg_gdkw),
     .cfg_ratio_i       (cfg_ratio),
-    .dt1_i             (qtag_dt1_i),
-    .dt2_i             (qtag_dt2_i),
-    .dt3_i             (qtag_dt3_i),
-    .dt4_i             (qtag_dt4_i),
+    .dt1_i             (dt1_r),
+    .dt2_i             (dt2_r),
+    .dt3_i             (dt3_r),
+    .dt4_i             (dt4_r),
     .start_i           (start_now),
     .run_kw_i          (run_kw),
     .arm_i             (mt_arm[1]),
@@ -782,8 +801,8 @@ module adaptive_sweep (
     .short_confirm_i   (short_confirm),
     .block_tol_i       (block_tol),
     .confirm_i         (cfg_confirm),
-    .min_step_i        (qtag_dt3_i),
-    .max_iteration_i   (qtag_dt4_i[15:0]),
+    .min_step_i        (dt3_r),
+    .max_iteration_i   (dt4_r[15:0]),
     .pf_freq_valid_o   (t_pf_freq_valid[1]),
     .pf_finish_o       (t_pf_finish[1]),
     .eng_freq_valid_o  (t_eng_freq_valid[1]),
@@ -814,10 +833,10 @@ module adaptive_sweep (
     .cfg_sweep_i       (cfg_sweep),
     .cfg_search_i      (cfg_gdkw),
     .cfg_ratio_i       (cfg_ratio),
-    .dt1_i             (qtag_dt1_i),
-    .dt2_i             (qtag_dt2_i),
-    .dt3_i             (qtag_dt3_i),
-    .dt4_i             (qtag_dt4_i),
+    .dt1_i             (dt1_r),
+    .dt2_i             (dt2_r),
+    .dt3_i             (dt3_r),
+    .dt4_i             (dt4_r),
     .start_i           (start_now),
     .run_kw_i          (run_kw),
     .arm_i             (mt_arm[2]),
@@ -839,8 +858,8 @@ module adaptive_sweep (
     .short_confirm_i   (short_confirm),
     .block_tol_i       (block_tol),
     .confirm_i         (cfg_confirm),
-    .min_step_i        (qtag_dt3_i),
-    .max_iteration_i   (qtag_dt4_i[15:0]),
+    .min_step_i        (dt3_r),
+    .max_iteration_i   (dt4_r[15:0]),
     .pf_freq_valid_o   (t_pf_freq_valid[2]),
     .pf_finish_o       (t_pf_finish[2]),
     .eng_freq_valid_o  (t_eng_freq_valid[2]),
@@ -871,10 +890,10 @@ module adaptive_sweep (
     .cfg_sweep_i       (cfg_sweep),
     .cfg_search_i      (cfg_gdkw),
     .cfg_ratio_i       (cfg_ratio),
-    .dt1_i             (qtag_dt1_i),
-    .dt2_i             (qtag_dt2_i),
-    .dt3_i             (qtag_dt3_i),
-    .dt4_i             (qtag_dt4_i),
+    .dt1_i             (dt1_r),
+    .dt2_i             (dt2_r),
+    .dt3_i             (dt3_r),
+    .dt4_i             (dt4_r),
     .start_i           (start_now),
     .run_kw_i          (run_kw),
     .arm_i             (mt_arm[3]),
@@ -896,8 +915,8 @@ module adaptive_sweep (
     .short_confirm_i   (short_confirm),
     .block_tol_i       (block_tol),
     .confirm_i         (cfg_confirm),
-    .min_step_i        (qtag_dt3_i),
-    .max_iteration_i   (qtag_dt4_i[15:0]),
+    .min_step_i        (dt3_r),
+    .max_iteration_i   (dt4_r[15:0]),
     .pf_freq_valid_o   (t_pf_freq_valid[3]),
     .pf_finish_o       (t_pf_finish[3]),
     .eng_freq_valid_o  (t_eng_freq_valid[3]),
@@ -928,10 +947,10 @@ module adaptive_sweep (
     .cfg_sweep_i       (cfg_sweep),
     .cfg_search_i      (cfg_gdkw),
     .cfg_ratio_i       (cfg_ratio),
-    .dt1_i             (qtag_dt1_i),
-    .dt2_i             (qtag_dt2_i),
-    .dt3_i             (qtag_dt3_i),
-    .dt4_i             (qtag_dt4_i),
+    .dt1_i             (dt1_r),
+    .dt2_i             (dt2_r),
+    .dt3_i             (dt3_r),
+    .dt4_i             (dt4_r),
     .start_i           (start_now),
     .run_kw_i          (run_kw),
     .arm_i             (mt_arm[4]),
@@ -953,8 +972,8 @@ module adaptive_sweep (
     .short_confirm_i   (short_confirm),
     .block_tol_i       (block_tol),
     .confirm_i         (cfg_confirm),
-    .min_step_i        (qtag_dt3_i),
-    .max_iteration_i   (qtag_dt4_i[15:0]),
+    .min_step_i        (dt3_r),
+    .max_iteration_i   (dt4_r[15:0]),
     .pf_freq_valid_o   (t_pf_freq_valid[4]),
     .pf_finish_o       (t_pf_finish[4]),
     .eng_freq_valid_o  (t_eng_freq_valid[4]),
@@ -985,10 +1004,10 @@ module adaptive_sweep (
     .cfg_sweep_i       (cfg_sweep),
     .cfg_search_i      (cfg_gdkw),
     .cfg_ratio_i       (cfg_ratio),
-    .dt1_i             (qtag_dt1_i),
-    .dt2_i             (qtag_dt2_i),
-    .dt3_i             (qtag_dt3_i),
-    .dt4_i             (qtag_dt4_i),
+    .dt1_i             (dt1_r),
+    .dt2_i             (dt2_r),
+    .dt3_i             (dt3_r),
+    .dt4_i             (dt4_r),
     .start_i           (start_now),
     .run_kw_i          (run_kw),
     .arm_i             (mt_arm[5]),
@@ -1010,8 +1029,8 @@ module adaptive_sweep (
     .short_confirm_i   (short_confirm),
     .block_tol_i       (block_tol),
     .confirm_i         (cfg_confirm),
-    .min_step_i        (qtag_dt3_i),
-    .max_iteration_i   (qtag_dt4_i[15:0]),
+    .min_step_i        (dt3_r),
+    .max_iteration_i   (dt4_r[15:0]),
     .pf_freq_valid_o   (t_pf_freq_valid[5]),
     .pf_finish_o       (t_pf_finish[5]),
     .eng_freq_valid_o  (t_eng_freq_valid[5]),
@@ -1042,10 +1061,10 @@ module adaptive_sweep (
     .cfg_sweep_i       (cfg_sweep),
     .cfg_search_i      (cfg_gdkw),
     .cfg_ratio_i       (cfg_ratio),
-    .dt1_i             (qtag_dt1_i),
-    .dt2_i             (qtag_dt2_i),
-    .dt3_i             (qtag_dt3_i),
-    .dt4_i             (qtag_dt4_i),
+    .dt1_i             (dt1_r),
+    .dt2_i             (dt2_r),
+    .dt3_i             (dt3_r),
+    .dt4_i             (dt4_r),
     .start_i           (start_now),
     .run_kw_i          (run_kw),
     .arm_i             (mt_arm[6]),
@@ -1067,8 +1086,8 @@ module adaptive_sweep (
     .short_confirm_i   (short_confirm),
     .block_tol_i       (block_tol),
     .confirm_i         (cfg_confirm),
-    .min_step_i        (qtag_dt3_i),
-    .max_iteration_i   (qtag_dt4_i[15:0]),
+    .min_step_i        (dt3_r),
+    .max_iteration_i   (dt4_r[15:0]),
     .pf_freq_valid_o   (t_pf_freq_valid[6]),
     .pf_finish_o       (t_pf_finish[6]),
     .eng_freq_valid_o  (t_eng_freq_valid[6]),
@@ -1099,10 +1118,10 @@ module adaptive_sweep (
     .cfg_sweep_i       (cfg_sweep),
     .cfg_search_i      (cfg_gdkw),
     .cfg_ratio_i       (cfg_ratio),
-    .dt1_i             (qtag_dt1_i),
-    .dt2_i             (qtag_dt2_i),
-    .dt3_i             (qtag_dt3_i),
-    .dt4_i             (qtag_dt4_i),
+    .dt1_i             (dt1_r),
+    .dt2_i             (dt2_r),
+    .dt3_i             (dt3_r),
+    .dt4_i             (dt4_r),
     .start_i           (start_now),
     .run_kw_i          (run_kw),
     .arm_i             (mt_arm[7]),
@@ -1124,8 +1143,8 @@ module adaptive_sweep (
     .short_confirm_i   (short_confirm),
     .block_tol_i       (block_tol),
     .confirm_i         (cfg_confirm),
-    .min_step_i        (qtag_dt3_i),
-    .max_iteration_i   (qtag_dt4_i[15:0]),
+    .min_step_i        (dt3_r),
+    .max_iteration_i   (dt4_r[15:0]),
     .pf_freq_valid_o   (t_pf_freq_valid[7]),
     .pf_finish_o       (t_pf_finish[7]),
     .eng_freq_valid_o  (t_eng_freq_valid[7]),
@@ -1205,7 +1224,7 @@ module adaptive_sweep (
     .read_sel_i       (read_sel),
     .job_start_i      (start_now | run_kw),
     .op_strobe_i      (en_rise),
-    .op_i             (qtag_op_i),
+    .op_i             (op_r),
     .op_unknown_i     (op_unknown),
     .read_held_i      ((status_rd | diag_rd | getfreq_rd | getmean_rd | next_rd | result_rd) & (res_pend | job_finish)),
     .getfreq_idle_i   (getfreq_rd & ~eng_freq_valid),
@@ -1258,7 +1277,7 @@ module adaptive_sweep (
     .view_dt2_o       (dbg_dt2)
   );
 
-  assign c_debug_do = {en_rise, qtag_op_i,
+  assign c_debug_do = {en_rise, op_r,
                        qtag_rdy_o, qtag_vld_o, res_pend, dest_r, pf_waiting, finish_seen,
                        1'b0, eng_flags[16:12],
                        eng_freq_valid, eng_probe_arm, eng_done, pf_freq_valid, pf_finish,
